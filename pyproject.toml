@@ -14,6 +14,7 @@ dependencies = [
     "sounddevice>=0.4.6",
     "pydub>=0.25.0",
     "noisereduce>=3.0.0",
+    "windnd>=1.0.7",
 ]
 
 [project.scripts]

@@ -1664,6 +1664,7 @@ dependencies = [
     { name = "scipy", version = "1.17.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "sounddevice" },
     { name = "soundfile" },
+    { name = "windnd" },
 ]
 
 [package.dev-dependencies]
@@ -1683,6 +1684,7 @@ requires-dist = [
     { name = "scipy", specifier = ">=1.10.0" },
     { name = "sounddevice", specifier = ">=0.4.6" },
     { name = "soundfile", specifier = ">=0.12.0" },
+    { name = "windnd", specifier = ">=1.0.7" },
 ]
 
 [package.metadata.requires-dev]
@@ -1884,4 +1886,12 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/c7/24/5f1b3bdffd70275f6661c76461e25f024d5a38a46f04aaca912426a2b1d3/urllib3-2.6.3.tar.gz", hash = "sha256:1b62b6884944a57dbe321509ab94fd4d3b307075e0c2eae991ac71ee15ad38ed", size = 435556, upload-time = "2026-01-07T16:24:43.925Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/39/08/aaaad47bc4e9dc8c725e68f9d04865dbcb2052843ff09c97b08904852d84/urllib3-2.6.3-py3-none-any.whl", hash = "sha256:bf272323e553dfb2e87d9bfd225ca7b0f467b919d7bbd355436d3fd37cb0acd4", size = 131584, upload-time = "2026-01-07T16:24:42.685Z" },
+]
+
+[[package]]
+name = "windnd"
+version = "1.0.7"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fe/6b/cb24d7638780a1d12e41b30839971e48048788ca54ec0e7f58a800a5e449/windnd-1.0.7-py3-none-any.whl", hash = "sha256:357ed0b00e801342a6997f851ee3d5185da2ad4827e0d404d16a2684006c0244", size = 4266, upload-time = "2020-08-17T04:11:11.359Z" },
 ]

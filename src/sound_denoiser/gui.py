@@ -21,8 +21,21 @@ from pathlib import Path
 from typing import Optional, Tuple
 import queue
 
-from .denoiser import AudioDenoiser, NoiseProfile
-from .audio_player import AudioPlayer, PlaybackState
+# Try to import windnd for drag and drop support (Windows)
+WINDND_AVAILABLE = False
+try:
+    import windnd
+    WINDND_AVAILABLE = True
+except ImportError:
+    pass
+
+# Handle imports for both module and direct execution
+try:
+    from .denoiser import AudioDenoiser, NoiseProfile
+    from .audio_player import AudioPlayer, PlaybackState
+except ImportError:
+    from denoiser import AudioDenoiser, NoiseProfile
+    from audio_player import AudioPlayer, PlaybackState
 
 
 # Configure appearance
@@ -275,21 +288,6 @@ class WaveformDisplay(ctk.CTkFrame):
             except:
                 pass
             self.played_area = None
-        self.canvas.draw_idle()
-        
-    def update_playhead(self, position: float, duration: float):
-        """
-        Update playhead position.
-        
-        Args:
-            position: Position as fraction (0-1)
-            duration: Total duration in seconds
-        """
-        if self.playhead:
-            self.playhead.remove()
-        
-        time_pos = position * duration
-        self.playhead = self.ax.axvline(x=time_pos, color='#ff6b6b', linewidth=2, alpha=0.8)
         self.canvas.draw_idle()
 
 
@@ -675,8 +673,63 @@ class SoundDenoiserApp(ctk.CTk):
         # Build UI
         self._create_ui()
         
+        # Setup drag and drop if available
+        self._setup_drag_and_drop()
+        
         # Start update loop
         self._update_ui()
+    
+    def _setup_drag_and_drop(self):
+        """Setup drag and drop file loading using windnd."""
+        # Initialize the dropped file holder (raw data from windnd)
+        self._pending_drop_files = None
+        
+        if WINDND_AVAILABLE:
+            try:
+                # Hook drag and drop to the main window
+                windnd.hook_dropfiles(self, func=self._on_drop_files)
+            except Exception as e:
+                print(f"Drag and drop setup failed: {e}")
+    
+    def _on_drop_files(self, file_list):
+        """Handle dropped files from windnd (called from a different thread).
+        
+        This runs in a non-GIL context from Windows COM, so we store raw data
+        and let the main thread do all processing.
+        """
+        # Store the raw file list - main thread will process it
+        # Keep this as minimal as possible to avoid GIL issues
+        self._pending_drop_files = file_list
+    
+    def _process_dropped_files(self, file_list):
+        """Process dropped files (runs in main thread)."""
+        if not file_list:
+            return
+        
+        audio_extensions = {'.wav', '.mp3', '.flac', '.aif', '.aiff', '.m4a', '.ogg'}
+        
+        for file_path in file_list:
+            try:
+                # Decode bytes to string if necessary
+                if isinstance(file_path, bytes):
+                    path_str = file_path.decode('utf-8', errors='replace')
+                else:
+                    path_str = str(file_path)
+                
+                path = Path(path_str)
+                
+                if path.suffix.lower() in audio_extensions and path.exists():
+                    self._load_audio_file(str(path))
+                    return  # Only load the first valid audio file
+            except Exception as e:
+                print(f"Error processing dropped file: {e}")
+                continue
+        
+        # No valid audio file found
+        messagebox.showwarning(
+            "Invalid File",
+            f"Please drop an audio file.\nSupported formats: {', '.join(audio_extensions)}"
+        )
         
     def _create_ui(self):
         """Create the user interface."""
@@ -1166,7 +1219,7 @@ class SoundDenoiserApp(ctk.CTk):
             self._set_status("Using adaptive noise estimation")
         
     def _load_audio(self):
-        """Load audio file."""
+        """Open file dialog to load audio file."""
         filetypes = [
             ("Audio Files", "*.wav *.mp3 *.flac *.aif *.aiff *.m4a *.ogg"),
             ("WAV Files", "*.wav"),
@@ -1188,14 +1241,20 @@ class SoundDenoiserApp(ctk.CTk):
             initialdir=initial_dir
         )
         
-        if not file_path:
-            return
-            
+        if file_path:
+            self._load_audio_file(file_path)
+    
+    def _load_audio_file(self, file_path: str):
+        """Load audio from a file path (used by both file dialog and drag-drop)."""
         self.input_path = Path(file_path)
         self._set_status(f"Loading: {self.input_path.name}...")
         
         # Clear previous noise profile
         self._clear_noise_profile()
+        
+        # Reset waveform playheads
+        self.waveform_original.reset_playhead()
+        self.waveform_processed.reset_playhead()
         
         # Load in background thread
         def load_thread():
@@ -1334,8 +1393,10 @@ class SoundDenoiserApp(ctk.CTk):
         """Handle seek bar change."""
         if which == "original":
             self.player_original.seek(position)
+            self.waveform_original.update_playhead(position)
         else:
             self.player_processed.seek(position)
+            self.waveform_processed.update_playhead(position)
             
     def _sync_to_original(self):
         """Sync processed player position to original player position."""
@@ -1345,6 +1406,7 @@ class SoundDenoiserApp(ctk.CTk):
         # Set the processed player to the same position
         self.player_processed.seek(orig_position)
         self.seek_proc.set_position(orig_position)
+        self.waveform_processed.update_playhead(orig_position)
         
         # If original is playing, also play processed (and stop original for A/B comparison)
         if self.player_original.is_playing():
@@ -1387,6 +1449,12 @@ class SoundDenoiserApp(ctk.CTk):
                     
         except queue.Empty:
             pass
+        
+        # Check for drag-and-drop files (polled from instance variable for thread safety)
+        if self._pending_drop_files is not None:
+            file_list = self._pending_drop_files
+            self._pending_drop_files = None
+            self._process_dropped_files(file_list)
         
         # Update seek bars and waveform playheads
         if self.player_original.is_playing():
