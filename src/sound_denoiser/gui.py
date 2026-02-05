@@ -17,7 +17,6 @@ from matplotlib.widgets import SpanSelector
 import librosa
 import librosa.display
 import threading
-import time
 from pathlib import Path
 from typing import Optional, Tuple
 import queue
@@ -92,7 +91,7 @@ class WaveformDisplay(ctk.CTkFrame):
         self._selection_mode_enabled = False
         self.selection_mode_btn = ctk.CTkButton(
             toggle_frame,
-            text="ðŸ” Select",
+            text="[+] Select",
             command=self._toggle_selection_mode,
             font=ctk.CTkFont(size=10),
             width=70,
@@ -114,7 +113,7 @@ class WaveformDisplay(ctk.CTkFrame):
         
         self.zoom_out_btn = ctk.CTkButton(
             toggle_frame,
-            text="âˆ’",
+            text="-",
             command=self._zoom_out,
             font=ctk.CTkFont(size=14, weight="bold"),
             width=28,
@@ -147,7 +146,7 @@ class WaveformDisplay(ctk.CTkFrame):
         
         self.zoom_reset_btn = ctk.CTkButton(
             toggle_frame,
-            text="âŸ²",
+            text="R",
             command=self._zoom_reset,
             font=ctk.CTkFont(size=12),
             width=28,
@@ -244,13 +243,13 @@ class WaveformDisplay(ctk.CTkFrame):
             self.selection_mode_btn.configure(
                 fg_color="#ff6b6b",
                 hover_color="#ff8f8f",
-                text="âœ“ Select"
+                text="[*] Select"
             )
         else:
             self.selection_mode_btn.configure(
                 fg_color="#1a1a2e",
                 hover_color="#252535",
-                text="ðŸ” Select"
+                text="[+] Select"
             )
     
     def _zoom_in(self):
@@ -350,7 +349,7 @@ class WaveformDisplay(ctk.CTkFrame):
             self.update_playhead(self._current_position)
     
     def _plot_spectrogram_internal(self):
-        """Internal method to plot spectrogram with zoom support and performance optimization."""
+        """Internal method to plot spectrogram with zoom support and aggressive performance optimization."""
         self.ax.clear()
         self.ax.set_facecolor('#1a1a2e')
         self.selection_rect = None
@@ -362,30 +361,47 @@ class WaveformDisplay(ctk.CTkFrame):
         
         # Calculate visible time range based on zoom
         visible_start, visible_end = self.get_visible_time_range()
+        visible_duration = visible_end - visible_start
         start_sample = int(visible_start * sr)
         end_sample = int(visible_end * sr)
         start_sample = max(0, start_sample)
         end_sample = min(len(audio), end_sample)
         
         # Extract visible audio with some padding for smoother edges
-        pad_samples = 1024
+        pad_samples = 512
         padded_start = max(0, start_sample - pad_samples)
         padded_end = min(len(audio), end_sample + pad_samples)
         visible_audio = audio[padded_start:padded_end]
         
-        # Adaptive STFT parameters based on zoom and audio length
-        # Use smaller FFT when zoomed in for better time resolution
-        # Use larger FFT when zoomed out for better frequency resolution
-        if self._zoom_level >= 4.0:
-            n_fft = 1024
-            hop_length = 256
-        elif self._zoom_level >= 2.0:
-            n_fft = 2048
-            hop_length = 512
+        # AGGRESSIVE performance optimization - much larger hop lengths
+        # Target approximately 500-800 time frames max for smooth display
+        target_frames = 600
+        audio_len = len(visible_audio)
+        
+        # Calculate hop length to achieve target frames
+        ideal_hop = max(512, audio_len // target_frames)
+        
+        # Round to power of 2 for efficiency
+        hop_length = 512
+        for h in [512, 1024, 2048, 4096]:
+            if h >= ideal_hop:
+                hop_length = h
+                break
         else:
-            # Zoomed out - use larger hop for performance
-            n_fft = 2048
-            hop_length = 1024 if len(visible_audio) > 100000 else 512
+            hop_length = 4096
+        
+        # FFT size - use smaller for better performance
+        n_fft = min(2048, hop_length * 4)
+        
+        # Downsample audio for very long segments (additional speedup)
+        if audio_len > 500000:  # > ~11 seconds at 44.1kHz
+            downsample_factor = audio_len // 200000
+            visible_audio = visible_audio[::downsample_factor]
+            effective_sr = sr // downsample_factor
+            hop_length = max(256, hop_length // downsample_factor)
+            n_fft = min(1024, hop_length * 4)
+        else:
+            effective_sr = sr
         
         # Compute spectrogram for visible region only
         D = librosa.amplitude_to_db(
@@ -395,15 +411,16 @@ class WaveformDisplay(ctk.CTkFrame):
         
         # Calculate time offset for correct positioning
         time_offset = padded_start / sr
+        time_end = padded_end / sr
         
-        # Plot spectrogram with custom colormap
+        # Plot spectrogram with custom colormap - use imshow for better performance
         img = librosa.display.specshow(
-            D, sr=sr, hop_length=hop_length, x_axis='time', y_axis='hz',
-            ax=self.ax, cmap='magma', x_coords=np.linspace(time_offset, padded_end/sr, D.shape[1])
+            D, sr=effective_sr, hop_length=hop_length, x_axis='time', y_axis='hz',
+            ax=self.ax, cmap='magma', x_coords=np.linspace(time_offset, time_end, D.shape[1])
         )
         
         self.ax.set_xlim(visible_start, visible_end)
-        self.ax.set_ylim(0, min(sr // 2, 16000))  # Cap at 16kHz for better visibility
+        self.ax.set_ylim(0, min(sr // 2, 12000))  # Cap at 12kHz - hiss is mostly below this
         
         # Restore selection if any and it's visible
         if self._selected_region:
@@ -587,12 +604,14 @@ class WaveformDisplay(ctk.CTkFrame):
         # Draw based on current view mode
         self._redraw_display()
     
-    def update_playhead(self, position: float):
+    def update_playhead(self, position: float, skip_draw: bool = False):
         """
         Update playhead position and played area shading.
         
         Args:
             position: Position as fraction (0-1)
+            skip_draw: If True, only update time label without redrawing canvas
+                      (for performance during spectrogram playback)
         """
         if self._duration <= 0:
             return
@@ -600,8 +619,13 @@ class WaveformDisplay(ctk.CTkFrame):
         time_pos = position * self._duration
         self._current_position = position
         
-        # Update time label
+        # Update time label (always do this)
         self._update_time_label(position)
+        
+        # In spectrogram mode, skip canvas updates for performance
+        # The spectrogram is expensive to redraw and playhead isn't critical
+        if skip_draw or self._view_mode == "spectrogram":
+            return
         
         # Remove old playhead
         if self.playhead is not None:
@@ -1392,6 +1416,25 @@ class SoundDenoiserApp(ctk.CTk):
         self.method_dropdown.set("Spectral Subtraction")
         self.method_dropdown.pack(anchor="w", pady=(5, 0))
         
+        # Method description - shows which parameters are most effective
+        self._method_descriptions = {
+            "Spectral Subtraction": "Best for: General hiss. Key params: Strength, HF Reduction",
+            "Wiener Filter": "Best for: Broadband noise. Key params: Strength, HF Reduction",
+            "Multi-Band Adaptive": "Best for: Complex noise. Key params: Strength (per-band)",
+            "Combined (All Methods)": "Best for: Heavy noise. Uses Spectral + Wiener + HF",
+            "Shellac/78rpm (Hiss+Groove)": "Best for: Old 78s. Auto-tuned for groove rumble + hiss",
+            "NoiseReduce (Legacy)": "ML-based. May not work well on vintage recordings",
+        }
+        
+        self.method_desc_label = ctk.CTkLabel(
+            method_frame,
+            text=self._method_descriptions["Spectral Subtraction"],
+            font=ctk.CTkFont(size=10),
+            text_color="#888888",
+            wraplength=190
+        )
+        self.method_desc_label.pack(anchor="w", pady=(3, 0))
+        
         # Max dB Reduction
         self.max_db_slider = ParameterSlider(
             params_inner,
@@ -1463,6 +1506,72 @@ class SoundDenoiserApp(ctk.CTk):
             command=self._on_parameter_change
         )
         self.smoothing_slider.pack(fill="x", pady=(0, 5))
+        
+        # Fine-Tuning Section
+        fine_tune_frame = ctk.CTkFrame(scroll_frame, fg_color="#151525", corner_radius=10)
+        fine_tune_frame.pack(fill="x", padx=5, pady=(0, 10))
+        
+        fine_tune_header = ctk.CTkFrame(fine_tune_frame, fg_color="transparent")
+        fine_tune_header.pack(fill="x", padx=10, pady=(10, 5))
+        
+        fine_tune_label = ctk.CTkLabel(
+            fine_tune_header,
+            text="Fine-Tuning",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="#bb8fce"
+        )
+        fine_tune_label.pack(side="left")
+        
+        fine_tune_inner = ctk.CTkFrame(fine_tune_frame, fg_color="transparent")
+        fine_tune_inner.pack(fill="x", padx=10, pady=(0, 10))
+        
+        # Hiss Start Frequency
+        self.hiss_start_slider = ParameterSlider(
+            fine_tune_inner,
+            label="Hiss Start Freq",
+            from_=500.0,
+            to=5000.0,
+            default=2000.0,
+            unit="Hz",
+            command=self._on_parameter_change
+        )
+        self.hiss_start_slider.pack(fill="x", pady=(0, 12))
+        
+        # Hiss Peak Frequency
+        self.hiss_peak_slider = ParameterSlider(
+            fine_tune_inner,
+            label="Hiss Peak Freq",
+            from_=3000.0,
+            to=12000.0,
+            default=6000.0,
+            unit="Hz",
+            command=self._on_parameter_change
+        )
+        self.hiss_peak_slider.pack(fill="x", pady=(0, 12))
+        
+        # Spectral Floor (artifact prevention)
+        self.spectral_floor_slider = ParameterSlider(
+            fine_tune_inner,
+            label="Spectral Floor",
+            from_=0.0,
+            to=20.0,
+            default=5.0,
+            unit="%",
+            command=self._on_parameter_change
+        )
+        self.spectral_floor_slider.pack(fill="x", pady=(0, 12))
+        
+        # Low Cut Frequency (rumble removal)
+        self.low_cut_slider = ParameterSlider(
+            fine_tune_inner,
+            label="Low Cut (Rumble)",
+            from_=0.0,
+            to=200.0,
+            default=0.0,
+            unit="Hz",
+            command=self._on_parameter_change
+        )
+        self.low_cut_slider.pack(fill="x", pady=(0, 5))
         
         # Buttons Section
         buttons_frame = ctk.CTkFrame(scroll_frame, fg_color="#151525", corner_radius=10)
@@ -1738,6 +1847,10 @@ class SoundDenoiserApp(ctk.CTk):
             transient_protection=self.transient_slider.get() / 100.0,
             high_freq_emphasis=self.hf_emphasis_slider.get(),
             smoothing_factor=self.smoothing_slider.get() / 100.0,
+            hiss_start_freq=self.hiss_start_slider.get(),
+            hiss_peak_freq=self.hiss_peak_slider.get(),
+            spectral_floor=self.spectral_floor_slider.get() / 100.0,
+            low_cut_freq=self.low_cut_slider.get(),
         )
         
         # Process in background thread
@@ -1757,8 +1870,33 @@ class SoundDenoiserApp(ctk.CTk):
     
     def _on_method_change(self, method_name: str):
         """Handle denoising method change."""
-        method = self._method_names.get(method_name, DenoiseMethod.NOISEREDUCE)
+        method = self._method_names.get(method_name, DenoiseMethod.SPECTRAL_SUBTRACTION)
         self.denoiser.set_method(method)
+        
+        # Update method description
+        desc = self._method_descriptions.get(method_name, "")
+        self.method_desc_label.configure(text=desc)
+        
+        # Define which sliders are relevant for each method
+        dim_color = "#666666"
+        active_color = "#cccccc"
+        
+        # HF slider is less relevant for Multiband (has own bands) and Shellac (auto-tuned)
+        hf_relevant = method_name not in ["Multi-Band Adaptive", "Shellac/78rpm (Hiss+Groove)"]
+        self.hf_emphasis_slider.label.configure(text_color=active_color if hf_relevant else dim_color)
+        
+        # Hiss frequency sliders - relevant for Spectral, Wiener, Combined, NoiseReduce
+        hiss_freq_relevant = method_name in ["Spectral Subtraction", "Wiener Filter", "Combined (Best)", "NoiseReduce (Legacy)"]
+        self.hiss_start_slider.label.configure(text_color=active_color if hiss_freq_relevant else dim_color)
+        self.hiss_peak_slider.label.configure(text_color=active_color if hiss_freq_relevant else dim_color)
+        
+        # Spectral floor - relevant for Spectral and Wiener
+        floor_relevant = method_name in ["Spectral Subtraction", "Wiener Filter", "Combined (Best)"]
+        self.spectral_floor_slider.label.configure(text_color=active_color if floor_relevant else dim_color)
+        
+        # Low cut - relevant for all methods (always applied post-processing)
+        self.low_cut_slider.label.configure(text_color=active_color)
+        
         self._set_status(f"Method changed to: {method_name}")
         # Highlight process button to indicate reprocessing needed
         if self.denoiser.get_original() is not None and not self.is_processing:
@@ -1772,8 +1910,14 @@ class SoundDenoiserApp(ctk.CTk):
         self.transient_slider.set(30.0)
         self.hf_emphasis_slider.set(1.5)
         self.smoothing_slider.set(20.0)
+        # Fine-tuning defaults
+        self.hiss_start_slider.set(2000.0)
+        self.hiss_peak_slider.set(6000.0)
+        self.spectral_floor_slider.set(5.0)
+        self.low_cut_slider.set(0.0)
+        # Method default
         self.method_dropdown.set("Spectral Subtraction")
-        self.denoiser.set_method(DenoiseMethod.NOISEREDUCE)
+        self.denoiser.set_method(DenoiseMethod.SPECTRAL_SUBTRACTION)
         
     def _toggle_play(self, which: str):
         """Toggle play/pause for original or processed audio."""
@@ -1878,36 +2022,14 @@ class SoundDenoiserApp(ctk.CTk):
             self._process_dropped_files(file_list)
         
         # Update waveform playheads during playback
-        # Throttle spectrogram updates for better performance
-        current_time = time.time()
-        
+        # Note: update_playhead automatically skips canvas redraws in spectrogram mode
         if self.player_original.is_playing():
             pos = self.player_original.get_position()
-            # Throttle updates in spectrogram mode (every 150ms) for performance
-            if self.waveform_original._view_mode == "spectrogram":
-                if not hasattr(self, '_last_orig_update') or current_time - self._last_orig_update > 0.15:
-                    self.waveform_original.update_playhead(pos)
-                    self._last_orig_update = current_time
-                else:
-                    # Just update time label without canvas redraw
-                    self.waveform_original._current_position = pos
-                    self.waveform_original._update_time_label(pos)
-            else:
-                self.waveform_original.update_playhead(pos)
+            self.waveform_original.update_playhead(pos)
                 
         if self.player_processed.is_playing():
             pos = self.player_processed.get_position()
-            # Throttle updates in spectrogram mode (every 150ms) for performance
-            if self.waveform_processed._view_mode == "spectrogram":
-                if not hasattr(self, '_last_proc_update') or current_time - self._last_proc_update > 0.15:
-                    self.waveform_processed.update_playhead(pos)
-                    self._last_proc_update = current_time
-                else:
-                    # Just update time label without canvas redraw
-                    self.waveform_processed._current_position = pos
-                    self.waveform_processed._update_time_label(pos)
-            else:
-                self.waveform_processed.update_playhead(pos)
+            self.waveform_processed.update_playhead(pos)
             
         # Update play buttons on completion
         if self.player_original.get_state() == PlaybackState.STOPPED:

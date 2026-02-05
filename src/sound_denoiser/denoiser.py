@@ -83,6 +83,11 @@ class AudioDenoiser:
         high_freq_emphasis: float = 1.5,
         smoothing_factor: float = 0.2,
         method: DenoiseMethod = DenoiseMethod.SPECTRAL_SUBTRACTION,
+        # New fine-tuning parameters
+        hiss_start_freq: float = 2000.0,
+        hiss_peak_freq: float = 6000.0,
+        spectral_floor: float = 0.05,
+        low_cut_freq: float = 0.0,
     ):
         """
         Initialize the denoiser with parameters.
@@ -95,6 +100,10 @@ class AudioDenoiser:
             high_freq_emphasis: Extra reduction for high frequencies where hiss lives (default: 1.5)
             smoothing_factor: Temporal smoothing for noise estimate (0-1, default: 0.2)
             method: Denoising method to use (default: SPECTRAL_SUBTRACTION)
+            hiss_start_freq: Frequency where hiss reduction begins (Hz, default: 2000)
+            hiss_peak_freq: Frequency where hiss reduction is maximum (Hz, default: 6000)
+            spectral_floor: Minimum signal to retain, prevents artifacts (0-1, default: 0.05)
+            low_cut_freq: High-pass filter frequency for rumble removal (Hz, 0=off, default: 0)
         """
         self.max_db_reduction = max_db_reduction
         self.blend_original = blend_original
@@ -103,6 +112,12 @@ class AudioDenoiser:
         self.high_freq_emphasis = high_freq_emphasis
         self.smoothing_factor = smoothing_factor
         self.method = method
+        
+        # Fine-tuning parameters
+        self.hiss_start_freq = hiss_start_freq
+        self.hiss_peak_freq = hiss_peak_freq
+        self.spectral_floor = spectral_floor
+        self.low_cut_freq = low_cut_freq
         
         # Internal state
         self._audio: Optional[np.ndarray] = None
@@ -307,7 +322,7 @@ class AudioDenoiser:
     def _apply_high_frequency_reduction(self, audio: np.ndarray, sr: int) -> np.ndarray:
         """
         Apply additional reduction to high frequencies where hiss typically lives.
-        Hiss is usually in the 2kHz-16kHz range.
+        Uses configurable hiss_start_freq and hiss_peak_freq parameters.
         """
         # Compute STFT
         stft = librosa.stft(audio, n_fft=self.N_FFT, hop_length=self.HOP_LENGTH)
@@ -318,23 +333,54 @@ class AudioDenoiser:
         freq_bins = stft_mag.shape[0]
         freqs = librosa.fft_frequencies(sr=sr, n_fft=self.N_FFT)
         
-        # Hiss typically lives above 2kHz
-        hiss_start_freq = 2000
-        hiss_peak_freq = 6000
+        # Use configurable hiss frequency range
+        hiss_start = self.hiss_start_freq
+        hiss_peak = self.hiss_peak_freq
         
         # Create smooth reduction curve
         gain = np.ones(freq_bins)
         for i, freq in enumerate(freqs):
-            if freq > hiss_start_freq:
+            if freq > hiss_start:
                 # Gradually increase reduction for higher frequencies
-                reduction_amount = min(1.0, (freq - hiss_start_freq) / (hiss_peak_freq - hiss_start_freq))
+                reduction_amount = min(1.0, (freq - hiss_start) / (hiss_peak - hiss_start + 1))
                 reduction_amount *= self.high_freq_emphasis - 1.0
-                gain[i] = max(0.3, 1.0 - reduction_amount * self.noise_reduction_strength)
+                # Use spectral_floor as minimum gain to prevent artifacts
+                min_gain = max(0.1, self.spectral_floor)
+                gain[i] = max(min_gain, 1.0 - reduction_amount * self.noise_reduction_strength)
         
         # Apply gain
         stft_reduced = stft_mag * gain[:, np.newaxis] * np.exp(1j * stft_phase)
         
         return librosa.istft(stft_reduced, hop_length=self.HOP_LENGTH, length=len(audio))
+    
+    def _apply_low_cut_filter(self, audio: np.ndarray, sr: int) -> np.ndarray:
+        """
+        Apply a high-pass filter to remove low-frequency rumble.
+        
+        Args:
+            audio: Input audio
+            sr: Sample rate
+            
+        Returns:
+            Filtered audio with low frequencies removed
+        """
+        if self.low_cut_freq <= 0:
+            return audio
+        
+        # Design a Butterworth high-pass filter
+        nyquist = sr / 2
+        normalized_cutoff = min(self.low_cut_freq / nyquist, 0.99)
+        
+        if normalized_cutoff <= 0:
+            return audio
+        
+        # 4th order Butterworth for smooth rolloff
+        b, a = signal.butter(4, normalized_cutoff, btype='high')
+        
+        # Apply filter with zero-phase filtering (no phase distortion)
+        filtered = signal.filtfilt(b, a, audio)
+        
+        return filtered
     
     def _detect_transients(self, audio: np.ndarray, sr: int) -> np.ndarray:
         """Detect transients for protection."""
@@ -380,8 +426,9 @@ class AudioDenoiser:
         # Over-subtraction factor (reduces musical noise)
         alpha = 1.0 + self.noise_reduction_strength * 2.0
         
-        # Spectral floor (prevents negative values)
-        beta = 0.01 + (1 - self.noise_reduction_strength) * 0.1
+        # Spectral floor (prevents negative values and musical noise artifacts)
+        # Uses the configurable spectral_floor parameter
+        beta = self.spectral_floor + (1 - self.noise_reduction_strength) * 0.05
         
         # Perform spectral subtraction
         noise_estimate_2d = noise_estimate[:, np.newaxis]
@@ -678,6 +725,10 @@ class AudioDenoiser:
         if self.blend_original > 0:
             denoised = denoised * (1 - self.blend_original) + audio_channel * self.blend_original
         
+        # Apply low-cut filter for rumble removal (if enabled)
+        if self.low_cut_freq > 0:
+            denoised = self._apply_low_cut_filter(denoised, self._sr)
+        
         return denoised
     
     def process(self, audio: Optional[np.ndarray] = None, sr: Optional[int] = None) -> np.ndarray:
@@ -768,6 +819,10 @@ class AudioDenoiser:
         high_freq_emphasis: Optional[float] = None,
         smoothing_factor: Optional[float] = None,
         method: Optional[DenoiseMethod] = None,
+        hiss_start_freq: Optional[float] = None,
+        hiss_peak_freq: Optional[float] = None,
+        spectral_floor: Optional[float] = None,
+        low_cut_freq: Optional[float] = None,
     ):
         """Update denoiser parameters."""
         if max_db_reduction is not None:
@@ -784,6 +839,14 @@ class AudioDenoiser:
             self.smoothing_factor = smoothing_factor
         if method is not None:
             self.method = method
+        if hiss_start_freq is not None:
+            self.hiss_start_freq = hiss_start_freq
+        if hiss_peak_freq is not None:
+            self.hiss_peak_freq = hiss_peak_freq
+        if spectral_floor is not None:
+            self.spectral_floor = spectral_floor
+        if low_cut_freq is not None:
+            self.low_cut_freq = low_cut_freq
     
     def set_method(self, method: DenoiseMethod):
         """Set the denoising method."""
