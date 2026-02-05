@@ -31,10 +31,10 @@ except ImportError:
 
 # Handle imports for both module and direct execution
 try:
-    from .denoiser import AudioDenoiser, NoiseProfile
+    from .denoiser import AudioDenoiser, NoiseProfile, DenoiseMethod
     from .audio_player import AudioPlayer, PlaybackState
 except ImportError:
-    from denoiser import AudioDenoiser, NoiseProfile
+    from denoiser import AudioDenoiser, NoiseProfile, DenoiseMethod
     from audio_player import AudioPlayer, PlaybackState
 
 
@@ -44,28 +44,59 @@ ctk.set_default_color_theme("blue")
 
 
 class WaveformDisplay(ctk.CTkFrame):
-    """Widget for displaying audio waveforms with noise region selection and playhead."""
+    """Widget for displaying audio waveforms/spectrograms with click-to-seek and noise region selection."""
     
-    def __init__(self, master, on_region_select=None, waveform_color='#00d9ff', **kwargs):
+    def __init__(self, master, on_region_select=None, on_seek=None, waveform_color='#00d9ff', **kwargs):
         super().__init__(master, **kwargs)
         
         self.on_region_select = on_region_select
+        self.on_seek = on_seek  # Callback for click-to-seek
         self._duration = 0.0
         self._selection_enabled = False
         self._selected_region: Optional[Tuple[float, float]] = None
         self._waveform_color = waveform_color
         self._current_position = 0.0
+        self._view_mode = "waveform"  # "waveform" or "spectrogram"
         
         # Store waveform data for redrawing
         self._audio_data = None
         self._sample_rate = 44100
         self._title = "Waveform"
         
+        # View toggle frame
+        toggle_frame = ctk.CTkFrame(self, fg_color="transparent", height=28)
+        toggle_frame.pack(fill="x", padx=5, pady=(5, 0))
+        
+        # View mode segmented button
+        self.view_toggle = ctk.CTkSegmentedButton(
+            toggle_frame,
+            values=["Waveform", "Spectrogram"],
+            command=self._on_view_change,
+            font=ctk.CTkFont(size=11),
+            height=24,
+            fg_color="#252535",
+            selected_color="#6c3483",
+            selected_hover_color="#8e44ad",
+            unselected_color="#1a1a2e",
+            unselected_hover_color="#252535"
+        )
+        self.view_toggle.set("Waveform")
+        self.view_toggle.pack(side="left", padx=2)
+        
+        # Time display label
+        self.time_label = ctk.CTkLabel(
+            toggle_frame,
+            text="0:00 / 0:00",
+            font=ctk.CTkFont(size=11),
+            text_color="#888888"
+        )
+        self.time_label.pack(side="right", padx=5)
+        
         # Create matplotlib figure with dark theme
-        self.fig = Figure(figsize=(10, 2.5), dpi=100, facecolor='#1a1a2e')
+        self.fig = Figure(figsize=(10, 2.2), dpi=100, facecolor='#1a1a2e')
         self.ax = self.fig.add_subplot(111)
         self.ax.set_facecolor('#1a1a2e')
-        self.fig.subplots_adjust(left=0.05, right=0.95, top=0.9, bottom=0.15)
+        self.fig.subplots_adjust(left=0.05, right=0.95, top=0.88, bottom=0.18)
         
         # Style the axes
         self.ax.tick_params(colors='#888888', labelsize=8)
@@ -79,6 +110,13 @@ class WaveformDisplay(ctk.CTkFrame):
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
         
+        # Bind click events for seeking
+        self.canvas.mpl_connect('button_press_event', self._on_canvas_click)
+        self.canvas.mpl_connect('motion_notify_event', self._on_canvas_drag)
+        self.canvas.mpl_connect('button_release_event', self._on_canvas_release)
+        self._is_dragging = False
+        self._drag_seeking = False
+        
         # Playhead line
         self.playhead = None
         
@@ -90,6 +128,167 @@ class WaveformDisplay(ctk.CTkFrame):
         
         # Span selector for region selection
         self.span_selector = None
+    
+    def _format_time(self, seconds: float) -> str:
+        """Format seconds as M:SS."""
+        if seconds < 0:
+            seconds = 0
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        if minutes >= 60:
+            hours = minutes // 60
+            minutes = minutes % 60
+            return f"{hours}:{minutes:02d}:{secs:02d}"
+        return f"{minutes}:{secs:02d}"
+    
+    def _update_time_label(self, position: float = None):
+        """Update the time display label."""
+        if position is None:
+            position = self._current_position
+        current_time = position * self._duration
+        self.time_label.configure(
+            text=f"{self._format_time(current_time)} / {self._format_time(self._duration)}"
+        )
+    
+    def _on_view_change(self, value: str):
+        """Handle view mode change."""
+        new_mode = "waveform" if value == "Waveform" else "spectrogram"
+        if new_mode != self._view_mode:
+            self._view_mode = new_mode
+            self._redraw_display()
+    
+    def _redraw_display(self):
+        """Redraw the current display (waveform or spectrogram)."""
+        if self._audio_data is None:
+            return
+        
+        if self._view_mode == "waveform":
+            self._plot_waveform_internal()
+        else:
+            self._plot_spectrogram_internal()
+    
+    def _plot_waveform_internal(self):
+        """Internal method to plot waveform."""
+        self.ax.clear()
+        self.ax.set_facecolor('#1a1a2e')
+        self.selection_rect = None
+        self.playhead = None
+        self.played_area = None
+        
+        audio = self._audio_data
+        sr = self._sample_rate
+        
+        # Create time axis
+        times = np.linspace(0, self._duration, len(audio))
+        
+        # Downsample for faster plotting
+        if len(audio) > 10000:
+            step = len(audio) // 10000
+            times_display = times[::step]
+            audio_display = audio[::step]
+        else:
+            times_display = times
+            audio_display = audio
+        
+        self.ax.fill_between(times_display, audio_display, alpha=0.6, color=self._waveform_color)
+        self.ax.plot(times_display, audio_display, color=self._waveform_color, linewidth=0.5, alpha=0.8)
+        self.ax.set_xlim(0, self._duration)
+        self.ax.set_ylim(-1, 1)
+        
+        # Restore selection if any
+        if self._selected_region:
+            self._draw_selection_rect(*self._selected_region)
+        
+        self.ax.set_title(self._title, color='#ffffff', fontsize=10, fontweight='bold')
+        self.ax.set_xlabel('Time (s)', color='#888888', fontsize=8)
+        self.ax.tick_params(colors='#888888', labelsize=8)
+        
+        self.canvas.draw()
+        
+        # Restore playhead
+        if self._current_position > 0:
+            self.update_playhead(self._current_position)
+    
+    def _plot_spectrogram_internal(self):
+        """Internal method to plot spectrogram."""
+        self.ax.clear()
+        self.ax.set_facecolor('#1a1a2e')
+        self.selection_rect = None
+        self.playhead = None
+        self.played_area = None
+        
+        audio = self._audio_data
+        sr = self._sample_rate
+        
+        # Compute spectrogram
+        D = librosa.amplitude_to_db(
+            np.abs(librosa.stft(audio, n_fft=2048, hop_length=512)),
+            ref=np.max
+        )
+        
+        # Plot spectrogram with custom colormap
+        img = librosa.display.specshow(
+            D, sr=sr, hop_length=512, x_axis='time', y_axis='hz',
+            ax=self.ax, cmap='magma'
+        )
+        
+        self.ax.set_xlim(0, self._duration)
+        self.ax.set_ylim(0, sr // 2)
+        
+        # Restore selection if any
+        if self._selected_region:
+            self._draw_selection_rect(*self._selected_region)
+        
+        self.ax.set_title(self._title.replace("Waveform", "Spectrogram"), color='#ffffff', fontsize=10, fontweight='bold')
+        self.ax.set_xlabel('Time (s)', color='#888888', fontsize=8)
+        self.ax.set_ylabel('Frequency (Hz)', color='#888888', fontsize=8)
+        self.ax.tick_params(colors='#888888', labelsize=8)
+        
+        self.canvas.draw()
+        
+        # Restore playhead
+        if self._current_position > 0:
+            self.update_playhead(self._current_position)
+    
+    def _on_canvas_click(self, event):
+        """Handle mouse click on canvas for seeking."""
+        if event.inaxes != self.ax or self._duration <= 0:
+            return
+        
+        # Check if we're in selection mode
+        if self._selection_enabled:
+            return  # Let span selector handle it
+        
+        # Convert x position to time fraction
+        x_pos = event.xdata
+        if x_pos is not None:
+            position = max(0, min(1, x_pos / self._duration))
+            self._drag_seeking = True
+            self._current_position = position
+            self.update_playhead(position)
+            self._update_time_label(position)
+            
+            if self.on_seek:
+                self.on_seek(position)
+    
+    def _on_canvas_drag(self, event):
+        """Handle mouse drag on canvas for seeking."""
+        if not self._drag_seeking or event.inaxes != self.ax or self._duration <= 0:
+            return
+        
+        x_pos = event.xdata
+        if x_pos is not None:
+            position = max(0, min(1, x_pos / self._duration))
+            self._current_position = position
+            self.update_playhead(position)
+            self._update_time_label(position)
+            
+            if self.on_seek:
+                self.on_seek(position)
+    
+    def _on_canvas_release(self, event):
+        """Handle mouse release after seeking."""
+        self._drag_seeking = False
         
     def enable_selection(self, enable: bool = True):
         """Enable or disable region selection mode."""
@@ -165,7 +364,7 @@ class WaveformDisplay(ctk.CTkFrame):
         color: str = '#00d9ff'
     ):
         """
-        Plot audio waveform.
+        Plot audio waveform or spectrogram based on current view mode.
         
         Args:
             audio: Audio data
@@ -173,11 +372,6 @@ class WaveformDisplay(ctk.CTkFrame):
             title: Plot title
             color: Waveform color
         """
-        self.ax.clear()
-        self.ax.set_facecolor('#1a1a2e')
-        self.selection_rect = None
-        self.playhead = None
-        self.played_area = None
         self._waveform_color = color
         self._title = title
         self._sample_rate = sr
@@ -190,38 +384,16 @@ class WaveformDisplay(ctk.CTkFrame):
             
             # Store for later use
             self._audio_data = audio.copy()
-            
-            # Create time axis
             self._duration = len(audio) / sr
-            times = np.linspace(0, self._duration, len(audio))
-            
-            # Downsample for faster plotting
-            if len(audio) > 10000:
-                step = len(audio) // 10000
-                times_display = times[::step]
-                audio_display = audio[::step]
-            else:
-                times_display = times
-                audio_display = audio
-            
-            # Plot waveform
-            self.ax.plot(times_display, audio_display, color=color, linewidth=0.5, alpha=0.8)
-            self.ax.fill_between(times_display, audio_display, alpha=0.3, color=color)
-            self.ax.set_xlim(0, self._duration)
-            self.ax.set_ylim(-1, 1)
-            
-            # Re-draw selection if exists
-            if self._selected_region:
-                self._draw_selection_rect(*self._selected_region)
         else:
             self._duration = 0.0
             self._audio_data = None
-            
-        self.ax.set_title(title, color='#ffffff', fontsize=10, fontweight='bold')
-        self.ax.set_xlabel('Time (s)', color='#888888', fontsize=8)
-        self.ax.tick_params(colors='#888888', labelsize=8)
         
-        self.canvas.draw()
+        # Update time label
+        self._update_time_label(0)
+        
+        # Draw based on current view mode
+        self._redraw_display()
     
     def update_playhead(self, position: float):
         """
@@ -235,6 +407,9 @@ class WaveformDisplay(ctk.CTkFrame):
             
         time_pos = position * self._duration
         self._current_position = position
+        
+        # Update time label
+        self._update_time_label(position)
         
         # Remove old playhead
         if self.playhead is not None:
@@ -276,6 +451,7 @@ class WaveformDisplay(ctk.CTkFrame):
     def reset_playhead(self):
         """Reset playhead to start."""
         self._current_position = 0.0
+        self._update_time_label(0)
         if self.playhead is not None:
             try:
                 self.playhead.remove()
@@ -831,20 +1007,21 @@ class SoundDenoiserApp(ctk.CTk):
         
         self.waveform_original = WaveformDisplay(
             original_frame,
-            on_region_select=self._on_noise_region_selected
+            on_region_select=self._on_noise_region_selected,
+            on_seek=lambda pos: self._on_seek("original", pos)
         )
         self.waveform_original.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
-        self.waveform_original.plot_waveform(None, 44100, "Original Audio (Click & drag to select noise region)", "#ff9f43")
+        self.waveform_original.plot_waveform(None, 44100, "Original Audio (Click to seek, drag to select noise)", "#ff9f43")
         
-        # Original playback controls
+        # Original playback controls (compact row)
         orig_controls = ctk.CTkFrame(original_frame, fg_color="transparent")
-        orig_controls.grid(row=1, column=0, sticky="ew", padx=10, pady=5)
+        orig_controls.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 5))
         
         self.play_orig_btn = ctk.CTkButton(
             orig_controls,
             text="▶",
-            width=40,
-            height=32,
+            width=50,
+            height=28,
             command=lambda: self._toggle_play("original"),
             fg_color="#ff9f43",
             hover_color="#f39c12",
@@ -857,8 +1034,8 @@ class SoundDenoiserApp(ctk.CTk):
         self.stop_orig_btn = ctk.CTkButton(
             orig_controls,
             text="⏹",
-            width=40,
-            height=32,
+            width=50,
+            height=28,
             command=lambda: self._stop_play("original"),
             fg_color="#555555",
             hover_color="#777777",
@@ -867,13 +1044,14 @@ class SoundDenoiserApp(ctk.CTk):
         )
         self.stop_orig_btn.pack(side="left", padx=2)
         
-        # Seekable progress bar for original
-        self.seek_orig = SeekBar(
+        # Label hint
+        hint_label = ctk.CTkLabel(
             orig_controls,
-            color="#ff9f43",
-            on_seek=lambda pos: self._on_seek("original", pos)
+            text="Click on waveform to seek",
+            font=ctk.CTkFont(size=10),
+            text_color="#666666"
         )
-        self.seek_orig.pack(side="left", fill="x", expand=True, padx=(10, 0))
+        hint_label.pack(side="right", padx=5)
         
         # Processed waveform
         processed_frame = ctk.CTkFrame(left_panel, fg_color="#151525", corner_radius=10)
@@ -881,19 +1059,22 @@ class SoundDenoiserApp(ctk.CTk):
         processed_frame.grid_rowconfigure(0, weight=1)
         processed_frame.grid_columnconfigure(0, weight=1)
         
-        self.waveform_processed = WaveformDisplay(processed_frame)
+        self.waveform_processed = WaveformDisplay(
+            processed_frame,
+            on_seek=lambda pos: self._on_seek("processed", pos)
+        )
         self.waveform_processed.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
         self.waveform_processed.plot_waveform(None, 44100, "Processed Audio (Denoised)", "#00d9ff")
         
-        # Processed playback controls
+        # Processed playback controls (compact row)
         proc_controls = ctk.CTkFrame(processed_frame, fg_color="transparent")
-        proc_controls.grid(row=1, column=0, sticky="ew", padx=10, pady=5)
+        proc_controls.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 5))
         
         self.play_proc_btn = ctk.CTkButton(
             proc_controls,
             text="▶",
-            width=40,
-            height=32,
+            width=50,
+            height=28,
             command=lambda: self._toggle_play("processed"),
             fg_color="#00d9ff",
             hover_color="#00b8d4",
@@ -906,8 +1087,8 @@ class SoundDenoiserApp(ctk.CTk):
         self.stop_proc_btn = ctk.CTkButton(
             proc_controls,
             text="⏹",
-            width=40,
-            height=32,
+            width=50,
+            height=28,
             command=lambda: self._stop_play("processed"),
             fg_color="#555555",
             hover_color="#777777",
@@ -919,24 +1100,16 @@ class SoundDenoiserApp(ctk.CTk):
         # Sync button - syncs processed position to original position
         self.sync_btn = ctk.CTkButton(
             proc_controls,
-            text="🔗",
-            width=40,
-            height=32,
+            text="🔗 Sync",
+            width=70,
+            height=28,
             command=self._sync_to_original,
             fg_color="#6c3483",
             hover_color="#8e44ad",
-            font=ctk.CTkFont(size=14),
+            font=ctk.CTkFont(size=12),
             state="disabled"
         )
-        self.sync_btn.pack(side="left", padx=2)
-        
-        # Seekable progress bar for processed
-        self.seek_proc = SeekBar(
-            proc_controls,
-            color="#00d9ff",
-            on_seek=lambda pos: self._on_seek("processed", pos)
-        )
-        self.seek_proc.pack(side="left", fill="x", expand=True, padx=(10, 0))
+        self.sync_btn.pack(side="left", padx=5)
         
     def _create_parameter_panel(self, parent):
         """Create parameter controls panel."""
@@ -981,6 +1154,42 @@ class SoundDenoiserApp(ctk.CTk):
         # Parameters
         params_inner = ctk.CTkFrame(params_frame, fg_color="transparent")
         params_inner.pack(fill="x", padx=10, pady=(0, 10))
+        
+        # Denoising Method Selector
+        method_frame = ctk.CTkFrame(params_inner, fg_color="transparent")
+        method_frame.pack(fill="x", pady=(0, 12))
+        
+        method_label = ctk.CTkLabel(
+            method_frame,
+            text="Denoising Method",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#cccccc"
+        )
+        method_label.pack(anchor="w")
+        
+        # Method names for display
+        self._method_names = {
+            "NoiseReduce (Default)": DenoiseMethod.NOISEREDUCE,
+            "Spectral Subtraction": DenoiseMethod.SPECTRAL_SUBTRACTION,
+            "Wiener Filter": DenoiseMethod.WIENER,
+            "Multi-Band Adaptive": DenoiseMethod.MULTIBAND,
+            "Combined (All Methods)": DenoiseMethod.COMBINED,
+        }
+        
+        self.method_dropdown = ctk.CTkOptionMenu(
+            method_frame,
+            values=list(self._method_names.keys()),
+            command=self._on_method_change,
+            fg_color="#252535",
+            button_color="#6c3483",
+            button_hover_color="#8e44ad",
+            dropdown_fg_color="#1a1a2e",
+            dropdown_hover_color="#252535",
+            font=ctk.CTkFont(size=11),
+            width=200
+        )
+        self.method_dropdown.set("NoiseReduce (Default)")
+        self.method_dropdown.pack(anchor="w", pady=(5, 0))
         
         # Max dB Reduction
         self.max_db_slider = ParameterSlider(
@@ -1344,6 +1553,15 @@ class SoundDenoiserApp(ctk.CTk):
         """Handle parameter change - enable reprocessing hint."""
         if self.denoiser.get_original() is not None and not self.is_processing:
             self.process_btn.configure(fg_color="#884499")
+    
+    def _on_method_change(self, method_name: str):
+        """Handle denoising method change."""
+        method = self._method_names.get(method_name, DenoiseMethod.NOISEREDUCE)
+        self.denoiser.set_method(method)
+        self._set_status(f"Method changed to: {method_name}")
+        # Highlight process button to indicate reprocessing needed
+        if self.denoiser.get_original() is not None and not self.is_processing:
+            self.process_btn.configure(fg_color="#884499")
             
     def _reset_parameters(self):
         """Reset parameters to defaults."""
@@ -1353,6 +1571,8 @@ class SoundDenoiserApp(ctk.CTk):
         self.transient_slider.set(30.0)
         self.hf_emphasis_slider.set(1.5)
         self.smoothing_slider.set(20.0)
+        self.method_dropdown.set("NoiseReduce (Default)")
+        self.denoiser.set_method(DenoiseMethod.NOISEREDUCE)
         
     def _toggle_play(self, which: str):
         """Toggle play/pause for original or processed audio."""
@@ -1381,12 +1601,10 @@ class SoundDenoiserApp(ctk.CTk):
         if which == "original":
             self.player_original.stop()
             self.play_orig_btn.configure(text="▶")
-            self.seek_orig.set_position(0)
             self.waveform_original.reset_playhead()
         else:
             self.player_processed.stop()
             self.play_proc_btn.configure(text="▶")
-            self.seek_proc.set_position(0)
             self.waveform_processed.reset_playhead()
             
     def _on_seek(self, which: str, position: float):
@@ -1405,7 +1623,6 @@ class SoundDenoiserApp(ctk.CTk):
         
         # Set the processed player to the same position
         self.player_processed.seek(orig_position)
-        self.seek_proc.set_position(orig_position)
         self.waveform_processed.update_playhead(orig_position)
         
         # If original is playing, also play processed (and stop original for A/B comparison)
@@ -1415,7 +1632,10 @@ class SoundDenoiserApp(ctk.CTk):
             self.player_processed.play()
             self.play_proc_btn.configure(text="⏸")
         
-        self._set_status(f"Synced to position: {self.seek_orig._format_time(orig_position * self.seek_orig._duration)}")
+        # Format the time for status
+        duration = self.waveform_original._duration
+        current_time = orig_position * duration
+        self._set_status(f"Synced to position: {self.waveform_original._format_time(current_time)}")
             
     def _set_status(self, message: str):
         """Update status bar message."""
@@ -1456,14 +1676,12 @@ class SoundDenoiserApp(ctk.CTk):
             self._pending_drop_files = None
             self._process_dropped_files(file_list)
         
-        # Update seek bars and waveform playheads
+        # Update waveform playheads during playback
         if self.player_original.is_playing():
             pos = self.player_original.get_position()
-            self.seek_orig.set_position(pos)
             self.waveform_original.update_playhead(pos)
         if self.player_processed.is_playing():
             pos = self.player_processed.get_position()
-            self.seek_proc.set_position(pos)
             self.waveform_processed.update_playhead(pos)
             
         # Update play buttons on completion
@@ -1481,7 +1699,7 @@ class SoundDenoiserApp(ctk.CTk):
         display_audio = audio[0] if audio.ndim == 2 else audio
         self.waveform_original.plot_waveform(
             display_audio, sr,
-            "Original Audio (Click & drag to select noise region)", "#ff9f43"
+            "Original Audio (Click to seek, drag to select noise)", "#ff9f43"
         )
         self.waveform_processed.plot_waveform(None, sr, "Processed Audio (Denoised)", "#00d9ff")
         
@@ -1490,11 +1708,6 @@ class SoundDenoiserApp(ctk.CTk):
         
         # Load into player
         self.player_original.load(audio, sr)
-        
-        # Calculate duration and set on seek bars
-        duration = len(audio[0] if audio.ndim == 2 else audio) / sr
-        self.seek_orig.set_duration(duration)
-        self.seek_proc.set_duration(duration)
         
         # Enable controls
         self.play_orig_btn.configure(state="normal")
@@ -1509,6 +1722,7 @@ class SoundDenoiserApp(ctk.CTk):
         self.save_btn.configure(state="disabled")
         
         # Update status
+        duration = self.waveform_original._duration
         self._set_status(f"Loaded: {duration:.1f}s @ {sr}Hz - Select noise region or use Auto Detect")
         self.file_label.configure(text=self.input_path.name)
         
