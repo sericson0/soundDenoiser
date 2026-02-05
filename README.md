@@ -7,6 +7,9 @@ A Python application for removing hiss and noise from vintage/older audio record
 
 ## Features
 
+- **Noise Profile Learning** - iZotope RX-style spectral denoising from a learned noise sample
+- **Auto-Detect Noise Regions** - Automatically finds the quietest sections for noise sampling
+- **Manual Region Selection** - Click and drag on waveform to select noise-only sections
 - **Adaptive Spectral Denoising** - Uses librosa for intelligent noise reduction
 - **Preserve Audio Fidelity** - Configurable maximum dB reduction to avoid over-cleaning
 - **Transient Protection** - Maintains punch and attack of drums and percussion
@@ -62,7 +65,13 @@ sound-denoiser
 
 2. **Load an audio file** by clicking "📂 Load Audio"
 
-3. **Adjust parameters** as needed:
+3. **Learn a noise profile** (recommended for best results):
+   - **Auto Detect**: Click "🔍 Auto Detect" to automatically find a quiet section
+   - **Manual Selection**: Click and drag on the original waveform to select a region with only noise (no music)
+   - Click "📝 Learn from Selection" to learn the noise profile
+   - Toggle "Use learned profile" to switch between learned and adaptive modes
+
+4. **Adjust parameters** as needed:
    - **Max dB Reduction** (default: 4dB) - Limits how much noise can be removed
    - **Blend Original** (default: 12%) - Mix back original signal for warmth
    - **Noise Reduction Strength** - Overall intensity of noise removal
@@ -70,9 +79,9 @@ sound-denoiser
    - **High Frequency Rolloff** - More aggressive reduction at high frequencies
    - **Temporal Smoothing** - Reduce musical noise artifacts
 
-4. **Preview** the processed audio using the play controls
+5. **Preview** the processed audio using the play controls
 
-5. **Save** when satisfied with the result
+6. **Save** when satisfied with the result
 
 ### Programmatic Usage
 
@@ -87,12 +96,40 @@ denoiser = AudioDenoiser(
     transient_protection=0.5,
 )
 
-# Load and process audio
+# Load audio
 audio, sr = denoiser.load_audio("path/to/noisy_audio.wav")
+
+# Option 1: Auto-detect noise region and learn profile
+profile, (start, end) = denoiser.auto_learn_noise_profile(min_duration=0.5)
+print(f"Noise region detected: {start:.2f}s - {end:.2f}s")
+
+# Option 2: Manually specify a noise region (e.g., first 0.5 seconds)
+# profile = denoiser.learn_noise_profile(start_time=0.0, end_time=0.5)
+
+# Process with learned profile
 processed = denoiser.process()
 
 # Save the result
 denoiser.save("path/to/cleaned_audio.wav")
+```
+
+### Noise Profile Learning
+
+The noise profile learning feature works similar to iZotope RX:
+
+```python
+# Learn from a specific region known to contain only noise
+denoiser.learn_noise_profile(start_time=0.0, end_time=0.5)
+
+# Or auto-detect the quietest region
+profile, region = denoiser.auto_learn_noise_profile()
+
+# Toggle between learned profile and adaptive estimation
+denoiser.set_use_learned_profile(True)   # Use learned profile
+denoiser.set_use_learned_profile(False)  # Use adaptive estimation
+
+# Clear learned profile
+denoiser.clear_noise_profile()
 ```
 
 ## Parameters Guide
@@ -108,8 +145,18 @@ denoiser.save("path/to/cleaned_audio.wav")
 
 ## Algorithm
 
-The denoiser uses an adaptive spectral gating approach:
+The denoiser uses an iZotope RX-inspired spectral subtraction approach:
 
+### With Learned Noise Profile (Recommended)
+1. **Noise Profile Learning** - Analyzes a noise-only region to create spectral fingerprint
+2. **Wiener Filtering** - Uses the learned profile for optimal noise estimation
+3. **Over-subtraction** - Applies configurable over-subtraction for cleaner results
+4. **Soft Thresholding** - Smooth transitions based on signal-to-noise ratio
+5. **Transient Protection** - Preserves attack transients during reduction
+6. **Maximum Reduction Limiting** - Ensures noise reduction never exceeds the specified maximum
+7. **Original Blending** - Mixes back original signal to preserve character
+
+### Without Noise Profile (Adaptive Mode)
 1. **Noise Floor Estimation** - Uses percentile-based analysis to estimate the noise floor
 2. **Transient Detection** - Identifies transient regions to protect from over-processing
 3. **Spectral Gating** - Creates a soft mask based on SNR with smooth transitions

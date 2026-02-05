@@ -3,6 +3,7 @@ Modern GUI for the Sound Denoiser application.
 
 Provides an intuitive interface for loading audio, adjusting
 denoising parameters, previewing results, and saving output.
+Includes noise profile learning with visual region selection.
 """
 
 import customtkinter as ctk
@@ -11,14 +12,16 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+from matplotlib.patches import Rectangle
+from matplotlib.widgets import SpanSelector
 import librosa
 import librosa.display
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 import queue
 
-from .denoiser import AudioDenoiser
+from .denoiser import AudioDenoiser, NoiseProfile
 from .audio_player import AudioPlayer, PlaybackState
 
 
@@ -28,10 +31,15 @@ ctk.set_default_color_theme("blue")
 
 
 class WaveformDisplay(ctk.CTkFrame):
-    """Widget for displaying audio waveforms."""
+    """Widget for displaying audio waveforms with noise region selection."""
     
-    def __init__(self, master, **kwargs):
+    def __init__(self, master, on_region_select=None, **kwargs):
         super().__init__(master, **kwargs)
+        
+        self.on_region_select = on_region_select
+        self._duration = 0.0
+        self._selection_enabled = False
+        self._selected_region: Optional[Tuple[float, float]] = None
         
         # Create matplotlib figure with dark theme
         self.fig = Figure(figsize=(10, 2.5), dpi=100, facecolor='#1a1a2e')
@@ -54,6 +62,78 @@ class WaveformDisplay(ctk.CTkFrame):
         # Playhead line
         self.playhead = None
         
+        # Selection rectangle for noise region
+        self.selection_rect = None
+        
+        # Span selector for region selection
+        self.span_selector = None
+        
+    def enable_selection(self, enable: bool = True):
+        """Enable or disable region selection mode."""
+        self._selection_enabled = enable
+        
+        if enable and self._duration > 0:
+            # Create span selector
+            self.span_selector = SpanSelector(
+                self.ax,
+                self._on_span_select,
+                'horizontal',
+                useblit=True,
+                props=dict(alpha=0.3, facecolor='#ff6b6b'),
+                interactive=True,
+                drag_from_anywhere=True,
+            )
+        elif self.span_selector:
+            self.span_selector.set_active(False)
+            self.span_selector = None
+            
+    def _on_span_select(self, xmin, xmax):
+        """Handle span selection."""
+        if not self._selection_enabled:
+            return
+            
+        # Clamp to valid range
+        xmin = max(0, xmin)
+        xmax = min(self._duration, xmax)
+        
+        if xmax - xmin < 0.1:  # Minimum 100ms selection
+            return
+            
+        self._selected_region = (xmin, xmax)
+        self._draw_selection_rect(xmin, xmax)
+        
+        if self.on_region_select:
+            self.on_region_select(xmin, xmax)
+            
+    def _draw_selection_rect(self, start: float, end: float):
+        """Draw selection rectangle on waveform."""
+        # Remove existing rectangle
+        if self.selection_rect:
+            self.selection_rect.remove()
+            self.selection_rect = None
+            
+        # Draw new rectangle
+        self.selection_rect = self.ax.axvspan(
+            start, end,
+            alpha=0.3,
+            color='#ff6b6b',
+            label='Noise Region'
+        )
+        self.canvas.draw_idle()
+        
+    def set_noise_region(self, start: float, end: float):
+        """Set and display a noise region."""
+        self._selected_region = (start, end)
+        self._draw_selection_rect(start, end)
+        
+    def clear_noise_region(self):
+        """Clear the noise region selection."""
+        self._selected_region = None
+        if self.selection_rect:
+            self.selection_rect.remove()
+            self.selection_rect = None
+            self.canvas.draw_idle()
+        
     def plot_waveform(
         self,
         audio: Optional[np.ndarray],
@@ -72,6 +152,7 @@ class WaveformDisplay(ctk.CTkFrame):
         """
         self.ax.clear()
         self.ax.set_facecolor('#1a1a2e')
+        self.selection_rect = None
         
         if audio is not None:
             # Downsample for display if needed
@@ -79,8 +160,8 @@ class WaveformDisplay(ctk.CTkFrame):
                 audio = audio[0] if audio.shape[0] <= 2 else audio[:, 0]
             
             # Create time axis
-            duration = len(audio) / sr
-            times = np.linspace(0, duration, len(audio))
+            self._duration = len(audio) / sr
+            times = np.linspace(0, self._duration, len(audio))
             
             # Downsample for faster plotting
             if len(audio) > 10000:
@@ -90,8 +171,14 @@ class WaveformDisplay(ctk.CTkFrame):
             
             self.ax.plot(times, audio, color=color, linewidth=0.5, alpha=0.8)
             self.ax.fill_between(times, audio, alpha=0.3, color=color)
-            self.ax.set_xlim(0, duration)
+            self.ax.set_xlim(0, self._duration)
             self.ax.set_ylim(-1, 1)
+            
+            # Re-draw selection if exists
+            if self._selected_region:
+                self._draw_selection_rect(*self._selected_region)
+        else:
+            self._duration = 0.0
             
         self.ax.set_title(title, color='#ffffff', fontsize=10, fontweight='bold')
         self.ax.set_xlabel('Time (s)', color='#888888', fontsize=8)
@@ -187,6 +274,187 @@ class ParameterSlider(ctk.CTkFrame):
         self.value_label.configure(text=f"{value:.1f}{self.unit}")
 
 
+class NoiseProfilePanel(ctk.CTkFrame):
+    """Panel for noise profile learning controls."""
+    
+    def __init__(
+        self,
+        master,
+        on_learn_manual,
+        on_learn_auto,
+        on_clear,
+        on_toggle_use,
+        **kwargs
+    ):
+        super().__init__(master, fg_color="#151525", corner_radius=10, **kwargs)
+        
+        self.on_learn_manual = on_learn_manual
+        self.on_learn_auto = on_learn_auto
+        self.on_clear = on_clear
+        self.on_toggle_use = on_toggle_use
+        
+        self._setup_ui()
+        
+    def _setup_ui(self):
+        """Setup the UI components."""
+        # Title
+        title = ctk.CTkLabel(
+            self,
+            text="🎯 Noise Profile Learning",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="#ff6b6b"
+        )
+        title.pack(pady=(10, 5), padx=10, anchor="w")
+        
+        # Description
+        desc = ctk.CTkLabel(
+            self,
+            text="Select a region with only noise (hiss) for better results",
+            font=ctk.CTkFont(size=10),
+            text_color="#888888",
+            wraplength=200
+        )
+        desc.pack(padx=10, anchor="w")
+        
+        # Separator
+        sep = ctk.CTkFrame(self, height=1, fg_color="#333333")
+        sep.pack(fill="x", padx=10, pady=10)
+        
+        # Status indicator
+        self.status_frame = ctk.CTkFrame(self, fg_color="#1a2a3a", corner_radius=6)
+        self.status_frame.pack(fill="x", padx=10, pady=(0, 10))
+        
+        self.status_label = ctk.CTkLabel(
+            self.status_frame,
+            text="⚪ No noise profile learned",
+            font=ctk.CTkFont(size=11),
+            text_color="#888888"
+        )
+        self.status_label.pack(pady=8, padx=10, anchor="w")
+        
+        self.region_label = ctk.CTkLabel(
+            self.status_frame,
+            text="",
+            font=ctk.CTkFont(size=10),
+            text_color="#666666"
+        )
+        self.region_label.pack(pady=(0, 8), padx=10, anchor="w")
+        
+        # Use profile toggle
+        self.use_profile_var = ctk.BooleanVar(value=False)
+        self.use_profile_switch = ctk.CTkSwitch(
+            self,
+            text="Use learned profile",
+            variable=self.use_profile_var,
+            command=self._on_toggle,
+            font=ctk.CTkFont(size=11),
+            progress_color="#ff6b6b",
+            button_color="#ff6b6b",
+            button_hover_color="#ff8f8f",
+            state="disabled"
+        )
+        self.use_profile_switch.pack(pady=(0, 10), padx=10, anchor="w")
+        
+        # Buttons frame
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=10, pady=(0, 10))
+        
+        # Auto-detect button
+        self.auto_btn = ctk.CTkButton(
+            btn_frame,
+            text="🔍 Auto Detect",
+            command=self.on_learn_auto,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="#2d5a27",
+            hover_color="#3d7a37",
+            height=32,
+            corner_radius=6,
+            state="disabled"
+        )
+        self.auto_btn.pack(fill="x", pady=(0, 5))
+        
+        # Manual selection instruction
+        self.select_label = ctk.CTkLabel(
+            btn_frame,
+            text="Or click & drag on waveform to select",
+            font=ctk.CTkFont(size=10),
+            text_color="#666666"
+        )
+        self.select_label.pack(pady=(5, 5))
+        
+        # Learn from selection button
+        self.learn_btn = ctk.CTkButton(
+            btn_frame,
+            text="📝 Learn from Selection",
+            command=self.on_learn_manual,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="#1a5276",
+            hover_color="#2471a3",
+            height=32,
+            corner_radius=6,
+            state="disabled"
+        )
+        self.learn_btn.pack(fill="x", pady=(0, 5))
+        
+        # Clear button
+        self.clear_btn = ctk.CTkButton(
+            btn_frame,
+            text="✖ Clear Profile",
+            command=self._on_clear,
+            font=ctk.CTkFont(size=11),
+            fg_color="#555555",
+            hover_color="#777777",
+            height=28,
+            corner_radius=6,
+            state="disabled"
+        )
+        self.clear_btn.pack(fill="x")
+        
+    def _on_toggle(self):
+        """Handle use profile toggle."""
+        self.on_toggle_use(self.use_profile_var.get())
+        
+    def _on_clear(self):
+        """Handle clear button."""
+        self.on_clear()
+        self.update_status(None)
+        
+    def enable_controls(self, enable: bool = True):
+        """Enable or disable controls."""
+        state = "normal" if enable else "disabled"
+        self.auto_btn.configure(state=state)
+        
+    def enable_learn_button(self, enable: bool = True):
+        """Enable or disable the learn button."""
+        state = "normal" if enable else "disabled"
+        self.learn_btn.configure(state=state)
+        
+    def update_status(self, profile: Optional[NoiseProfile], region: Optional[Tuple[float, float]] = None):
+        """Update the status display."""
+        if profile is not None:
+            self.status_label.configure(
+                text="🟢 Noise profile learned",
+                text_color="#4ade80"
+            )
+            if region:
+                self.region_label.configure(
+                    text=f"Region: {region[0]:.2f}s - {region[1]:.2f}s ({region[1]-region[0]:.2f}s)"
+                )
+            self.use_profile_switch.configure(state="normal")
+            self.use_profile_var.set(True)
+            self.clear_btn.configure(state="normal")
+            self._on_toggle()  # Trigger callback
+        else:
+            self.status_label.configure(
+                text="⚪ No noise profile learned",
+                text_color="#888888"
+            )
+            self.region_label.configure(text="")
+            self.use_profile_switch.configure(state="disabled")
+            self.use_profile_var.set(False)
+            self.clear_btn.configure(state="disabled")
+
+
 class SoundDenoiserApp(ctk.CTk):
     """Main application window for Sound Denoiser."""
     
@@ -195,8 +463,8 @@ class SoundDenoiserApp(ctk.CTk):
         
         # Window setup
         self.title("Sound Denoiser - Hiss Removal")
-        self.geometry("1200x800")
-        self.minsize(1000, 700)
+        self.geometry("1280x850")
+        self.minsize(1100, 750)
         
         # Initialize components
         self.denoiser = AudioDenoiser()
@@ -209,6 +477,7 @@ class SoundDenoiserApp(ctk.CTk):
         self.output_path: Optional[Path] = None
         self.is_processing = False
         self.processing_queue = queue.Queue()
+        self.selected_noise_region: Optional[Tuple[float, float]] = None
         
         # Build UI
         self._create_ui()
@@ -314,9 +583,12 @@ class SoundDenoiserApp(ctk.CTk):
         original_frame.grid_rowconfigure(0, weight=1)
         original_frame.grid_columnconfigure(0, weight=1)
         
-        self.waveform_original = WaveformDisplay(original_frame)
+        self.waveform_original = WaveformDisplay(
+            original_frame,
+            on_region_select=self._on_noise_region_selected
+        )
         self.waveform_original.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
-        self.waveform_original.plot_waveform(None, 44100, "Original Audio", "#ff9f43")
+        self.waveform_original.plot_waveform(None, 44100, "Original Audio (Click & drag to select noise region)", "#ff9f43")
         
         # Original playback controls
         orig_controls = ctk.CTkFrame(original_frame, fg_color="transparent")
@@ -413,30 +685,48 @@ class SoundDenoiserApp(ctk.CTk):
         right_panel = ctk.CTkFrame(parent, fg_color="#0f0f1a", corner_radius=12)
         right_panel.grid(row=0, column=1, sticky="nsew", padx=0, pady=0)
         
-        # Title
-        params_title = ctk.CTkLabel(
-            right_panel,
-            text="⚙️ Denoising Parameters",
-            font=ctk.CTkFont(size=16, weight="bold"),
-            text_color="#ffffff"
-        )
-        params_title.pack(pady=(15, 10), padx=15, anchor="w")
-        
-        # Separator
-        sep = ctk.CTkFrame(right_panel, height=1, fg_color="#333333")
-        sep.pack(fill="x", padx=15, pady=(0, 15))
-        
-        # Parameters frame (scrollable)
-        params_frame = ctk.CTkScrollableFrame(
+        # Create scrollable content
+        scroll_frame = ctk.CTkScrollableFrame(
             right_panel,
             fg_color="transparent",
             scrollbar_button_color="#333333"
         )
-        params_frame.pack(fill="both", expand=True, padx=15, pady=(0, 10))
+        scroll_frame.pack(fill="both", expand=True, padx=5, pady=5)
+        
+        # Noise Profile Section
+        self.noise_profile_panel = NoiseProfilePanel(
+            scroll_frame,
+            on_learn_manual=self._learn_noise_profile_manual,
+            on_learn_auto=self._learn_noise_profile_auto,
+            on_clear=self._clear_noise_profile,
+            on_toggle_use=self._toggle_use_profile,
+        )
+        self.noise_profile_panel.pack(fill="x", padx=5, pady=(5, 10))
+        
+        # Parameters Section
+        params_frame = ctk.CTkFrame(scroll_frame, fg_color="#151525", corner_radius=10)
+        params_frame.pack(fill="x", padx=5, pady=(0, 10))
+        
+        # Title
+        params_title = ctk.CTkLabel(
+            params_frame,
+            text="⚙️ Denoising Parameters",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="#ffffff"
+        )
+        params_title.pack(pady=(10, 5), padx=10, anchor="w")
+        
+        # Separator
+        sep = ctk.CTkFrame(params_frame, height=1, fg_color="#333333")
+        sep.pack(fill="x", padx=10, pady=(0, 10))
+        
+        # Parameters
+        params_inner = ctk.CTkFrame(params_frame, fg_color="transparent")
+        params_inner.pack(fill="x", padx=10, pady=(0, 10))
         
         # Max dB Reduction
         self.max_db_slider = ParameterSlider(
-            params_frame,
+            params_inner,
             label="Max dB Reduction",
             from_=1.0,
             to=20.0,
@@ -444,11 +734,11 @@ class SoundDenoiserApp(ctk.CTk):
             unit=" dB",
             command=self._on_parameter_change
         )
-        self.max_db_slider.pack(fill="x", pady=(0, 15))
+        self.max_db_slider.pack(fill="x", pady=(0, 12))
         
         # Blend Original
         self.blend_slider = ParameterSlider(
-            params_frame,
+            params_inner,
             label="Blend Original Signal",
             from_=0.0,
             to=50.0,
@@ -456,11 +746,11 @@ class SoundDenoiserApp(ctk.CTk):
             unit="%",
             command=self._on_parameter_change
         )
-        self.blend_slider.pack(fill="x", pady=(0, 15))
+        self.blend_slider.pack(fill="x", pady=(0, 12))
         
         # Noise Reduction Strength
         self.strength_slider = ParameterSlider(
-            params_frame,
+            params_inner,
             label="Noise Reduction Strength",
             from_=0.0,
             to=100.0,
@@ -468,11 +758,11 @@ class SoundDenoiserApp(ctk.CTk):
             unit="%",
             command=self._on_parameter_change
         )
-        self.strength_slider.pack(fill="x", pady=(0, 15))
+        self.strength_slider.pack(fill="x", pady=(0, 12))
         
         # Transient Protection
         self.transient_slider = ParameterSlider(
-            params_frame,
+            params_inner,
             label="Transient Protection",
             from_=0.0,
             to=100.0,
@@ -480,11 +770,11 @@ class SoundDenoiserApp(ctk.CTk):
             unit="%",
             command=self._on_parameter_change
         )
-        self.transient_slider.pack(fill="x", pady=(0, 15))
+        self.transient_slider.pack(fill="x", pady=(0, 12))
         
         # High Freq Rolloff
         self.rolloff_slider = ParameterSlider(
-            params_frame,
+            params_inner,
             label="High Frequency Rolloff",
             from_=0.0,
             to=100.0,
@@ -492,11 +782,11 @@ class SoundDenoiserApp(ctk.CTk):
             unit="%",
             command=self._on_parameter_change
         )
-        self.rolloff_slider.pack(fill="x", pady=(0, 15))
+        self.rolloff_slider.pack(fill="x", pady=(0, 12))
         
         # Smoothing Factor
         self.smoothing_slider = ParameterSlider(
-            params_frame,
+            params_inner,
             label="Temporal Smoothing",
             from_=0.0,
             to=50.0,
@@ -504,15 +794,18 @@ class SoundDenoiserApp(ctk.CTk):
             unit="%",
             command=self._on_parameter_change
         )
-        self.smoothing_slider.pack(fill="x", pady=(0, 15))
+        self.smoothing_slider.pack(fill="x", pady=(0, 5))
         
-        # Separator
-        sep2 = ctk.CTkFrame(right_panel, height=1, fg_color="#333333")
-        sep2.pack(fill="x", padx=15, pady=(5, 15))
+        # Buttons Section
+        buttons_frame = ctk.CTkFrame(scroll_frame, fg_color="#151525", corner_radius=10)
+        buttons_frame.pack(fill="x", padx=5, pady=(0, 10))
+        
+        buttons_inner = ctk.CTkFrame(buttons_frame, fg_color="transparent")
+        buttons_inner.pack(fill="x", padx=10, pady=10)
         
         # Process button
         self.process_btn = ctk.CTkButton(
-            right_panel,
+            buttons_inner,
             text="🔄 Apply Denoising",
             command=self._process_audio,
             font=ctk.CTkFont(size=14, weight="bold"),
@@ -522,11 +815,11 @@ class SoundDenoiserApp(ctk.CTk):
             corner_radius=10,
             state="disabled"
         )
-        self.process_btn.pack(fill="x", padx=15, pady=(0, 10))
+        self.process_btn.pack(fill="x", pady=(0, 8))
         
         # Reset button
         self.reset_btn = ctk.CTkButton(
-            right_panel,
+            buttons_inner,
             text="↺ Reset to Defaults",
             command=self._reset_parameters,
             font=ctk.CTkFont(size=12),
@@ -535,18 +828,19 @@ class SoundDenoiserApp(ctk.CTk):
             height=35,
             corner_radius=8
         )
-        self.reset_btn.pack(fill="x", padx=15, pady=(0, 15))
+        self.reset_btn.pack(fill="x")
         
         # Info box
-        info_frame = ctk.CTkFrame(right_panel, fg_color="#1a2a3a", corner_radius=8)
-        info_frame.pack(fill="x", padx=15, pady=(0, 15))
+        info_frame = ctk.CTkFrame(scroll_frame, fg_color="#1a2a3a", corner_radius=8)
+        info_frame.pack(fill="x", padx=5, pady=(0, 10))
         
         info_text = ctk.CTkLabel(
             info_frame,
             text="💡 Tips:\n"
-                 "• Lower dB reduction = gentler denoising\n"
-                 "• Higher blend = more original character\n"
-                 "• Protect transients for punchy drums",
+                 "• Use Auto Detect to find quiet sections\n"
+                 "• Or click & drag on waveform for manual selection\n"
+                 "• Learning a noise profile improves results\n"
+                 "• Lower dB reduction = gentler denoising",
             font=ctk.CTkFont(size=11),
             text_color="#aaaaaa",
             justify="left"
@@ -575,6 +869,71 @@ class SoundDenoiserApp(ctk.CTk):
         )
         self.file_label.pack(side="right", padx=15, pady=5)
         
+    def _on_noise_region_selected(self, start: float, end: float):
+        """Handle noise region selection from waveform."""
+        self.selected_noise_region = (start, end)
+        self.noise_profile_panel.enable_learn_button(True)
+        self._set_status(f"Noise region selected: {start:.2f}s - {end:.2f}s ({end-start:.2f}s)")
+        
+    def _learn_noise_profile_manual(self):
+        """Learn noise profile from manually selected region."""
+        if self.selected_noise_region is None:
+            messagebox.showwarning(
+                "No Selection",
+                "Please select a noise region on the waveform first.\n\n"
+                "Click and drag on the original waveform to select a region "
+                "that contains only noise (no music/vocals)."
+            )
+            return
+            
+        start, end = self.selected_noise_region
+        
+        try:
+            self._set_status("Learning noise profile...")
+            profile = self.denoiser.learn_noise_profile(start, end)
+            self.noise_profile_panel.update_status(profile, (start, end))
+            self._set_status(f"Noise profile learned from {start:.2f}s - {end:.2f}s")
+            
+            # Auto-reprocess
+            if self.denoiser.get_original() is not None:
+                self._process_audio()
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to learn noise profile:\n{str(e)}")
+            
+    def _learn_noise_profile_auto(self):
+        """Auto-detect quiet region and learn noise profile."""
+        if self.denoiser.get_original() is None:
+            return
+            
+        self._set_status("Auto-detecting quiet region...")
+        
+        def auto_learn_thread():
+            try:
+                profile, region = self.denoiser.auto_learn_noise_profile(min_duration=0.5)
+                self.processing_queue.put(("noise_profile", profile, region))
+            except Exception as e:
+                self.processing_queue.put(("error", str(e)))
+        
+        threading.Thread(target=auto_learn_thread, daemon=True).start()
+        
+    def _clear_noise_profile(self):
+        """Clear the learned noise profile."""
+        self.denoiser.clear_noise_profile()
+        self.waveform_original.clear_noise_region()
+        self.selected_noise_region = None
+        self.noise_profile_panel.enable_learn_button(False)
+        self._set_status("Noise profile cleared - using adaptive estimation")
+        
+    def _toggle_use_profile(self, use: bool):
+        """Toggle use of learned noise profile."""
+        self.denoiser.set_use_learned_profile(use)
+        
+        if use:
+            self._set_status("Using learned noise profile for denoising")
+        else:
+            self._set_status("Using adaptive noise estimation")
+        
     def _load_audio(self):
         """Load audio file."""
         filetypes = [
@@ -587,10 +946,15 @@ class SoundDenoiserApp(ctk.CTk):
             ("All Files", "*.*")
         ]
         
+        # Try to start in example_tracks folder
+        initial_dir = Path(__file__).parent.parent.parent.parent / "example_tracks"
+        if not initial_dir.exists():
+            initial_dir = Path.home()
+        
         file_path = filedialog.askopenfilename(
             title="Select Audio File",
             filetypes=filetypes,
-            initialdir=Path(__file__).parent.parent.parent.parent / "example_tracks"
+            initialdir=initial_dir
         )
         
         if not file_path:
@@ -598,6 +962,9 @@ class SoundDenoiserApp(ctk.CTk):
             
         self.input_path = Path(file_path)
         self._set_status(f"Loading: {self.input_path.name}...")
+        
+        # Clear previous noise profile
+        self._clear_noise_profile()
         
         # Load in background thread
         def load_thread():
@@ -738,6 +1105,10 @@ class SoundDenoiserApp(ctk.CTk):
                     _, processed = msg
                     self._on_audio_processed(processed)
                     
+                elif msg[0] == "noise_profile":
+                    _, profile, region = msg
+                    self._on_noise_profile_learned(profile, region)
+                    
                 elif msg[0] == "error":
                     _, error = msg
                     messagebox.showerror("Error", f"An error occurred:\n{error}")
@@ -767,8 +1138,14 @@ class SoundDenoiserApp(ctk.CTk):
         """Handle audio loaded event."""
         # Update waveform display
         display_audio = audio[0] if audio.ndim == 2 else audio
-        self.waveform_original.plot_waveform(display_audio, sr, "Original Audio", "#ff9f43")
+        self.waveform_original.plot_waveform(
+            display_audio, sr,
+            "Original Audio (Click & drag to select noise region)", "#ff9f43"
+        )
         self.waveform_processed.plot_waveform(None, sr, "Processed Audio (Denoised)", "#00d9ff")
+        
+        # Enable noise region selection
+        self.waveform_original.enable_selection(True)
         
         # Load into player
         self.player_original.load(audio, sr)
@@ -777,6 +1154,7 @@ class SoundDenoiserApp(ctk.CTk):
         self.play_orig_btn.configure(state="normal")
         self.stop_orig_btn.configure(state="normal")
         self.process_btn.configure(state="normal")
+        self.noise_profile_panel.enable_controls(True)
         
         # Disable processed controls until processing
         self.play_proc_btn.configure(state="disabled")
@@ -785,7 +1163,7 @@ class SoundDenoiserApp(ctk.CTk):
         
         # Update status
         duration = len(audio[0] if audio.ndim == 2 else audio) / sr
-        self._set_status(f"Loaded: {duration:.1f}s @ {sr}Hz")
+        self._set_status(f"Loaded: {duration:.1f}s @ {sr}Hz - Select noise region or use Auto Detect")
         self.file_label.configure(text=self.input_path.name)
         
         # Auto-process
@@ -810,7 +1188,20 @@ class SoundDenoiserApp(ctk.CTk):
         self.process_btn.configure(state="normal", text="🔄 Apply Denoising", fg_color="#6c3483")
         
         # Update status
-        self._set_status("Processing complete - Preview and adjust parameters as needed")
+        profile_status = "with learned profile" if self.denoiser._use_learned_profile else "with adaptive estimation"
+        self._set_status(f"Processing complete {profile_status} - Preview and adjust as needed")
+        
+    def _on_noise_profile_learned(self, profile: NoiseProfile, region: Tuple[float, float]):
+        """Handle noise profile learned from auto-detect."""
+        self.selected_noise_region = region
+        self.waveform_original.set_noise_region(*region)
+        self.noise_profile_panel.update_status(profile, region)
+        self.noise_profile_panel.enable_learn_button(True)
+        self._set_status(f"Auto-detected noise region: {region[0]:.2f}s - {region[1]:.2f}s")
+        
+        # Auto-reprocess
+        if self.denoiser.get_original() is not None:
+            self._process_audio()
         
     def on_closing(self):
         """Clean up on window close."""
