@@ -202,6 +202,108 @@ class WaveformDisplay(ctk.CTkFrame):
         self.canvas.draw_idle()
 
 
+class SeekBar(ctk.CTkFrame):
+    """Seekable progress bar for audio playback with time display."""
+    
+    def __init__(
+        self,
+        master,
+        color: str = "#00d9ff",
+        on_seek=None,
+        **kwargs
+    ):
+        super().__init__(master, fg_color="transparent", **kwargs)
+        
+        self.on_seek = on_seek
+        self._duration = 0.0
+        self._is_seeking = False
+        
+        # Time label (current)
+        self.time_current = ctk.CTkLabel(
+            self,
+            text="0:00",
+            font=ctk.CTkFont(size=10),
+            text_color="#888888",
+            width=40
+        )
+        self.time_current.pack(side="left", padx=(0, 5))
+        
+        # Seek slider
+        self.slider = ctk.CTkSlider(
+            self,
+            from_=0,
+            to=1,
+            number_of_steps=1000,
+            command=self._on_slider_change,
+            progress_color=color,
+            button_color=color,
+            button_hover_color=color,
+            height=12
+        )
+        self.slider.set(0)
+        self.slider.pack(side="left", fill="x", expand=True)
+        
+        # Bind mouse events for seeking
+        self.slider.bind("<ButtonPress-1>", self._on_seek_start)
+        self.slider.bind("<ButtonRelease-1>", self._on_seek_end)
+        
+        # Time label (duration)
+        self.time_duration = ctk.CTkLabel(
+            self,
+            text="0:00",
+            font=ctk.CTkFont(size=10),
+            text_color="#888888",
+            width=40
+        )
+        self.time_duration.pack(side="left", padx=(5, 0))
+        
+    def _format_time(self, seconds: float) -> str:
+        """Format seconds as M:SS or H:MM:SS."""
+        if seconds < 0:
+            seconds = 0
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        if minutes >= 60:
+            hours = minutes // 60
+            minutes = minutes % 60
+            return f"{hours}:{minutes:02d}:{secs:02d}"
+        return f"{minutes}:{secs:02d}"
+    
+    def _on_slider_change(self, value):
+        """Handle slider value change."""
+        if self._is_seeking and self.on_seek:
+            self.on_seek(value)
+        # Update current time display
+        current_time = value * self._duration
+        self.time_current.configure(text=self._format_time(current_time))
+            
+    def _on_seek_start(self, event):
+        """Handle seek start."""
+        self._is_seeking = True
+        
+    def _on_seek_end(self, event):
+        """Handle seek end."""
+        if self._is_seeking and self.on_seek:
+            self.on_seek(self.slider.get())
+        self._is_seeking = False
+        
+    def set_duration(self, duration: float):
+        """Set the total duration."""
+        self._duration = duration
+        self.time_duration.configure(text=self._format_time(duration))
+        
+    def set_position(self, position: float):
+        """Set position (0-1) without triggering seek callback."""
+        if not self._is_seeking:
+            self.slider.set(position)
+            current_time = position * self._duration
+            self.time_current.configure(text=self._format_time(current_time))
+            
+    def get_position(self) -> float:
+        """Get current position (0-1)."""
+        return self.slider.get()
+
+
 class ParameterSlider(ctk.CTkFrame):
     """Custom parameter slider with label and value display."""
     
@@ -621,14 +723,13 @@ class SoundDenoiserApp(ctk.CTk):
         )
         self.stop_orig_btn.pack(side="left", padx=2)
         
-        self.progress_orig = ctk.CTkProgressBar(
+        # Seekable progress bar for original
+        self.seek_orig = SeekBar(
             orig_controls,
-            progress_color="#ff9f43",
-            fg_color="#333333",
-            height=8
+            color="#ff9f43",
+            on_seek=lambda pos: self._on_seek("original", pos)
         )
-        self.progress_orig.pack(side="left", fill="x", expand=True, padx=(10, 0))
-        self.progress_orig.set(0)
+        self.seek_orig.pack(side="left", fill="x", expand=True, padx=(10, 0))
         
         # Processed waveform
         processed_frame = ctk.CTkFrame(left_panel, fg_color="#151525", corner_radius=10)
@@ -671,14 +772,27 @@ class SoundDenoiserApp(ctk.CTk):
         )
         self.stop_proc_btn.pack(side="left", padx=2)
         
-        self.progress_proc = ctk.CTkProgressBar(
+        # Sync button - syncs processed position to original position
+        self.sync_btn = ctk.CTkButton(
             proc_controls,
-            progress_color="#00d9ff",
-            fg_color="#333333",
-            height=8
+            text="🔗",
+            width=40,
+            height=32,
+            command=self._sync_to_original,
+            fg_color="#6c3483",
+            hover_color="#8e44ad",
+            font=ctk.CTkFont(size=14),
+            state="disabled"
         )
-        self.progress_proc.pack(side="left", fill="x", expand=True, padx=(10, 0))
-        self.progress_proc.set(0)
+        self.sync_btn.pack(side="left", padx=2)
+        
+        # Seekable progress bar for processed
+        self.seek_proc = SeekBar(
+            proc_controls,
+            color="#00d9ff",
+            on_seek=lambda pos: self._on_seek("processed", pos)
+        )
+        self.seek_proc.pack(side="left", fill="x", expand=True, padx=(10, 0))
         
     def _create_parameter_panel(self, parent):
         """Create parameter controls panel."""
@@ -1080,11 +1194,36 @@ class SoundDenoiserApp(ctk.CTk):
         if which == "original":
             self.player_original.stop()
             self.play_orig_btn.configure(text="▶")
-            self.progress_orig.set(0)
+            self.seek_orig.set_position(0)
         else:
             self.player_processed.stop()
             self.play_proc_btn.configure(text="▶")
-            self.progress_proc.set(0)
+            self.seek_proc.set_position(0)
+            
+    def _on_seek(self, which: str, position: float):
+        """Handle seek bar change."""
+        if which == "original":
+            self.player_original.seek(position)
+        else:
+            self.player_processed.seek(position)
+            
+    def _sync_to_original(self):
+        """Sync processed player position to original player position."""
+        # Get the original player's position
+        orig_position = self.player_original.get_position()
+        
+        # Set the processed player to the same position
+        self.player_processed.seek(orig_position)
+        self.seek_proc.set_position(orig_position)
+        
+        # If original is playing, also play processed (and stop original for A/B comparison)
+        if self.player_original.is_playing():
+            self.player_original.pause()
+            self.play_orig_btn.configure(text="▶")
+            self.player_processed.play()
+            self.play_proc_btn.configure(text="⏸")
+        
+        self._set_status(f"Synced to position: {self.seek_orig._format_time(orig_position * self.seek_orig._duration)}")
             
     def _set_status(self, message: str):
         """Update status bar message."""
@@ -1119,11 +1258,11 @@ class SoundDenoiserApp(ctk.CTk):
         except queue.Empty:
             pass
         
-        # Update progress bars
+        # Update seek bars
         if self.player_original.is_playing():
-            self.progress_orig.set(self.player_original.get_position())
+            self.seek_orig.set_position(self.player_original.get_position())
         if self.player_processed.is_playing():
-            self.progress_proc.set(self.player_processed.get_position())
+            self.seek_proc.set_position(self.player_processed.get_position())
             
         # Update play buttons on completion
         if self.player_original.get_state() == PlaybackState.STOPPED:
@@ -1150,6 +1289,11 @@ class SoundDenoiserApp(ctk.CTk):
         # Load into player
         self.player_original.load(audio, sr)
         
+        # Calculate duration and set on seek bars
+        duration = len(audio[0] if audio.ndim == 2 else audio) / sr
+        self.seek_orig.set_duration(duration)
+        self.seek_proc.set_duration(duration)
+        
         # Enable controls
         self.play_orig_btn.configure(state="normal")
         self.stop_orig_btn.configure(state="normal")
@@ -1159,10 +1303,10 @@ class SoundDenoiserApp(ctk.CTk):
         # Disable processed controls until processing
         self.play_proc_btn.configure(state="disabled")
         self.stop_proc_btn.configure(state="disabled")
+        self.sync_btn.configure(state="disabled")
         self.save_btn.configure(state="disabled")
         
         # Update status
-        duration = len(audio[0] if audio.ndim == 2 else audio) / sr
         self._set_status(f"Loaded: {duration:.1f}s @ {sr}Hz - Select noise region or use Auto Detect")
         self.file_label.configure(text=self.input_path.name)
         
@@ -1184,6 +1328,7 @@ class SoundDenoiserApp(ctk.CTk):
         # Enable controls
         self.play_proc_btn.configure(state="normal")
         self.stop_proc_btn.configure(state="normal")
+        self.sync_btn.configure(state="normal")
         self.save_btn.configure(state="normal")
         self.process_btn.configure(state="normal", text="🔄 Apply Denoising", fg_color="#6c3483")
         
