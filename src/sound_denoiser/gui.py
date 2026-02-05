@@ -394,12 +394,19 @@ class WaveformDisplay(ctk.CTkFrame):
         n_fft = min(2048, hop_length * 4)
         
         # Downsample audio for very long segments (additional speedup)
+        # BUT limit downsampling to ensure we can still display up to 12kHz
+        # (need effective_sr >= 24000 Hz for 12kHz Nyquist limit)
+        max_downsample = max(1, sr // 24000)  # Ensure effective_sr >= 24kHz
+        
         if audio_len > 500000:  # > ~11 seconds at 44.1kHz
-            downsample_factor = audio_len // 200000
-            visible_audio = visible_audio[::downsample_factor]
-            effective_sr = sr // downsample_factor
-            hop_length = max(256, hop_length // downsample_factor)
-            n_fft = min(1024, hop_length * 4)
+            downsample_factor = min(max_downsample, audio_len // 200000)
+            if downsample_factor > 1:
+                visible_audio = visible_audio[::downsample_factor]
+                effective_sr = sr // downsample_factor
+                hop_length = max(256, hop_length // downsample_factor)
+                n_fft = min(1024, hop_length * 4)
+            else:
+                effective_sr = sr
         else:
             effective_sr = sr
         
@@ -419,8 +426,11 @@ class WaveformDisplay(ctk.CTkFrame):
             ax=self.ax, cmap='magma', x_coords=np.linspace(time_offset, time_end, D.shape[1])
         )
         
+        # Set axis limits - X is zoom-dependent, Y is always 0-12kHz
         self.ax.set_xlim(visible_start, visible_end)
-        self.ax.set_ylim(0, min(sr // 2, 12000))  # Cap at 12kHz - hiss is mostly below this
+        # Fixed Y-axis: always 0-12kHz regardless of zoom (limited by Nyquist if sample rate is low)
+        max_freq = min(effective_sr // 2, 12000)
+        self.ax.set_ylim(0, max_freq)
         
         # Restore selection if any and it's visible
         if self._selected_region:
