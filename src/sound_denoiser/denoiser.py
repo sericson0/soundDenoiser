@@ -25,11 +25,12 @@ import noisereduce as nr
 
 class DenoiseMethod(Enum):
     """Available denoising methods."""
-    NOISEREDUCE = "noisereduce"          # noisereduce library (default, good for most cases)
-    SPECTRAL_SUBTRACTION = "spectral"    # Classic spectral subtraction
-    WIENER = "wiener"                    # Wiener filtering
+    SPECTRAL_SUBTRACTION = "spectral"    # Classic spectral subtraction (good for shellac/vinyl)
+    WIENER = "wiener"                    # Wiener filtering (good for broadband noise)
     MULTIBAND = "multiband"              # Multi-band adaptive reduction
     COMBINED = "combined"                # Combine multiple methods
+    SHELLAC = "shellac"                  # Optimized for 78rpm shellac records (hiss + groove)
+    NOISEREDUCE = "noisereduce"          # noisereduce library (may not work well on old recordings)
 
 
 @dataclass
@@ -70,6 +71,9 @@ class AudioDenoiser:
     # Frequency bands for multi-band processing (Hz)
     BAND_EDGES = [0, 300, 1000, 3000, 8000, 20000]
     
+    # Shellac-specific frequency bands (Hz) - optimized for 78rpm records
+    SHELLAC_BANDS = [0, 100, 300, 800, 2000, 4000, 8000, 16000]
+    
     def __init__(
         self,
         max_db_reduction: float = 12.0,
@@ -78,7 +82,7 @@ class AudioDenoiser:
         transient_protection: float = 0.3,
         high_freq_emphasis: float = 1.5,
         smoothing_factor: float = 0.2,
-        method: DenoiseMethod = DenoiseMethod.NOISEREDUCE,
+        method: DenoiseMethod = DenoiseMethod.SPECTRAL_SUBTRACTION,
     ):
         """
         Initialize the denoiser with parameters.
@@ -90,7 +94,7 @@ class AudioDenoiser:
             transient_protection: How much to protect transients (0-1, default: 0.3)
             high_freq_emphasis: Extra reduction for high frequencies where hiss lives (default: 1.5)
             smoothing_factor: Temporal smoothing for noise estimate (0-1, default: 0.2)
-            method: Denoising method to use (default: NOISEREDUCE)
+            method: Denoising method to use (default: SPECTRAL_SUBTRACTION)
         """
         self.max_db_reduction = max_db_reduction
         self.blend_original = blend_original
@@ -176,11 +180,80 @@ class AudioDenoiser:
     
     def auto_detect_noise_region(self, min_duration: float = 0.5) -> Tuple[float, float]:
         """
-        Automatically detect the quietest region of audio for noise sampling.
+        Automatically detect a region with noise but without music or silence.
+        
+        Uses spectral flatness to distinguish between:
+        - Noise (high spectral flatness, moderate energy)
+        - Music (low spectral flatness, varying energy)
+        - Silence (very low energy)
+        
+        This is particularly effective for finding hiss/groove noise sections
+        in old shellac recordings.
         """
         if self._audio is None or self._sr is None:
             raise ValueError("No audio loaded.")
         
+        audio = self._audio[0]
+        window_samples = int(min_duration * self._sr)
+        hop_samples = window_samples // 4
+        
+        candidates = []
+        
+        for start in range(0, len(audio) - window_samples, hop_samples):
+            end = start + window_samples
+            window = audio[start:end]
+            
+            # Skip if too quiet (silence)
+            rms = np.sqrt(np.mean(window ** 2))
+            peak = np.max(np.abs(window))
+            
+            if peak < 0.002:  # Too quiet - likely silence
+                continue
+            
+            if rms < 0.0005:  # Very low RMS - likely digital silence
+                continue
+            
+            # Compute spectral flatness (noise is spectrally flat, music is not)
+            stft = librosa.stft(window, n_fft=1024, hop_length=256)
+            mag = np.abs(stft)
+            
+            # Geometric mean / arithmetic mean = spectral flatness
+            # Higher values indicate more noise-like signal
+            geometric_mean = np.exp(np.mean(np.log(mag + 1e-10), axis=0))
+            arithmetic_mean = np.mean(mag, axis=0)
+            flatness = np.mean(geometric_mean / (arithmetic_mean + 1e-10))
+            
+            # Check for low spectral variation (noise is consistent)
+            spectral_var = np.var(np.mean(mag, axis=0))
+            
+            # Good noise regions have:
+            # - High spectral flatness (noise-like)
+            # - Low spectral variation over time (consistent)
+            # - Moderate energy (not silence)
+            
+            # Score combining these factors
+            # Higher score = more likely to be pure noise
+            score = flatness * 100 - spectral_var * 1000 - rms * 10
+            
+            # Penalize very low or high energy
+            if rms < 0.005 or rms > 0.1:
+                score -= 50
+            
+            candidates.append((score, start, end, rms, flatness))
+        
+        if not candidates:
+            # Fallback: use quietest region that's not silence
+            return self._fallback_noise_detection(min_duration)
+        
+        # Sort by score (highest first)
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        
+        # Return the best candidate
+        _, start_sample, end_sample, _, _ = candidates[0]
+        return (start_sample / self._sr, end_sample / self._sr)
+    
+    def _fallback_noise_detection(self, min_duration: float) -> Tuple[float, float]:
+        """Fallback noise detection using simple RMS-based approach."""
         audio = self._audio[0]
         window_samples = int(min_duration * self._sr)
         hop_samples = window_samples // 4
@@ -192,29 +265,27 @@ class AudioDenoiser:
             end = start + window_samples
             window = audio[start:end]
             rms = np.sqrt(np.mean(window ** 2))
+            peak = np.max(np.abs(window))
+            
+            # Skip silence
+            if peak < 0.001:
+                continue
+                
             rms_values.append(rms)
             positions.append(start)
+        
+        if not rms_values:
+            # Absolute fallback - use the beginning
+            return (0.0, min_duration)
         
         rms_values = np.array(rms_values)
         positions = np.array(positions)
         
-        # Find quietest non-silent region
+        # Find the quietest non-silent region
         sorted_indices = np.argsort(rms_values)
-        
-        for idx in sorted_indices[:20]:
-            start_sample = positions[idx]
-            end_sample = start_sample + window_samples
-            region = audio[start_sample:end_sample]
-            
-            # Skip if too quiet (likely silence)
-            if np.max(np.abs(region)) < 0.001:
-                continue
-                
-            return (start_sample / self._sr, end_sample / self._sr)
-        
-        # Fallback to first quiet region
         idx = sorted_indices[0]
         start_sample = positions[idx]
+        
         return (start_sample / self._sr, (start_sample + window_samples) / self._sr)
     
     def auto_learn_noise_profile(self, min_duration: float = 0.5) -> Tuple[NoiseProfile, Tuple[float, float]]:
@@ -451,6 +522,85 @@ class AudioDenoiser:
             denoised = self._apply_high_frequency_reduction(denoised, self._sr)
         
         return denoised
+    def _shellac_reduction(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Specialized denoising for shellac 78rpm records.
+        
+        Addresses the specific noise characteristics of shellac recordings:
+        - Groove noise (low-frequency rumble from worn grooves)
+        - Surface hiss (broadband high-frequency noise)
+        - Crackle (impulsive noise - addressed separately)
+        
+        Uses a multi-stage approach:
+        1. Low-frequency rumble reduction (below 80Hz)
+        2. Broadband surface noise reduction with frequency-dependent strength
+        3. High-frequency hiss targeting (2kHz-12kHz)
+        """
+        # Compute STFT with good frequency resolution for low-freq work
+        stft = librosa.stft(audio, n_fft=self.N_FFT, hop_length=self.HOP_LENGTH)
+        stft_mag = np.abs(stft)
+        stft_phase = np.angle(stft)
+        
+        # Get frequency bins
+        freqs = librosa.fft_frequencies(sr=self._sr, n_fft=self.N_FFT)
+        
+        # Get noise estimate
+        if self._use_learned_profile and self._noise_profile is not None:
+            noise_estimate = self._noise_profile.spectral_mean
+        else:
+            noise_estimate = self._estimate_noise_spectrum(stft_mag)
+        
+        # Create frequency-dependent gain matrix
+        gain = np.ones_like(stft_mag)
+        
+        # Define shellac-specific reduction strengths per frequency band
+        # (low_freq, high_freq, reduction_multiplier)
+        shellac_bands = [
+            (0, 60, 1.8),       # Sub-bass rumble - strong reduction
+            (60, 150, 1.4),    # Bass rumble - moderate reduction
+            (150, 500, 0.8),   # Low-mids - gentle (preserve warmth)
+            (500, 2000, 0.9),  # Mids - gentle (preserve vocals)
+            (2000, 4000, 1.3), # Upper-mids - moderate hiss
+            (4000, 8000, 1.6), # High - strong hiss reduction
+            (8000, 16000, 2.0), # Very high - aggressive hiss reduction
+        ]
+        
+        for low_freq, high_freq, reduction_mult in shellac_bands:
+            band_mask = (freqs >= low_freq) & (freqs < high_freq)
+            
+            if not np.any(band_mask):
+                continue
+            
+            # Calculate band-specific gains
+            for j, (is_in_band, freq) in enumerate(zip(band_mask, freqs)):
+                if is_in_band:
+                    band_noise_level = noise_estimate[j]
+                    
+                    # Calculate SNR
+                    snr = stft_mag[j, :] / (band_noise_level + 1e-10)
+                    
+                    # Strength adjusted by band multiplier and user setting
+                    effective_strength = self.noise_reduction_strength * reduction_mult
+                    
+                    # Adaptive gain - more reduction for lower SNR
+                    band_gain = np.clip(1 - effective_strength / (snr + 1), 0.05, 1.0)
+                    gain[j, :] = band_gain
+        
+        # Smooth gain to reduce musical noise artifacts
+        gain = median_filter(gain, size=(3, 5))
+        gain = uniform_filter1d(gain, size=3, axis=1)
+        
+        # Apply gain
+        stft_clean = stft_mag * gain * np.exp(1j * stft_phase)
+        
+        # Inverse STFT
+        denoised = librosa.istft(stft_clean, hop_length=self.HOP_LENGTH, length=len(audio))
+        
+        # Optional: Apply gentle high-frequency shelf for additional hiss control
+        if self.high_freq_emphasis > 1.0:
+            denoised = self._apply_high_frequency_reduction(denoised, self._sr)
+        
+        return denoised
     
     def _process_channel(self, audio_channel: np.ndarray) -> np.ndarray:
         """Process a single audio channel with the selected denoising method."""
@@ -497,16 +647,14 @@ class AudioDenoiser:
         elif self.method == DenoiseMethod.COMBINED:
             denoised = self._combined_reduction(audio_channel)
             
+        elif self.method == DenoiseMethod.SHELLAC:
+            denoised = self._shellac_reduction(audio_channel)
+            
         else:
-            # Default to noisereduce
-            denoised = nr.reduce_noise(
-                y=audio_channel,
-                sr=self._sr,
-                prop_decrease=self.noise_reduction_strength,
-                stationary=True,
-                n_fft=self.N_FFT,
-                hop_length=self.HOP_LENGTH,
-            )
+            # Default to spectral subtraction (better for old recordings)
+            denoised = self._spectral_subtraction(audio_channel)
+            if self.high_freq_emphasis > 1.0:
+                denoised = self._apply_high_frequency_reduction(denoised, self._sr)
         
         # Apply maximum dB reduction limit (prevents over-processing)
         max_reduction_linear = 10 ** (-self.max_db_reduction / 20)

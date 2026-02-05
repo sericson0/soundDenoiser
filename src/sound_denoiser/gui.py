@@ -17,6 +17,7 @@ from matplotlib.widgets import SpanSelector
 import librosa
 import librosa.display
 import threading
+import time
 from pathlib import Path
 from typing import Optional, Tuple
 import queue
@@ -83,6 +84,79 @@ class WaveformDisplay(ctk.CTkFrame):
         self.view_toggle.set("Waveform")
         self.view_toggle.pack(side="left", padx=2)
         
+        # Separator
+        sep1 = ctk.CTkFrame(toggle_frame, width=1, height=20, fg_color="#444444")
+        sep1.pack(side="left", padx=8)
+        
+        # Selection mode toggle
+        self._selection_mode_enabled = False
+        self.selection_mode_btn = ctk.CTkButton(
+            toggle_frame,
+            text="ðŸ” Select",
+            command=self._toggle_selection_mode,
+            font=ctk.CTkFont(size=10),
+            width=70,
+            height=24,
+            fg_color="#1a1a2e",
+            hover_color="#252535",
+            border_width=1,
+            border_color="#444444"
+        )
+        self.selection_mode_btn.pack(side="left", padx=2)
+        
+        # Separator
+        sep2 = ctk.CTkFrame(toggle_frame, width=1, height=20, fg_color="#444444")
+        sep2.pack(side="left", padx=8)
+        
+        # Zoom controls
+        self._zoom_level = 1.0
+        self._zoom_offset = 0.0  # Start position as fraction of audio
+        
+        self.zoom_out_btn = ctk.CTkButton(
+            toggle_frame,
+            text="âˆ’",
+            command=self._zoom_out,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            width=28,
+            height=24,
+            fg_color="#1a1a2e",
+            hover_color="#252535"
+        )
+        self.zoom_out_btn.pack(side="left", padx=1)
+        
+        self.zoom_label = ctk.CTkLabel(
+            toggle_frame,
+            text="1x",
+            font=ctk.CTkFont(size=10),
+            text_color="#888888",
+            width=30
+        )
+        self.zoom_label.pack(side="left", padx=1)
+        
+        self.zoom_in_btn = ctk.CTkButton(
+            toggle_frame,
+            text="+",
+            command=self._zoom_in,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            width=28,
+            height=24,
+            fg_color="#1a1a2e",
+            hover_color="#252535"
+        )
+        self.zoom_in_btn.pack(side="left", padx=1)
+        
+        self.zoom_reset_btn = ctk.CTkButton(
+            toggle_frame,
+            text="âŸ²",
+            command=self._zoom_reset,
+            font=ctk.CTkFont(size=12),
+            width=28,
+            height=24,
+            fg_color="#1a1a2e",
+            hover_color="#252535"
+        )
+        self.zoom_reset_btn.pack(side="left", padx=1)
+        
         # Time display label
         self.time_label = ctk.CTkLabel(
             toggle_frame,
@@ -114,8 +188,12 @@ class WaveformDisplay(ctk.CTkFrame):
         self.canvas.mpl_connect('button_press_event', self._on_canvas_click)
         self.canvas.mpl_connect('motion_notify_event', self._on_canvas_drag)
         self.canvas.mpl_connect('button_release_event', self._on_canvas_release)
+        self.canvas.mpl_connect('scroll_event', self._on_scroll)
         self._is_dragging = False
         self._drag_seeking = False
+        
+        # Playback update throttling for performance
+        self._last_playhead_update = 0
         
         # Playhead line
         self.playhead = None
@@ -157,6 +235,56 @@ class WaveformDisplay(ctk.CTkFrame):
             self._view_mode = new_mode
             self._redraw_display()
     
+    def _toggle_selection_mode(self):
+        """Toggle between seek mode and selection mode."""
+        self._selection_mode_enabled = not self._selection_mode_enabled
+        self.enable_selection(self._selection_mode_enabled)
+        
+        if self._selection_mode_enabled:
+            self.selection_mode_btn.configure(
+                fg_color="#ff6b6b",
+                hover_color="#ff8f8f",
+                text="âœ“ Select"
+            )
+        else:
+            self.selection_mode_btn.configure(
+                fg_color="#1a1a2e",
+                hover_color="#252535",
+                text="ðŸ” Select"
+            )
+    
+    def _zoom_in(self):
+        """Zoom in on the waveform."""
+        if self._zoom_level < 16.0:  # Max 16x zoom
+            self._zoom_level *= 2.0
+            self._update_zoom()
+    
+    def _zoom_out(self):
+        """Zoom out on the waveform."""
+        if self._zoom_level > 1.0:
+            self._zoom_level /= 2.0
+            # Adjust offset to keep center in view
+            self._zoom_offset = max(0, min(self._zoom_offset, 1.0 - 1.0/self._zoom_level))
+            self._update_zoom()
+    
+    def _zoom_reset(self):
+        """Reset zoom to show full waveform."""
+        self._zoom_level = 1.0
+        self._zoom_offset = 0.0
+        self._update_zoom()
+    
+    def _update_zoom(self):
+        """Update the zoom level display and redraw."""
+        self.zoom_label.configure(text=f"{self._zoom_level:.0f}x")
+        self._redraw_display()
+    
+    def get_visible_time_range(self) -> tuple:
+        """Get the currently visible time range based on zoom."""
+        visible_duration = self._duration / self._zoom_level
+        start_time = self._zoom_offset * self._duration
+        end_time = start_time + visible_duration
+        return (start_time, end_time)
+    
     def _redraw_display(self):
         """Redraw the current display (waveform or spectrogram)."""
         if self._audio_data is None:
@@ -168,7 +296,7 @@ class WaveformDisplay(ctk.CTkFrame):
             self._plot_spectrogram_internal()
     
     def _plot_waveform_internal(self):
-        """Internal method to plot waveform."""
+        """Internal method to plot waveform with zoom support."""
         self.ax.clear()
         self.ax.set_facecolor('#1a1a2e')
         self.selection_rect = None
@@ -178,28 +306,40 @@ class WaveformDisplay(ctk.CTkFrame):
         audio = self._audio_data
         sr = self._sample_rate
         
-        # Create time axis
-        times = np.linspace(0, self._duration, len(audio))
+        # Calculate visible time range based on zoom
+        visible_start, visible_end = self.get_visible_time_range()
+        start_sample = int(visible_start * sr)
+        end_sample = int(visible_end * sr)
+        start_sample = max(0, start_sample)
+        end_sample = min(len(audio), end_sample)
+        
+        # Extract visible audio data
+        visible_audio = audio[start_sample:end_sample]
+        visible_times = np.linspace(visible_start, visible_end, len(visible_audio))
         
         # Downsample for faster plotting
-        if len(audio) > 10000:
-            step = len(audio) // 10000
-            times_display = times[::step]
-            audio_display = audio[::step]
+        if len(visible_audio) > 10000:
+            step = len(visible_audio) // 10000
+            times_display = visible_times[::step]
+            audio_display = visible_audio[::step]
         else:
-            times_display = times
-            audio_display = audio
+            times_display = visible_times
+            audio_display = visible_audio
         
         self.ax.fill_between(times_display, audio_display, alpha=0.6, color=self._waveform_color)
         self.ax.plot(times_display, audio_display, color=self._waveform_color, linewidth=0.5, alpha=0.8)
-        self.ax.set_xlim(0, self._duration)
+        self.ax.set_xlim(visible_start, visible_end)
         self.ax.set_ylim(-1, 1)
         
-        # Restore selection if any
+        # Restore selection if any and it's visible
         if self._selected_region:
-            self._draw_selection_rect(*self._selected_region)
+            sel_start, sel_end = self._selected_region
+            if sel_end > visible_start and sel_start < visible_end:
+                self._draw_selection_rect(max(sel_start, visible_start), min(sel_end, visible_end))
         
-        self.ax.set_title(self._title, color='#ffffff', fontsize=10, fontweight='bold')
+        # Show zoom indicator in title
+        zoom_text = f" [{self._zoom_level:.0f}x zoom]" if self._zoom_level > 1.0 else ""
+        self.ax.set_title(self._title + zoom_text, color='#ffffff', fontsize=10, fontweight='bold')
         self.ax.set_xlabel('Time (s)', color='#888888', fontsize=8)
         self.ax.tick_params(colors='#888888', labelsize=8)
         
@@ -210,7 +350,7 @@ class WaveformDisplay(ctk.CTkFrame):
             self.update_playhead(self._current_position)
     
     def _plot_spectrogram_internal(self):
-        """Internal method to plot spectrogram."""
+        """Internal method to plot spectrogram with zoom support and performance optimization."""
         self.ax.clear()
         self.ax.set_facecolor('#1a1a2e')
         self.selection_rect = None
@@ -220,26 +360,60 @@ class WaveformDisplay(ctk.CTkFrame):
         audio = self._audio_data
         sr = self._sample_rate
         
-        # Compute spectrogram
+        # Calculate visible time range based on zoom
+        visible_start, visible_end = self.get_visible_time_range()
+        start_sample = int(visible_start * sr)
+        end_sample = int(visible_end * sr)
+        start_sample = max(0, start_sample)
+        end_sample = min(len(audio), end_sample)
+        
+        # Extract visible audio with some padding for smoother edges
+        pad_samples = 1024
+        padded_start = max(0, start_sample - pad_samples)
+        padded_end = min(len(audio), end_sample + pad_samples)
+        visible_audio = audio[padded_start:padded_end]
+        
+        # Adaptive STFT parameters based on zoom and audio length
+        # Use smaller FFT when zoomed in for better time resolution
+        # Use larger FFT when zoomed out for better frequency resolution
+        if self._zoom_level >= 4.0:
+            n_fft = 1024
+            hop_length = 256
+        elif self._zoom_level >= 2.0:
+            n_fft = 2048
+            hop_length = 512
+        else:
+            # Zoomed out - use larger hop for performance
+            n_fft = 2048
+            hop_length = 1024 if len(visible_audio) > 100000 else 512
+        
+        # Compute spectrogram for visible region only
         D = librosa.amplitude_to_db(
-            np.abs(librosa.stft(audio, n_fft=2048, hop_length=512)),
+            np.abs(librosa.stft(visible_audio, n_fft=n_fft, hop_length=hop_length)),
             ref=np.max
         )
         
+        # Calculate time offset for correct positioning
+        time_offset = padded_start / sr
+        
         # Plot spectrogram with custom colormap
         img = librosa.display.specshow(
-            D, sr=sr, hop_length=512, x_axis='time', y_axis='hz',
-            ax=self.ax, cmap='magma'
+            D, sr=sr, hop_length=hop_length, x_axis='time', y_axis='hz',
+            ax=self.ax, cmap='magma', x_coords=np.linspace(time_offset, padded_end/sr, D.shape[1])
         )
         
-        self.ax.set_xlim(0, self._duration)
-        self.ax.set_ylim(0, sr // 2)
+        self.ax.set_xlim(visible_start, visible_end)
+        self.ax.set_ylim(0, min(sr // 2, 16000))  # Cap at 16kHz for better visibility
         
-        # Restore selection if any
+        # Restore selection if any and it's visible
         if self._selected_region:
-            self._draw_selection_rect(*self._selected_region)
+            sel_start, sel_end = self._selected_region
+            if sel_end > visible_start and sel_start < visible_end:
+                self._draw_selection_rect(max(sel_start, visible_start), min(sel_end, visible_end))
         
-        self.ax.set_title(self._title.replace("Waveform", "Spectrogram"), color='#ffffff', fontsize=10, fontweight='bold')
+        # Show zoom indicator in title
+        zoom_text = f" [{self._zoom_level:.0f}x zoom]" if self._zoom_level > 1.0 else ""
+        self.ax.set_title(self._title.replace("Waveform", "Spectrogram") + zoom_text, color='#ffffff', fontsize=10, fontweight='bold')
         self.ax.set_xlabel('Time (s)', color='#888888', fontsize=8)
         self.ax.set_ylabel('Frequency (Hz)', color='#888888', fontsize=8)
         self.ax.tick_params(colors='#888888', labelsize=8)
@@ -289,6 +463,24 @@ class WaveformDisplay(ctk.CTkFrame):
     def _on_canvas_release(self, event):
         """Handle mouse release after seeking."""
         self._drag_seeking = False
+    
+    def _on_scroll(self, event):
+        """Handle scroll wheel for panning when zoomed."""
+        if self._zoom_level <= 1.0:
+            return  # No panning needed at 1x zoom
+        
+        # Calculate pan step (10% of visible area)
+        pan_step = 0.1 / self._zoom_level
+        
+        if event.button == 'up':
+            # Pan left
+            self._zoom_offset = max(0, self._zoom_offset - pan_step)
+        elif event.button == 'down':
+            # Pan right
+            max_offset = 1.0 - 1.0 / self._zoom_level
+            self._zoom_offset = min(max_offset, self._zoom_offset + pan_step)
+        
+        self._redraw_display()
         
     def enable_selection(self, enable: bool = True):
         """Enable or disable region selection mode."""
@@ -427,17 +619,25 @@ class WaveformDisplay(ctk.CTkFrame):
                 pass
             self.played_area = None
         
-        # Draw played area (grayed out)
-        if time_pos > 0:
+        # Get visible time range for zoom-aware rendering
+        visible_start, visible_end = self.get_visible_time_range()
+        
+        # Only draw playhead if it's in the visible range
+        playhead_visible = visible_start <= time_pos <= visible_end
+        
+        # Draw played area (grayed out) - clip to visible range
+        if time_pos > visible_start:
+            played_end = min(time_pos, visible_end)
+            played_start = visible_start
             self.played_area = self.ax.axvspan(
-                0, time_pos,
+                played_start, played_end,
                 alpha=0.3,
                 color='#333333',
                 zorder=1
             )
         
-        # Draw playhead line
-        if position > 0:
+        # Draw playhead line if visible
+        if position > 0 and playhead_visible:
             self.playhead = self.ax.axvline(
                 x=time_pos,
                 color='#ffffff',
@@ -1169,11 +1369,12 @@ class SoundDenoiserApp(ctk.CTk):
         
         # Method names for display
         self._method_names = {
-            "NoiseReduce (Default)": DenoiseMethod.NOISEREDUCE,
             "Spectral Subtraction": DenoiseMethod.SPECTRAL_SUBTRACTION,
             "Wiener Filter": DenoiseMethod.WIENER,
             "Multi-Band Adaptive": DenoiseMethod.MULTIBAND,
             "Combined (All Methods)": DenoiseMethod.COMBINED,
+            "Shellac/78rpm (Hiss+Groove)": DenoiseMethod.SHELLAC,
+            "NoiseReduce (Legacy)": DenoiseMethod.NOISEREDUCE,
         }
         
         self.method_dropdown = ctk.CTkOptionMenu(
@@ -1188,7 +1389,7 @@ class SoundDenoiserApp(ctk.CTk):
             font=ctk.CTkFont(size=11),
             width=200
         )
-        self.method_dropdown.set("NoiseReduce (Default)")
+        self.method_dropdown.set("Spectral Subtraction")
         self.method_dropdown.pack(anchor="w", pady=(5, 0))
         
         # Max dB Reduction
@@ -1571,7 +1772,7 @@ class SoundDenoiserApp(ctk.CTk):
         self.transient_slider.set(30.0)
         self.hf_emphasis_slider.set(1.5)
         self.smoothing_slider.set(20.0)
-        self.method_dropdown.set("NoiseReduce (Default)")
+        self.method_dropdown.set("Spectral Subtraction")
         self.denoiser.set_method(DenoiseMethod.NOISEREDUCE)
         
     def _toggle_play(self, which: str):
@@ -1677,12 +1878,36 @@ class SoundDenoiserApp(ctk.CTk):
             self._process_dropped_files(file_list)
         
         # Update waveform playheads during playback
+        # Throttle spectrogram updates for better performance
+        current_time = time.time()
+        
         if self.player_original.is_playing():
             pos = self.player_original.get_position()
-            self.waveform_original.update_playhead(pos)
+            # Throttle updates in spectrogram mode (every 150ms) for performance
+            if self.waveform_original._view_mode == "spectrogram":
+                if not hasattr(self, '_last_orig_update') or current_time - self._last_orig_update > 0.15:
+                    self.waveform_original.update_playhead(pos)
+                    self._last_orig_update = current_time
+                else:
+                    # Just update time label without canvas redraw
+                    self.waveform_original._current_position = pos
+                    self.waveform_original._update_time_label(pos)
+            else:
+                self.waveform_original.update_playhead(pos)
+                
         if self.player_processed.is_playing():
             pos = self.player_processed.get_position()
-            self.waveform_processed.update_playhead(pos)
+            # Throttle updates in spectrogram mode (every 150ms) for performance
+            if self.waveform_processed._view_mode == "spectrogram":
+                if not hasattr(self, '_last_proc_update') or current_time - self._last_proc_update > 0.15:
+                    self.waveform_processed.update_playhead(pos)
+                    self._last_proc_update = current_time
+                else:
+                    # Just update time label without canvas redraw
+                    self.waveform_processed._current_position = pos
+                    self.waveform_processed._update_time_label(pos)
+            else:
+                self.waveform_processed.update_playhead(pos)
             
         # Update play buttons on completion
         if self.player_original.get_state() == PlaybackState.STOPPED:
