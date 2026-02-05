@@ -31,15 +31,22 @@ ctk.set_default_color_theme("blue")
 
 
 class WaveformDisplay(ctk.CTkFrame):
-    """Widget for displaying audio waveforms with noise region selection."""
+    """Widget for displaying audio waveforms with noise region selection and playhead."""
     
-    def __init__(self, master, on_region_select=None, **kwargs):
+    def __init__(self, master, on_region_select=None, waveform_color='#00d9ff', **kwargs):
         super().__init__(master, **kwargs)
         
         self.on_region_select = on_region_select
         self._duration = 0.0
         self._selection_enabled = False
         self._selected_region: Optional[Tuple[float, float]] = None
+        self._waveform_color = waveform_color
+        self._current_position = 0.0
+        
+        # Store waveform data for redrawing
+        self._audio_data = None
+        self._sample_rate = 44100
+        self._title = "Waveform"
         
         # Create matplotlib figure with dark theme
         self.fig = Figure(figsize=(10, 2.5), dpi=100, facecolor='#1a1a2e')
@@ -61,6 +68,9 @@ class WaveformDisplay(ctk.CTkFrame):
         
         # Playhead line
         self.playhead = None
+        
+        # Played area shading
+        self.played_area = None
         
         # Selection rectangle for noise region
         self.selection_rect = None
@@ -153,11 +163,20 @@ class WaveformDisplay(ctk.CTkFrame):
         self.ax.clear()
         self.ax.set_facecolor('#1a1a2e')
         self.selection_rect = None
+        self.playhead = None
+        self.played_area = None
+        self._waveform_color = color
+        self._title = title
+        self._sample_rate = sr
+        self._current_position = 0.0
         
         if audio is not None:
             # Downsample for display if needed
             if len(audio.shape) > 1:
                 audio = audio[0] if audio.shape[0] <= 2 else audio[:, 0]
+            
+            # Store for later use
+            self._audio_data = audio.copy()
             
             # Create time axis
             self._duration = len(audio) / sr
@@ -166,11 +185,15 @@ class WaveformDisplay(ctk.CTkFrame):
             # Downsample for faster plotting
             if len(audio) > 10000:
                 step = len(audio) // 10000
-                times = times[::step]
-                audio = audio[::step]
+                times_display = times[::step]
+                audio_display = audio[::step]
+            else:
+                times_display = times
+                audio_display = audio
             
-            self.ax.plot(times, audio, color=color, linewidth=0.5, alpha=0.8)
-            self.ax.fill_between(times, audio, alpha=0.3, color=color)
+            # Plot waveform
+            self.ax.plot(times_display, audio_display, color=color, linewidth=0.5, alpha=0.8)
+            self.ax.fill_between(times_display, audio_display, alpha=0.3, color=color)
             self.ax.set_xlim(0, self._duration)
             self.ax.set_ylim(-1, 1)
             
@@ -179,12 +202,80 @@ class WaveformDisplay(ctk.CTkFrame):
                 self._draw_selection_rect(*self._selected_region)
         else:
             self._duration = 0.0
+            self._audio_data = None
             
         self.ax.set_title(title, color='#ffffff', fontsize=10, fontweight='bold')
         self.ax.set_xlabel('Time (s)', color='#888888', fontsize=8)
         self.ax.tick_params(colors='#888888', labelsize=8)
         
         self.canvas.draw()
+    
+    def update_playhead(self, position: float):
+        """
+        Update playhead position and played area shading.
+        
+        Args:
+            position: Position as fraction (0-1)
+        """
+        if self._duration <= 0:
+            return
+            
+        time_pos = position * self._duration
+        self._current_position = position
+        
+        # Remove old playhead
+        if self.playhead is not None:
+            try:
+                self.playhead.remove()
+            except:
+                pass
+            self.playhead = None
+        
+        # Remove old played area
+        if self.played_area is not None:
+            try:
+                self.played_area.remove()
+            except:
+                pass
+            self.played_area = None
+        
+        # Draw played area (grayed out)
+        if time_pos > 0:
+            self.played_area = self.ax.axvspan(
+                0, time_pos,
+                alpha=0.3,
+                color='#333333',
+                zorder=1
+            )
+        
+        # Draw playhead line
+        if position > 0:
+            self.playhead = self.ax.axvline(
+                x=time_pos,
+                color='#ffffff',
+                linewidth=2,
+                alpha=0.9,
+                zorder=10
+            )
+        
+        self.canvas.draw_idle()
+    
+    def reset_playhead(self):
+        """Reset playhead to start."""
+        self._current_position = 0.0
+        if self.playhead is not None:
+            try:
+                self.playhead.remove()
+            except:
+                pass
+            self.playhead = None
+        if self.played_area is not None:
+            try:
+                self.played_area.remove()
+            except:
+                pass
+            self.played_area = None
+        self.canvas.draw_idle()
         
     def update_playhead(self, position: float, duration: float):
         """
@@ -843,8 +934,8 @@ class SoundDenoiserApp(ctk.CTk):
             params_inner,
             label="Max dB Reduction",
             from_=1.0,
-            to=20.0,
-            default=4.0,
+            to=30.0,
+            default=12.0,
             unit=" dB",
             command=self._on_parameter_change
         )
@@ -856,7 +947,7 @@ class SoundDenoiserApp(ctk.CTk):
             label="Blend Original Signal",
             from_=0.0,
             to=50.0,
-            default=12.0,
+            default=5.0,
             unit="%",
             command=self._on_parameter_change
         )
@@ -868,7 +959,7 @@ class SoundDenoiserApp(ctk.CTk):
             label="Noise Reduction Strength",
             from_=0.0,
             to=100.0,
-            default=70.0,
+            default=85.0,
             unit="%",
             command=self._on_parameter_change
         )
@@ -880,23 +971,23 @@ class SoundDenoiserApp(ctk.CTk):
             label="Transient Protection",
             from_=0.0,
             to=100.0,
-            default=50.0,
+            default=30.0,
             unit="%",
             command=self._on_parameter_change
         )
         self.transient_slider.pack(fill="x", pady=(0, 12))
         
-        # High Freq Rolloff
-        self.rolloff_slider = ParameterSlider(
+        # High Frequency Emphasis (extra reduction for hiss frequencies)
+        self.hf_emphasis_slider = ParameterSlider(
             params_inner,
-            label="High Frequency Rolloff",
-            from_=0.0,
-            to=100.0,
-            default=80.0,
-            unit="%",
+            label="High Freq Hiss Reduction",
+            from_=1.0,
+            to=3.0,
+            default=1.5,
+            unit="x",
             command=self._on_parameter_change
         )
-        self.rolloff_slider.pack(fill="x", pady=(0, 12))
+        self.hf_emphasis_slider.pack(fill="x", pady=(0, 12))
         
         # Smoothing Factor
         self.smoothing_slider = ParameterSlider(
@@ -904,7 +995,7 @@ class SoundDenoiserApp(ctk.CTk):
             label="Temporal Smoothing",
             from_=0.0,
             to=50.0,
-            default=10.0,
+            default=20.0,
             unit="%",
             command=self._on_parameter_change
         )
@@ -942,7 +1033,33 @@ class SoundDenoiserApp(ctk.CTk):
             height=35,
             corner_radius=8
         )
-        self.reset_btn.pack(fill="x")
+        self.reset_btn.pack(fill="x", pady=(0, 10))
+        
+        # Output Format Section
+        format_frame = ctk.CTkFrame(buttons_inner, fg_color="transparent")
+        format_frame.pack(fill="x", pady=(5, 0))
+        
+        format_label = ctk.CTkLabel(
+            format_frame,
+            text="Output Format:",
+            font=ctk.CTkFont(size=12),
+            text_color="#cccccc"
+        )
+        format_label.pack(side="left")
+        
+        self.output_format = ctk.CTkOptionMenu(
+            format_frame,
+            values=["FLAC", "WAV", "OGG"],
+            font=ctk.CTkFont(size=12),
+            fg_color="#2d5a27",
+            button_color="#2d5a27",
+            button_hover_color="#3d7a37",
+            dropdown_fg_color="#1a1a2e",
+            dropdown_hover_color="#333333",
+            width=100
+        )
+        self.output_format.set("FLAC")
+        self.output_format.pack(side="right")
         
         # Info box
         info_frame = ctk.CTkFrame(scroll_frame, fg_color="#1a2a3a", corner_radius=8)
@@ -1095,26 +1212,37 @@ class SoundDenoiserApp(ctk.CTk):
         if self.denoiser.get_processed() is None:
             messagebox.showwarning("No Processed Audio", "Please process the audio first.")
             return
-            
-        # Default output filename
-        default_name = f"{self.input_path.stem}_denoised.wav"
+        
+        # Get selected output format
+        output_format = self.output_format.get()
+        ext = output_format.lower()
+        
+        # Default output filename with selected format
+        default_name = f"{self.input_path.stem}_denoised.{ext}"
+        
+        # File type options based on format
+        if output_format == "FLAC":
+            filetypes = [("FLAC Files", "*.flac"), ("All Files", "*.*")]
+            default_ext = ".flac"
+        elif output_format == "WAV":
+            filetypes = [("WAV Files", "*.wav"), ("All Files", "*.*")]
+            default_ext = ".wav"
+        else:  # OGG
+            filetypes = [("OGG Files", "*.ogg"), ("All Files", "*.*")]
+            default_ext = ".ogg"
         
         file_path = filedialog.asksaveasfilename(
             title="Save Processed Audio",
-            defaultextension=".wav",
+            defaultextension=default_ext,
             initialfile=default_name,
-            filetypes=[
-                ("WAV Files", "*.wav"),
-                ("FLAC Files", "*.flac"),
-                ("All Files", "*.*")
-            ]
+            filetypes=filetypes
         )
         
         if not file_path:
             return
             
         try:
-            self.denoiser.save(file_path)
+            self.denoiser.save(file_path, format=output_format)
             self._set_status(f"Saved: {Path(file_path).name}")
             messagebox.showinfo("Success", f"Audio saved to:\n{file_path}")
         except Exception as e:
@@ -1139,7 +1267,7 @@ class SoundDenoiserApp(ctk.CTk):
             blend_original=self.blend_slider.get() / 100.0,
             noise_reduction_strength=self.strength_slider.get() / 100.0,
             transient_protection=self.transient_slider.get() / 100.0,
-            high_freq_rolloff=self.rolloff_slider.get() / 100.0,
+            high_freq_emphasis=self.hf_emphasis_slider.get(),
             smoothing_factor=self.smoothing_slider.get() / 100.0,
         )
         
@@ -1160,12 +1288,12 @@ class SoundDenoiserApp(ctk.CTk):
             
     def _reset_parameters(self):
         """Reset parameters to defaults."""
-        self.max_db_slider.set(4.0)
-        self.blend_slider.set(12.0)
-        self.strength_slider.set(70.0)
-        self.transient_slider.set(50.0)
-        self.rolloff_slider.set(80.0)
-        self.smoothing_slider.set(10.0)
+        self.max_db_slider.set(12.0)
+        self.blend_slider.set(5.0)
+        self.strength_slider.set(85.0)
+        self.transient_slider.set(30.0)
+        self.hf_emphasis_slider.set(1.5)
+        self.smoothing_slider.set(20.0)
         
     def _toggle_play(self, which: str):
         """Toggle play/pause for original or processed audio."""
@@ -1195,10 +1323,12 @@ class SoundDenoiserApp(ctk.CTk):
             self.player_original.stop()
             self.play_orig_btn.configure(text="▶")
             self.seek_orig.set_position(0)
+            self.waveform_original.reset_playhead()
         else:
             self.player_processed.stop()
             self.play_proc_btn.configure(text="▶")
             self.seek_proc.set_position(0)
+            self.waveform_processed.reset_playhead()
             
     def _on_seek(self, which: str, position: float):
         """Handle seek bar change."""
@@ -1258,11 +1388,15 @@ class SoundDenoiserApp(ctk.CTk):
         except queue.Empty:
             pass
         
-        # Update seek bars
+        # Update seek bars and waveform playheads
         if self.player_original.is_playing():
-            self.seek_orig.set_position(self.player_original.get_position())
+            pos = self.player_original.get_position()
+            self.seek_orig.set_position(pos)
+            self.waveform_original.update_playhead(pos)
         if self.player_processed.is_playing():
-            self.seek_proc.set_position(self.player_processed.get_position())
+            pos = self.player_processed.get_position()
+            self.seek_proc.set_position(pos)
+            self.waveform_processed.update_playhead(pos)
             
         # Update play buttons on completion
         if self.player_original.get_state() == PlaybackState.STOPPED:

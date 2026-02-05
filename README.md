@@ -136,12 +136,12 @@ denoiser.clear_noise_profile()
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `max_db_reduction` | 4.0 dB | Maximum amount of noise reduction. Lower = gentler, more natural |
-| `blend_original` | 12% | Amount of original signal mixed back in. Higher = more original character |
-| `noise_reduction_strength` | 70% | Overall strength of the noise reduction algorithm |
-| `transient_protection` | 50% | How much to protect transients (drums, attacks) from reduction |
-| `high_freq_rolloff` | 80% | Apply more aggressive reduction at high frequencies where hiss lives |
-| `smoothing_factor` | 10% | Temporal smoothing to reduce musical noise artifacts |
+| `max_db_reduction` | 8.0 dB | Maximum amount of noise reduction. Lower = gentler, more natural |
+| `blend_original` | 8% | Amount of original signal mixed back in. Higher = more original character |
+| `noise_reduction_strength` | 75% | Overall strength of the noise reduction algorithm |
+| `transient_protection` | 40% | How much to protect transients (drums, attacks) from reduction |
+| `high_freq_rolloff` | 60% | Apply more aggressive reduction at high frequencies where hiss lives |
+| `smoothing_factor` | 15% | Temporal smoothing to reduce musical noise artifacts |
 
 ## Algorithm
 
