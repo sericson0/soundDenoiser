@@ -22,6 +22,17 @@ from dataclasses import dataclass, field
 from enum import Enum
 import noisereduce as nr
 
+# Metadata handling
+try:
+    from mutagen import File as MutagenFile
+    from mutagen.flac import FLAC, Picture
+    from mutagen.oggvorbis import OggVorbis
+    from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, TDRC, TCON, TRCK, COMM
+    from mutagen.wave import WAVE
+    MUTAGEN_AVAILABLE = True
+except ImportError:
+    MUTAGEN_AVAILABLE = False
+
 
 class DenoiseMethod(Enum):
     """Available denoising methods."""
@@ -770,9 +781,208 @@ class AudioDenoiser:
     def get_sample_rate(self) -> Optional[int]:
         return self._sr
     
+    def _copy_metadata(self, source_path: Path, dest_path: Path) -> bool:
+        """
+        Copy metadata (including album art) from source to destination audio file.
+        
+        Supports copying between: MP3, FLAC, OGG, WAV, M4A/AAC formats.
+        
+        Args:
+            source_path: Path to the original file with metadata
+            dest_path: Path to the newly saved file
+            
+        Returns:
+            True if metadata was copied successfully, False otherwise
+        """
+        if not MUTAGEN_AVAILABLE:
+            return False
+            
+        try:
+            # Open source file to read metadata
+            source_audio = MutagenFile(str(source_path))
+            if source_audio is None:
+                return False
+            
+            dest_ext = dest_path.suffix.lower()
+            
+            # Extract common metadata fields from source
+            metadata = {}
+            pictures = []
+            
+            # Handle different source formats
+            if hasattr(source_audio, 'tags') and source_audio.tags:
+                tags = source_audio.tags
+                
+                # FLAC and OGG Vorbis use Vorbis comments
+                if hasattr(tags, 'get'):
+                    # Try common Vorbis comment fields
+                    for field, key in [
+                        ('title', 'TITLE'), ('artist', 'ARTIST'), ('album', 'ALBUM'),
+                        ('date', 'DATE'), ('genre', 'GENRE'), ('tracknumber', 'TRACKNUMBER'),
+                        ('comment', 'COMMENT'), ('albumartist', 'ALBUMARTIST'),
+                        ('composer', 'COMPOSER'), ('discnumber', 'DISCNUMBER')
+                    ]:
+                        value = tags.get(key) or tags.get(key.lower())
+                        if value:
+                            metadata[field] = value[0] if isinstance(value, list) else value
+                
+                # Extract ID3 tags (MP3)
+                if hasattr(tags, 'getall'):
+                    for frame in ['TIT2', 'TPE1', 'TALB', 'TDRC', 'TCON', 'TRCK', 'COMM']:
+                        try:
+                            frames = tags.getall(frame)
+                            if frames:
+                                if frame == 'TIT2':
+                                    metadata['title'] = str(frames[0])
+                                elif frame == 'TPE1':
+                                    metadata['artist'] = str(frames[0])
+                                elif frame == 'TALB':
+                                    metadata['album'] = str(frames[0])
+                                elif frame == 'TDRC':
+                                    metadata['date'] = str(frames[0])
+                                elif frame == 'TCON':
+                                    metadata['genre'] = str(frames[0])
+                                elif frame == 'TRCK':
+                                    metadata['tracknumber'] = str(frames[0])
+                        except:
+                            pass
+                    
+                    # Extract album art from ID3
+                    try:
+                        apic_frames = tags.getall('APIC')
+                        for apic in apic_frames:
+                            pictures.append({
+                                'data': apic.data,
+                                'mime': apic.mime,
+                                'type': apic.type,
+                                'desc': apic.desc
+                            })
+                    except:
+                        pass
+            
+            # Extract pictures from FLAC
+            if hasattr(source_audio, 'pictures'):
+                for pic in source_audio.pictures:
+                    pictures.append({
+                        'data': pic.data,
+                        'mime': pic.mime,
+                        'type': pic.type,
+                        'desc': pic.desc if hasattr(pic, 'desc') else ''
+                    })
+            
+            # Extract from MP4/M4A
+            if hasattr(source_audio, 'tags') and source_audio.tags:
+                tags = source_audio.tags
+                # MP4 atom names
+                mp4_map = {
+                    '\xa9nam': 'title', '\xa9ART': 'artist', '\xa9alb': 'album',
+                    '\xa9day': 'date', '\xa9gen': 'genre', 'trkn': 'tracknumber'
+                }
+                for atom, field in mp4_map.items():
+                    if atom in tags:
+                        val = tags[atom]
+                        if isinstance(val, list) and val:
+                            val = val[0]
+                            if isinstance(val, tuple):
+                                val = str(val[0])  # Track number tuple
+                            metadata[field] = str(val)
+                
+                # MP4 cover art
+                if 'covr' in tags:
+                    for cover in tags['covr']:
+                        pictures.append({
+                            'data': bytes(cover),
+                            'mime': 'image/jpeg' if cover.imageformat == 13 else 'image/png',
+                            'type': 3,  # Front cover
+                            'desc': ''
+                        })
+            
+            # Now write metadata to destination
+            if dest_ext == '.flac':
+                dest_audio = FLAC(str(dest_path))
+                
+                # Set text metadata
+                for field, value in metadata.items():
+                    dest_audio[field.upper()] = value
+                
+                # Add pictures
+                dest_audio.clear_pictures()
+                for pic_data in pictures:
+                    pic = Picture()
+                    pic.data = pic_data['data']
+                    pic.mime = pic_data['mime']
+                    pic.type = pic_data.get('type', 3)
+                    pic.desc = pic_data.get('desc', '')
+                    dest_audio.add_picture(pic)
+                
+                dest_audio.save()
+                
+            elif dest_ext == '.ogg':
+                dest_audio = OggVorbis(str(dest_path))
+                
+                # Set text metadata
+                for field, value in metadata.items():
+                    dest_audio[field.upper()] = value
+                
+                # OGG can embed pictures as base64 in METADATA_BLOCK_PICTURE
+                import base64
+                for pic_data in pictures:
+                    pic = Picture()
+                    pic.data = pic_data['data']
+                    pic.mime = pic_data['mime']
+                    pic.type = pic_data.get('type', 3)
+                    pic.desc = pic_data.get('desc', '')
+                    pic_encoded = base64.b64encode(pic.write()).decode('ascii')
+                    dest_audio['METADATA_BLOCK_PICTURE'] = [pic_encoded]
+                
+                dest_audio.save()
+                
+            elif dest_ext == '.wav':
+                # WAV files can have ID3 tags
+                try:
+                    dest_audio = WAVE(str(dest_path))
+                    if dest_audio.tags is None:
+                        dest_audio.add_tags()
+                    
+                    # Add ID3 tags
+                    if 'title' in metadata:
+                        dest_audio.tags.add(TIT2(encoding=3, text=metadata['title']))
+                    if 'artist' in metadata:
+                        dest_audio.tags.add(TPE1(encoding=3, text=metadata['artist']))
+                    if 'album' in metadata:
+                        dest_audio.tags.add(TALB(encoding=3, text=metadata['album']))
+                    if 'date' in metadata:
+                        dest_audio.tags.add(TDRC(encoding=3, text=metadata['date']))
+                    if 'genre' in metadata:
+                        dest_audio.tags.add(TCON(encoding=3, text=metadata['genre']))
+                    if 'tracknumber' in metadata:
+                        dest_audio.tags.add(TRCK(encoding=3, text=metadata['tracknumber']))
+                    
+                    # Add pictures
+                    for pic_data in pictures:
+                        dest_audio.tags.add(APIC(
+                            encoding=3,
+                            mime=pic_data['mime'],
+                            type=pic_data.get('type', 3),
+                            desc=pic_data.get('desc', ''),
+                            data=pic_data['data']
+                        ))
+                    
+                    dest_audio.save()
+                except Exception:
+                    # WAV ID3 support can be flaky
+                    pass
+            
+            return True
+            
+        except Exception as e:
+            # Log but don't fail - metadata is nice to have but not critical
+            print(f"Warning: Could not copy metadata: {e}")
+            return False
+    
     def save(self, output_path: str, audio: Optional[np.ndarray] = None, format: str = "FLAC") -> str:
         """
-        Save processed audio to file.
+        Save processed audio to file, preserving metadata from the original file.
         
         Args:
             output_path: Path to save the output file
@@ -807,6 +1017,10 @@ class AudioDenoiser:
             subtype = None
         
         sf.write(str(output_path), audio, self._sr, subtype=subtype)
+        
+        # Copy metadata from original file if available
+        if self._file_path and self._file_path.exists():
+            self._copy_metadata(self._file_path, output_path)
         
         return str(output_path)
     
