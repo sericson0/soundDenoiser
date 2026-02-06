@@ -99,6 +99,7 @@ class AudioDenoiser:
         hiss_peak_freq: float = 6000.0,
         spectral_floor: float = 0.05,
         low_cut_freq: float = 0.0,
+        noise_threshold: float = 1.0,
     ):
         """
         Initialize the denoiser with parameters.
@@ -115,6 +116,9 @@ class AudioDenoiser:
             hiss_peak_freq: Frequency where hiss reduction is maximum (Hz, default: 6000)
             spectral_floor: Minimum signal to retain, prevents artifacts (0-1, default: 0.05)
             low_cut_freq: High-pass filter frequency for rumble removal (Hz, 0=off, default: 0)
+            noise_threshold: Multiplier for noise estimate boundary (0.5-3.0, default: 1.0)
+                Higher values = more aggressive (treats more as noise)
+                Lower values = more conservative (preserves more signal)
         """
         self.max_db_reduction = max_db_reduction
         self.blend_original = blend_original
@@ -129,6 +133,7 @@ class AudioDenoiser:
         self.hiss_peak_freq = hiss_peak_freq
         self.spectral_floor = spectral_floor
         self.low_cut_freq = low_cut_freq
+        self.noise_threshold = noise_threshold
         
         # Internal state
         self._audio: Optional[np.ndarray] = None
@@ -434,6 +439,11 @@ class AudioDenoiser:
         else:
             noise_estimate = self._estimate_noise_spectrum(stft_mag)
         
+        # Apply noise threshold - multiplies the noise estimate to define the boundary
+        # Higher threshold = more aggressive (treats more as noise)
+        # Lower threshold = more conservative (preserves more signal)
+        noise_estimate = noise_estimate * self.noise_threshold
+        
         # Over-subtraction factor (reduces musical noise)
         alpha = 1.0 + self.noise_reduction_strength * 2.0
         
@@ -471,10 +481,13 @@ class AudioDenoiser:
         
         # Get noise estimate
         if self._use_learned_profile and self._noise_profile is not None:
-            noise_power = self._noise_profile.spectral_mean ** 2
+            noise_estimate = self._noise_profile.spectral_mean
         else:
             noise_estimate = self._estimate_noise_spectrum(stft_mag)
-            noise_power = noise_estimate ** 2
+        
+        # Apply noise threshold - multiplies the noise estimate to define the boundary
+        noise_estimate = noise_estimate * self.noise_threshold
+        noise_power = noise_estimate ** 2
         
         # Signal power estimate
         signal_power = stft_mag ** 2
@@ -517,6 +530,9 @@ class AudioDenoiser:
             noise_estimate = self._noise_profile.spectral_mean
         else:
             noise_estimate = self._estimate_noise_spectrum(stft_mag)
+        
+        # Apply noise threshold - multiplies the noise estimate to define the boundary
+        noise_estimate = noise_estimate * self.noise_threshold
         
         # Create gain matrix
         gain = np.ones_like(stft_mag)
@@ -607,6 +623,9 @@ class AudioDenoiser:
             noise_estimate = self._noise_profile.spectral_mean
         else:
             noise_estimate = self._estimate_noise_spectrum(stft_mag)
+        
+        # Apply noise threshold - multiplies the noise estimate to define the boundary
+        noise_estimate = noise_estimate * self.noise_threshold
         
         # Create frequency-dependent gain matrix
         gain = np.ones_like(stft_mag)
@@ -1037,6 +1056,7 @@ class AudioDenoiser:
         hiss_peak_freq: Optional[float] = None,
         spectral_floor: Optional[float] = None,
         low_cut_freq: Optional[float] = None,
+        noise_threshold: Optional[float] = None,
     ):
         """Update denoiser parameters."""
         if max_db_reduction is not None:
@@ -1061,6 +1081,8 @@ class AudioDenoiser:
             self.spectral_floor = spectral_floor
         if low_cut_freq is not None:
             self.low_cut_freq = low_cut_freq
+        if noise_threshold is not None:
+            self.noise_threshold = noise_threshold
     
     def set_method(self, method: DenoiseMethod):
         """Set the denoising method."""

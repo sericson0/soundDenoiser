@@ -1428,11 +1428,11 @@ class SoundDenoiserApp(ctk.CTk):
         
         # Method description - shows which parameters are most effective
         self._method_descriptions = {
-            "Spectral Subtraction": "Best for: General hiss. Key params: Strength, HF Reduction",
-            "Wiener Filter": "Best for: Broadband noise. Key params: Strength, HF Reduction",
-            "Multi-Band Adaptive": "Best for: Complex noise. Key params: Strength (per-band)",
-            "Combined (All Methods)": "Best for: Heavy noise. Uses Spectral + Wiener + HF",
-            "Shellac/78rpm (Hiss+Groove)": "Best for: Old 78s. Auto-tuned for groove rumble + hiss",
+            "Spectral Subtraction": "Best for: General hiss. Key params: Strength, Noise Threshold, HF Reduction",
+            "Wiener Filter": "Best for: Broadband noise. Key params: Strength, Noise Threshold",
+            "Multi-Band Adaptive": "Best for: Complex noise. Key params: Strength, Noise Threshold",
+            "Combined (All Methods)": "Best for: Heavy noise. Uses Spectral + Wiener + Threshold",
+            "Shellac/78rpm (Hiss+Groove)": "Best for: Old 78s. Key params: Strength, Noise Threshold",
             "NoiseReduce (Legacy)": "ML-based. May not work well on vintage recordings",
         }
         
@@ -1581,7 +1581,19 @@ class SoundDenoiserApp(ctk.CTk):
             unit="Hz",
             command=self._on_parameter_change
         )
-        self.low_cut_slider.pack(fill="x", pady=(0, 5))
+        self.low_cut_slider.pack(fill="x", pady=(0, 12))
+        
+        # Noise Threshold (noise/signal boundary)
+        self.noise_threshold_slider = ParameterSlider(
+            fine_tune_inner,
+            label="Noise Threshold",
+            from_=0.5,
+            to=3.0,
+            default=1.0,
+            unit="x",
+            command=self._on_parameter_change
+        )
+        self.noise_threshold_slider.pack(fill="x", pady=(0, 5))
         
         # Buttons Section
         buttons_frame = ctk.CTkFrame(scroll_frame, fg_color="#151525", corner_radius=10)
@@ -1861,6 +1873,7 @@ class SoundDenoiserApp(ctk.CTk):
             hiss_peak_freq=self.hiss_peak_slider.get(),
             spectral_floor=self.spectral_floor_slider.get() / 100.0,
             low_cut_freq=self.low_cut_slider.get(),
+            noise_threshold=self.noise_threshold_slider.get(),
         )
         
         # Process in background thread
@@ -1907,6 +1920,10 @@ class SoundDenoiserApp(ctk.CTk):
         # Low cut - relevant for all methods (always applied post-processing)
         self.low_cut_slider.label.configure(text_color=active_color)
         
+        # Noise threshold - relevant for all spectral methods (not NoiseReduce which uses own logic)
+        threshold_relevant = method_name != "NoiseReduce (Legacy)"
+        self.noise_threshold_slider.label.configure(text_color=active_color if threshold_relevant else dim_color)
+        
         self._set_status(f"Method changed to: {method_name}")
         # Highlight process button to indicate reprocessing needed
         if self.denoiser.get_original() is not None and not self.is_processing:
@@ -1925,6 +1942,7 @@ class SoundDenoiserApp(ctk.CTk):
         self.hiss_peak_slider.set(6000.0)
         self.spectral_floor_slider.set(5.0)
         self.low_cut_slider.set(0.0)
+        self.noise_threshold_slider.set(1.0)
         # Method default
         self.method_dropdown.set("Spectral Subtraction")
         self.denoiser.set_method(DenoiseMethod.SPECTRAL_SUBTRACTION)
