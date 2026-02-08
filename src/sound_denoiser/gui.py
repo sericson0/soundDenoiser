@@ -420,17 +420,15 @@ class WaveformDisplay(ctk.CTkFrame):
         time_offset = padded_start / sr
         time_end = padded_end / sr
         
-        # Plot spectrogram with custom colormap - use imshow for better performance
+        # Plot mel spectrogram - y_axis='mel' uses mel scale (non-linear)
         img = librosa.display.specshow(
-            D, sr=effective_sr, hop_length=hop_length, x_axis='time', y_axis='hz',
-            ax=self.ax, cmap='magma', x_coords=np.linspace(time_offset, time_end, D.shape[1])
+            D, sr=effective_sr, hop_length=hop_length, x_axis='time', y_axis='mel',
+            ax=self.ax, cmap='magma', x_coords=np.linspace(time_offset, time_end, D.shape[1]),
+            fmax=max_freq
         )
         
-        # Set axis limits - X is zoom-dependent, Y is always 0-12kHz
+        # Set axis limits - X is zoom-dependent
         self.ax.set_xlim(visible_start, visible_end)
-        # Fixed Y-axis: always 0-12kHz regardless of zoom (limited by Nyquist if sample rate is low)
-        max_freq = min(effective_sr // 2, 12000)
-        self.ax.set_ylim(0, max_freq)
         
         # Restore selection if any and it's visible
         if self._selected_region:
@@ -621,7 +619,6 @@ class WaveformDisplay(ctk.CTkFrame):
         Args:
             position: Position as fraction (0-1)
             skip_draw: If True, only update time label without redrawing canvas
-                      (for performance during spectrogram playback)
         """
         if self._duration <= 0:
             return
@@ -632,10 +629,29 @@ class WaveformDisplay(ctk.CTkFrame):
         # Update time label (always do this)
         self._update_time_label(position)
         
-        # In spectrogram mode, skip canvas updates for performance
-        # The spectrogram is expensive to redraw and playhead isn't critical
-        if skip_draw or self._view_mode == "spectrogram":
+        if skip_draw:
             return
+        
+        # Get visible time range for zoom-aware rendering
+        visible_start, visible_end = self.get_visible_time_range()
+        
+        # Auto-scroll when zoomed and playhead reaches end of visible range
+        if self._zoom_level > 1.0 and time_pos >= visible_end - 0.1:
+            # Scroll so playhead is at left edge
+            total_duration = self._duration
+            visible_duration = visible_end - visible_start
+            new_offset = min(time_pos / total_duration, 1.0 - (visible_duration / total_duration))
+            new_offset = max(0.0, new_offset)
+            
+            if abs(new_offset - self._zoom_offset) > 0.01:
+                self._zoom_offset = new_offset
+                # Redraw the plot with new offset
+                if self._view_mode == "spectrogram":
+                    self._plot_spectrogram_internal()
+                else:
+                    self._plot_waveform_internal()
+                # Recalculate visible range after redraw
+                visible_start, visible_end = self.get_visible_time_range()
         
         # Remove old playhead
         if self.playhead is not None:
@@ -645,7 +661,7 @@ class WaveformDisplay(ctk.CTkFrame):
                 pass
             self.playhead = None
         
-        # Remove old played area
+        # Remove old played area (only for waveform mode to reduce flicker in spectrogram)
         if self.played_area is not None:
             try:
                 self.played_area.remove()
@@ -653,14 +669,11 @@ class WaveformDisplay(ctk.CTkFrame):
                 pass
             self.played_area = None
         
-        # Get visible time range for zoom-aware rendering
-        visible_start, visible_end = self.get_visible_time_range()
-        
         # Only draw playhead if it's in the visible range
         playhead_visible = visible_start <= time_pos <= visible_end
         
-        # Draw played area (grayed out) - clip to visible range
-        if time_pos > visible_start:
+        # Draw played area (grayed out) - clip to visible range (waveform only)
+        if time_pos > visible_start and self._view_mode != "spectrogram":
             played_end = min(time_pos, visible_end)
             played_start = visible_start
             self.played_area = self.ax.axvspan(
@@ -1953,13 +1966,17 @@ class SoundDenoiserApp(ctk.CTk):
             player = self.player_original
             btn = self.play_orig_btn
             other_player = self.player_processed
+            other_btn = self.play_proc_btn
         else:
             player = self.player_processed
             btn = self.play_proc_btn
             other_player = self.player_original
+            other_btn = self.play_orig_btn
             
-        # Stop other player
-        other_player.stop()
+        # Pause other player (not stop - preserve position)
+        if other_player.is_playing():
+            other_player.pause()
+            other_btn.configure(text="▶")
         
         if player.is_playing():
             player.pause()
