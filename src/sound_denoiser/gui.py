@@ -103,8 +103,10 @@ class WaveformDisplay(ctk.CTkFrame):
         self._dragging_threshold_idx: Optional[int] = None
         self.noise_floor_freqs: Optional[np.ndarray] = None
         self.noise_floor_levels: Optional[np.ndarray] = None
+        self.noise_threshold_mult: float = 1.0
         self.threshold_smooth_plot = None
         self.noise_floor_plot = None
+        self.noise_threshold_plot = None
         self.noise_fill = None
         self.analyzer_img = None
         self._analyzer_freqs: Optional[np.ndarray] = None
@@ -112,6 +114,8 @@ class WaveformDisplay(ctk.CTkFrame):
         self._analyzer_floor_db = -110.0
         self._analyzer_ceiling_db = 10.0
         self._analyzer_nfft = 2048
+        self._analyzer_filter = None
+        self._analyzer_filter_sr = None
 
         # Separator before zoom controls
         sep1 = ctk.CTkFrame(toggle_frame, width=1, height=20, fg_color="#444444")
@@ -294,6 +298,16 @@ class WaveformDisplay(ctk.CTkFrame):
         if self._view_mode == "spectrum":
             self._plot_spectrum_internal()
 
+    def set_noise_threshold_multiplier(self, mult: float):
+        """Set current noise threshold multiplier for visualizing gating line."""
+        try:
+            mult = float(mult)
+        except Exception:
+            return
+        self.noise_threshold_mult = max(0.01, mult)
+        if self._view_mode == "spectrum":
+            self._refresh_threshold_artists()
+
     def _smooth_threshold_curve(self, dense_points: int = 400) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         """Return a lightly smoothed threshold curve for RX-like visuals."""
         if len(self.threshold_freqs) < 2:
@@ -331,6 +345,7 @@ class WaveformDisplay(ctk.CTkFrame):
         smoothed = self._smooth_threshold_curve()
         floor_freqs = self.noise_floor_freqs
         floor_levels = self.noise_floor_levels
+        threshold_mult = self.noise_threshold_mult
 
         if smoothed:
             dense_freqs, smooth_levels = smoothed
@@ -368,18 +383,53 @@ class WaveformDisplay(ctk.CTkFrame):
                 (self.noise_floor_plot,) = self.ax.plot(
                     floor_freqs,
                     floor_levels,
-                    color="#b187ff",
+                    color="#999999",
                     linewidth=1.4,
                     linestyle="--",
                     alpha=0.9,
                 )
             else:
                 self.noise_floor_plot.set_data(floor_freqs, floor_levels)
+
+            # Noise threshold line = learned floor lifted by multiplier
+            offset_db = 20 * np.log10(max(threshold_mult, 1e-3))
+            shifted_levels = floor_levels + offset_db
+
+            if self.noise_threshold_plot is None:
+                (self.noise_threshold_plot,) = self.ax.plot(
+                    floor_freqs,
+                    shifted_levels,
+                    color="#b187ff",
+                    linewidth=1.4,
+                    linestyle="--",
+                    alpha=0.9,
+                )
+            else:
+                self.noise_threshold_plot.set_data(floor_freqs, shifted_levels)
         else:
             if self.noise_floor_plot is not None:
                 self.noise_floor_plot.set_data([], [])
+            if self.noise_threshold_plot is not None:
+                self.noise_threshold_plot.set_data([], [])
 
         self.canvas.draw_idle()
+
+    def _build_analyzer_filter(self, sr: int):
+        """Prepare mel filter bank for the analyzer based on current sample rate."""
+        nyquist = max(2000.0, sr / 2)
+        n_mels = 256
+        fmin = 30.0
+        fmax = min(nyquist, 20000.0)
+        self._analyzer_filter = librosa.filters.mel(
+            sr=sr,
+            n_fft=self._analyzer_nfft,
+            n_mels=n_mels,
+            fmin=fmin,
+            fmax=fmax,
+            htk=True,
+        )
+        self._analyzer_freqs = librosa.mel_frequencies(n_mels=n_mels, fmin=fmin, fmax=fmax)
+        self._analyzer_filter_sr = sr
 
     def _format_time(self, seconds: float) -> str:
         """Format seconds as M:SS."""
@@ -506,8 +556,13 @@ class WaveformDisplay(ctk.CTkFrame):
         self.played_area = None
         self.threshold_smooth_plot = None
         self.noise_floor_plot = None
+        self.noise_threshold_plot = None
         self.noise_fill = None
         self.analyzer_img = None
+        self.threshold_smooth_plot = None
+        self.noise_floor_plot = None
+        self.noise_threshold_plot = None
+        self.noise_fill = None
         self.analyzer_img = None
 
         audio = self._audio_data
@@ -708,14 +763,19 @@ class WaveformDisplay(ctk.CTkFrame):
         self.played_area = None
         self.analyzer_img = None
         self._analyzer_levels = None
+        self.threshold_smooth_plot = None
+        self.noise_floor_plot = None
+        self.noise_threshold_plot = None
+        self.noise_fill = None
 
         audio = self._audio_data
         sr = self._sample_rate
 
         nyquist = max(2000.0, sr / 2)
 
-        # Initialize analyzer background (Prism-style bar wash)
-        self._analyzer_freqs = np.geomspace(20.0, min(nyquist, 20000.0), 256)
+        # Initialize mel-space analyzer background (Prism-style wash)
+        if self._analyzer_filter is None or self._analyzer_filter_sr != sr:
+            self._build_analyzer_filter(sr)
         zero_levels = np.full_like(self._analyzer_freqs, self._analyzer_floor_db)
         norm = np.clip(
             (zero_levels - self._analyzer_floor_db) / (self._analyzer_ceiling_db - self._analyzer_floor_db),
@@ -748,8 +808,9 @@ class WaveformDisplay(ctk.CTkFrame):
         self._refresh_threshold_artists()
 
         # Axes styling
-        self.ax.set_xlim(20, min(nyquist, 20000))
+        self.ax.set_xlim(max(30, float(self._analyzer_freqs[0])), min(nyquist, float(self._analyzer_freqs[-1])))
         self.ax.set_ylim(self._analyzer_floor_db, self._analyzer_ceiling_db)
+        self.ax.set_xscale('log')
         self.ax.set_xlabel('Frequency (Hz)', color='#888888', fontsize=8)
         self.ax.set_ylabel('Level (dB)', color='#888888', fontsize=8)
         self.ax.tick_params(colors='#888888', labelsize=8)
@@ -757,6 +818,9 @@ class WaveformDisplay(ctk.CTkFrame):
         self.ax.set_title('Frequency Analyzer', color='#ffffff', fontsize=10, fontweight='bold')
         self.ax.xaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=False))
         self.ax.ticklabel_format(axis='x', style='plain', useOffset=False)
+
+        # Seed analyzer with current frame so it's visible immediately
+        self.update_frequency_analyzer(audio, sr, self._current_position)
 
         self.canvas.draw()
 
@@ -782,18 +846,22 @@ class WaveformDisplay(ctk.CTkFrame):
         window = audio[start:end]
         window = window * np.hanning(len(window))
 
+        # Build mel filter if sample rate changed
+        if self._analyzer_filter is None or self._analyzer_filter_sr != sr:
+            self._build_analyzer_filter(sr)
+
         spec = np.abs(np.fft.rfft(window, n=self._analyzer_nfft))
-        freqs = np.fft.rfftfreq(self._analyzer_nfft, d=1.0 / sr)
-        spec_db = 20 * np.log10(np.maximum(spec, 1e-9))
+        spec_power = spec ** 2
 
-        # Log-spaced interpolation for smoother, RX/Prism-like distribution
-        interp_levels = np.interp(self._analyzer_freqs, freqs, spec_db, left=self._analyzer_floor_db, right=self._analyzer_floor_db)
+        # Project to mel bands
+        mel_power = self._analyzer_filter @ spec_power[: self._analyzer_filter.shape[1]]
+        mel_db = 10 * np.log10(np.maximum(mel_power, 1e-12))
 
-        if self._analyzer_levels is None or len(self._analyzer_levels) != len(interp_levels):
-            self._analyzer_levels = interp_levels
+        if self._analyzer_levels is None or len(self._analyzer_levels) != len(mel_db):
+            self._analyzer_levels = mel_db
         else:
             # Exponential smoothing to keep motion fluid
-            self._analyzer_levels = 0.82 * self._analyzer_levels + 0.18 * interp_levels
+            self._analyzer_levels = 0.82 * self._analyzer_levels + 0.18 * mel_db
 
         norm = np.clip(
             (self._analyzer_levels - self._analyzer_floor_db) / (self._analyzer_ceiling_db - self._analyzer_floor_db),
@@ -2522,6 +2590,8 @@ class SoundDenoiserApp(ctk.CTk):
         self.threshold_curve = list(zip(freqs.tolist(), levels.tolist()))
         self.waveform_original.set_threshold_curve(freqs, levels)
         self.waveform_processed.set_threshold_curve(freqs, levels)
+        self.waveform_original.set_noise_threshold_multiplier(noise_thresh)
+        self.waveform_processed.set_noise_threshold_multiplier(noise_thresh)
 
     def _on_method_change(self, method_name: str):
         """Handle denoising method change."""
