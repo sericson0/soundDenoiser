@@ -80,8 +80,8 @@ class WaveformDisplay(ctk.CTkFrame):
         self.analyzer_fill = None
         self._analyzer_freqs: Optional[np.ndarray] = None
         self._analyzer_levels: Optional[np.ndarray] = None
-        self._analyzer_floor_db = -110.0
-        self._analyzer_ceiling_db = 10.0
+        self._analyzer_floor_db = -90.0
+        self._analyzer_ceiling_db = 60.0
         self._analyzer_nfft = 2048
         self._analyzer_filter = None
         self._analyzer_filter_sr = None
@@ -382,7 +382,7 @@ class WaveformDisplay(ctk.CTkFrame):
                 self.noise_threshold_plot.set_data([], [])
 
         if self.analyzer_line is not None:
-            self.analyzer_line.set_zorder(0.5)
+            self.analyzer_line.set_zorder(2)
 
         self.canvas.draw_idle()
 
@@ -696,23 +696,29 @@ class WaveformDisplay(ctk.CTkFrame):
 
         if self._analyzer_filter is None or self._analyzer_filter_sr != sr:
             self._build_analyzer_filter(sr)
-        zero_levels = np.full_like(self._analyzer_freqs, self._analyzer_floor_db + 6.0)
-        norm = np.clip(
-            (zero_levels - self._analyzer_floor_db) / (self._analyzer_ceiling_db - self._analyzer_floor_db),
-            0,
-            1,
+
+        # Initialize with floor levels - will be updated with real audio data
+        initial_levels = np.full_like(self._analyzer_freqs, self._analyzer_floor_db)
+
+        # Use line plot + fill for spectrum (works correctly with log x-axis)
+        self.analyzer_fill = self.ax.fill_between(
+            self._analyzer_freqs,
+            self._analyzer_floor_db,
+            initial_levels,
+            color="#ff9f43",
+            alpha=0.6,
+            zorder=1,
         )
-        analyzer_grid = np.tile(norm, (2, 1))
-        self.analyzer_img = self.ax.imshow(
-            analyzer_grid,
-            extent=(self._analyzer_freqs[0], self._analyzer_freqs[-1], self._analyzer_floor_db, self._analyzer_ceiling_db),
-            aspect="auto",
-            origin="lower",
-            cmap="magma",
-            alpha=0.55,
-            interpolation="nearest",
-            zorder=0,
+        (self.analyzer_line,) = self.ax.plot(
+            self._analyzer_freqs,
+            initial_levels,
+            color="#ffcc00",
+            linewidth=1.2,
+            alpha=0.9,
+            zorder=2,
         )
+        # Keep analyzer_img as a flag that the analyzer is initialized
+        self.analyzer_img = True
 
         plot_freqs = np.clip(self.threshold_freqs, 20, nyquist)
         (self.threshold_plot,) = self.ax.plot(
@@ -746,6 +752,8 @@ class WaveformDisplay(ctk.CTkFrame):
             return
         if audio is None or sr <= 0 or self.analyzer_img is None or self._analyzer_freqs is None:
             return
+        if self.analyzer_line is None:
+            return
 
         center = int(position * len(audio))
         if center <= 0:
@@ -775,14 +783,26 @@ class WaveformDisplay(ctk.CTkFrame):
         else:
             self._analyzer_levels = 0.82 * self._analyzer_levels + 0.18 * mel_db
 
-        norm = np.clip(
-            (self._analyzer_levels - self._analyzer_floor_db) / (self._analyzer_ceiling_db - self._analyzer_floor_db),
-            0,
-            1,
-        )
+        # Clip levels to the display range
+        display_levels = np.clip(self._analyzer_levels, self._analyzer_floor_db, self._analyzer_ceiling_db)
 
-        analyzer_grid = np.tile(norm, (2, 1))
-        self.analyzer_img.set_data(analyzer_grid)
+        # Update line plot data
+        self.analyzer_line.set_ydata(display_levels)
+
+        # Update fill - need to remove old and create new
+        if self.analyzer_fill is not None:
+            self.analyzer_fill.remove()
+        self.analyzer_fill = self.ax.fill_between(
+            self._analyzer_freqs,
+            self._analyzer_floor_db,
+            display_levels,
+            color="#ff9f43",
+            alpha=0.6,
+            zorder=1,
+        )
+        # Ensure line stays on top
+        self.analyzer_line.set_zorder(2)
+
         self.canvas.draw_idle()
 
     def _on_canvas_click(self, event):
