@@ -387,7 +387,7 @@ class SoundDenoiserApp(ctk.CTk):
             "Multi-Band Adaptive": DenoiseMethod.MULTIBAND,
             "Combined (All Methods)": DenoiseMethod.COMBINED,
             "Shellac/78rpm (Hiss+Groove)": DenoiseMethod.SHELLAC,
-            "NoiseReduce (Legacy)": DenoiseMethod.NOISEREDUCE,
+            "Spectral Gating (Learned Profile)": DenoiseMethod.SPECTRAL_GATING,
         }
 
         self.method_dropdown = ctk.CTkOptionMenu(
@@ -412,7 +412,7 @@ class SoundDenoiserApp(ctk.CTk):
             "Multi-Band Adaptive": "Best for: Complex noise. Key params: Strength, Noise Threshold",
             "Combined (All Methods)": "Best for: Heavy noise. Uses Spectral + Wiener + Threshold",
             "Shellac/78rpm (Hiss+Groove)": "Best for: Old 78s. Key params: Strength, Noise Threshold",
-            "NoiseReduce (Legacy)": "ML-based. May not work well on vintage recordings",
+            "Spectral Gating (Learned Profile)": "Best with learned profile. Soft gate based on noise floor",
         }
 
         self.method_desc_label = ctk.CTkLabel(
@@ -993,20 +993,20 @@ class SoundDenoiserApp(ctk.CTk):
         hf_relevant = method_name not in ["Multi-Band Adaptive", "Shellac/78rpm (Hiss+Groove)"]
         self.hf_emphasis_slider.label.configure(text_color=active_color if hf_relevant else dim_color)
 
-        # Hiss frequency sliders - relevant for Spectral, Wiener, Combined, NoiseReduce
-        hiss_freq_relevant = method_name in ["Spectral Subtraction", "Wiener Filter", "Combined (All Methods)", "NoiseReduce (Legacy)"]
+        # Hiss frequency sliders - relevant for Spectral, Wiener, Combined, Spectral Gating
+        hiss_freq_relevant = method_name in ["Spectral Subtraction", "Wiener Filter", "Combined (All Methods)", "Spectral Gating (Learned Profile)"]
         self.hiss_start_slider.label.configure(text_color=active_color if hiss_freq_relevant else dim_color)
         self.hiss_peak_slider.label.configure(text_color=active_color if hiss_freq_relevant else dim_color)
 
-        # Spectral floor - relevant for Spectral and Wiener
-        floor_relevant = method_name in ["Spectral Subtraction", "Wiener Filter", "Combined (All Methods)"]
+        # Spectral floor - relevant for Spectral, Wiener, and Spectral Gating
+        floor_relevant = method_name in ["Spectral Subtraction", "Wiener Filter", "Combined (All Methods)", "Spectral Gating (Learned Profile)"]
         self.spectral_floor_slider.label.configure(text_color=active_color if floor_relevant else dim_color)
 
         # Low cut - relevant for all methods (always applied post-processing)
         self.low_cut_slider.label.configure(text_color=active_color)
 
-        # Noise threshold - relevant for all spectral methods (not NoiseReduce which uses own logic)
-        threshold_relevant = method_name != "NoiseReduce (Legacy)"
+        # Noise threshold - relevant for all spectral methods
+        threshold_relevant = True
         self.noise_threshold_slider.label.configure(text_color=active_color if threshold_relevant else dim_color)
 
         self._set_status(f"Method changed to: {method_name}")

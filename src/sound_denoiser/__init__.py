@@ -5,7 +5,7 @@ This package provides adaptive spectral denoising using librosa,
 with controls for preserving audio fidelity and transients.
 Includes noise profile learning similar to iZotope RX.
 Multiple denoising methods are available:
-- noisereduce (default, best for general use)
+- spectral gating (best with learned noise profile)
 - spectral subtraction
 - Wiener filtering
 - multi-band adaptive reduction

@@ -2,7 +2,7 @@
 Core audio denoising module using multiple techniques for hiss removal.
 
 Implements:
-- noisereduce library for stationary noise reduction
+- Spectral gating with learned noise profiles
 - Spectral subtraction for broadband noise
 - Multi-band adaptive noise reduction
 - Wiener filtering for optimal noise estimation
@@ -20,7 +20,6 @@ from typing import Tuple, Optional, List
 from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum
-import noisereduce as nr
 
 # Metadata handling
 try:
@@ -41,7 +40,7 @@ class DenoiseMethod(Enum):
     MULTIBAND = "multiband"              # Multi-band adaptive reduction
     COMBINED = "combined"                # Combine multiple methods
     SHELLAC = "shellac"                  # Optimized for 78rpm shellac records (hiss + groove)
-    NOISEREDUCE = "noisereduce"          # noisereduce library (may not work well on old recordings)
+    SPECTRAL_GATING = "gating"           # Pure spectral gating using learned noise profile
 
 
 @dataclass
@@ -67,7 +66,7 @@ class AudioDenoiser:
     Multi-technique denoiser for removing hiss from audio recordings.
 
     Features:
-    - Multiple denoising algorithms (noisereduce, spectral subtraction, Wiener, multiband)
+    - Multiple denoising algorithms (spectral gating, spectral subtraction, Wiener, multiband)
     - Spectral gating with learned noise profiles
     - High-frequency emphasis for hiss targeting (2kHz-20kHz)
     - Transient preservation
@@ -493,6 +492,58 @@ class AudioDenoiser:
 
         return noise_estimate
 
+    def _spectral_gating(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Pure spectral gating using the learned noise profile.
+
+        This method requires a learned noise profile. It applies a soft gate
+        that attenuates frequency bins where the signal is below or near the
+        learned noise floor. More aggressive than spectral subtraction but
+        very effective when you have a good noise sample.
+        """
+        # Compute STFT
+        stft = librosa.stft(audio, n_fft=self.N_FFT, hop_length=self.HOP_LENGTH)
+        stft_mag = np.abs(stft)
+        stft_phase = np.angle(stft)
+
+        # Get noise estimate - prefer learned profile
+        if self._use_learned_profile and self._noise_profile is not None:
+            noise_estimate = self._noise_profile.spectral_mean
+            noise_std = self._noise_profile.spectral_std
+        else:
+            # Fall back to automatic estimation if no profile learned
+            noise_estimate = self._estimate_noise_spectrum(stft_mag)
+            noise_std = noise_estimate * 0.5  # Approximate std
+
+        # Apply noise threshold multiplier
+        gate_threshold = noise_estimate * self.noise_threshold
+
+        # Expand to match STFT shape
+        gate_threshold_2d = gate_threshold[:, np.newaxis]
+        noise_std_2d = noise_std[:, np.newaxis] if noise_std is not None else gate_threshold_2d * 0.3
+
+        # Soft gating: compute gain based on how far above threshold the signal is
+        # Gain = 1 when signal >> threshold, Gain -> reduction_amount when signal <= threshold
+        margin = stft_mag - gate_threshold_2d
+
+        # Sigmoid-like soft gate centered around the threshold
+        # Use noise_std to control the transition width
+        transition_width = np.maximum(noise_std_2d * 2, 1e-10)
+        gate_gain = 1.0 / (1.0 + np.exp(-margin / transition_width * 4))
+
+        # Apply reduction strength - controls how much attenuation below threshold
+        min_gain = 1.0 - self.noise_reduction_strength
+        min_gain = max(min_gain, self.spectral_floor)
+        gate_gain = min_gain + gate_gain * (1.0 - min_gain)
+
+        # Smooth gain temporally to reduce musical noise
+        gate_gain = median_filter(gate_gain, size=(1, 3))
+
+        # Apply gate
+        stft_gated = stft_mag * gate_gain * np.exp(1j * stft_phase)
+
+        return librosa.istft(stft_gated, hop_length=self.HOP_LENGTH, length=len(audio))
+
     def _spectral_subtraction(self, audio: np.ndarray) -> np.ndarray:
         """
         Classic spectral subtraction for noise removal.
@@ -755,28 +806,9 @@ class AudioDenoiser:
         """Process a single audio channel with the selected denoising method."""
 
         # Apply the selected denoising method
-        if self.method == DenoiseMethod.NOISEREDUCE:
-            # Use noisereduce library (very effective for stationary noise like hiss)
-            if self._use_learned_profile and self._noise_profile is not None:
-                denoised = nr.reduce_noise(
-                    y=audio_channel,
-                    sr=self._sr,
-                    y_noise=self._noise_profile.noise_clip,
-                    prop_decrease=self.noise_reduction_strength,
-                    stationary=True,
-                    n_fft=self.N_FFT,
-                    hop_length=self.HOP_LENGTH,
-                )
-            else:
-                denoised = nr.reduce_noise(
-                    y=audio_channel,
-                    sr=self._sr,
-                    prop_decrease=self.noise_reduction_strength,
-                    stationary=True,
-                    n_fft=self.N_FFT,
-                    hop_length=self.HOP_LENGTH,
-                )
-            # Additional high-frequency reduction
+        if self.method == DenoiseMethod.SPECTRAL_GATING:
+            # Pure spectral gating using learned noise profile
+            denoised = self._spectral_gating(audio_channel)
             if self.high_freq_emphasis > 1.0:
                 denoised = self._apply_high_frequency_reduction(denoised, self._sr)
 
