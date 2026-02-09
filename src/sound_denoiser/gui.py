@@ -14,6 +14,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 from matplotlib.widgets import SpanSelector
+import matplotlib.ticker as mticker
 import json
 import librosa
 import librosa.display
@@ -329,6 +330,10 @@ class WaveformDisplay(ctk.CTkFrame):
         self.ax.set_xlim(visible_start, visible_end)
         self.ax.set_ylim(-1, 1)
 
+        # Keep x-axis in plain seconds (no scientific notation)
+        self.ax.xaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=False))
+        self.ax.ticklabel_format(axis='x', style='plain', useOffset=False)
+
         # Restore selection if any and it's visible
         if self._selected_region:
             sel_start, sel_end = self._selected_region
@@ -348,6 +353,32 @@ class WaveformDisplay(ctk.CTkFrame):
             self.update_playhead(self._current_position)
 
     def _plot_spectrogram_internal(self):
+        """
+        Internal method to plot spectrogram with zoom support and aggressive performance optimization.
+        This method renders a mel-scaled spectrogram of the audio data with the following features:
+        Performance Optimizations:
+        - Adaptive frame targeting based on zoom level (320-1200 frames)
+        - Dynamic hop length selection (256-8192) rounded to powers of 2
+        - Audio downsampling for segments longer than ~4.5 seconds
+        - Maximum frequency capping at 12kHz to reduce computation
+        - FFT size optimized relative to hop length (n_fft = hop_length * 4, max 2048)
+        Visualization Features:
+        - Displays mel-scaled spectrogram with 'magma' colormap on dark background (#1a1a2e)
+        - Shows zoom level indicator in title when zoomed beyond 1x
+        - Preserves and renders any active time selection as overlay rectangle
+        - Restores playhead position indicator after redraw
+        - Color-coded labels and axes for dark theme (#888888 text, #ffffff title)
+        Zoom & Pan:
+        - Clips spectrogram to visible time range based on current zoom level
+        - Pads edges (±512 samples) for smoother rendering at boundaries
+        - Maintains correct time coordinate mapping through offset calculations
+        - Effective sample rate adjusted when downsampling is applied
+        Args:
+            None (uses instance variables: _audio_data, _sample_rate, _zoom_level,
+                  _selected_region, _current_position, _title)
+        Returns:
+            None (updates self.ax canvas and internal playhead/selection state)
+        """
         """Internal method to plot spectrogram with zoom support and aggressive performance optimization."""
         self.ax.clear()
         self.ax.set_facecolor('#1a1a2e')
@@ -372,25 +403,25 @@ class WaveformDisplay(ctk.CTkFrame):
         padded_end = min(len(audio), end_sample + pad_samples)
         visible_audio = audio[padded_start:padded_end]
 
-        # AGGRESSIVE performance optimization - larger hop lengths and fewer frames
-        # Target approximately 250-400 time frames max for smooth display
-        target_frames = 320
+        # Adaptive frame target based on zoom: more detail when zoomed in, fewer frames when zoomed out
+        zoom_factor = max(1.0, self._zoom_level)
+        target_frames = min(1200, int(320 * zoom_factor))
         audio_len = len(visible_audio)
 
         # Calculate hop length to achieve target frames
         ideal_hop = max(512, audio_len // target_frames)
 
-        # Round to power of 2 for efficiency, favor bigger hops to reduce columns
+        # Round to power of 2 for efficiency; allow smaller hops when zoomed in for more detail
         hop_length = 1024
-        for h in [1024, 2048, 4096, 8192]:
+        for h in [256, 512, 1024, 2048, 4096, 8192]:
             if h >= ideal_hop:
                 hop_length = h
                 break
         else:
             hop_length = 8192
 
-        # FFT size - small for speed
-        n_fft = min(1024, hop_length * 2)
+        # FFT size - keep modest for speed while allowing finer resolution when hop is small
+        n_fft = min(4096, hop_length * 4)
 
         # Downsample audio for very long segments (more aggressive for perf)
         max_downsample = max(1, sr // 16000)  # keep >=16kHz effective for voice/music clarity
@@ -400,7 +431,7 @@ class WaveformDisplay(ctk.CTkFrame):
             visible_audio = visible_audio[::downsample_factor]
             effective_sr = sr // downsample_factor
             hop_length = max(512, hop_length // downsample_factor)
-            n_fft = min(1024, hop_length * 2)
+            n_fft = min(4096, hop_length * 4)
         else:
             effective_sr = sr
 
@@ -411,7 +442,7 @@ class WaveformDisplay(ctk.CTkFrame):
             sr=effective_sr,
             n_fft=n_fft,
             hop_length=hop_length,
-            n_mels=128,
+            n_mels=256,
             fmax=max_freq,
             power=2.0,
         )
@@ -436,6 +467,10 @@ class WaveformDisplay(ctk.CTkFrame):
 
         # Set axis limits - X is zoom-dependent
         self.ax.set_xlim(visible_start, visible_end)
+
+        # Keep x-axis in plain seconds (no scientific notation)
+        self.ax.xaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=False))
+        self.ax.ticklabel_format(axis='x', style='plain', useOffset=False)
 
         # Restore selection if any and it's visible
         if self._selected_region:
