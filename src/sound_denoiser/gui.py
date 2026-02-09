@@ -14,6 +14,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 from matplotlib.widgets import SpanSelector
+import matplotlib.ticker as mticker
+import json
 import librosa
 import librosa.display
 import threading
@@ -152,7 +154,8 @@ class WaveformDisplay(ctk.CTkFrame):
         self.fig = Figure(figsize=(10, 2.2), dpi=100, facecolor='#1a1a2e')
         self.ax = self.fig.add_subplot(111)
         self.ax.set_facecolor('#1a1a2e')
-        self.fig.subplots_adjust(left=0.05, right=0.95, top=0.88, bottom=0.18)
+        # Extra space on the left for the frequency label, tighter on the right to reclaim width
+        self.fig.subplots_adjust(left=0.08, right=0.98, top=0.88, bottom=0.18)
 
         # Style the axes
         self.ax.tick_params(colors='#888888', labelsize=8)
@@ -217,6 +220,22 @@ class WaveformDisplay(ctk.CTkFrame):
             self._view_mode = new_mode
             self._redraw_display()
 
+    def set_view_mode(self, mode: str):
+        """Programmatically set view mode and redraw."""
+        normalized = mode.lower()
+        if normalized not in ("waveform", "spectrogram"):
+            return
+        self._view_mode = normalized
+        try:
+            self.view_toggle.set("Waveform" if normalized == "waveform" else "Spectrogram")
+        except Exception:
+            pass
+        self._redraw_display()
+
+    def get_view_mode(self) -> str:
+        """Return current view mode."""
+        return self._view_mode
+
     def _zoom_in(self):
         """Zoom in on the waveform."""
         if self._zoom_level < 16.0:  # Max 16x zoom
@@ -241,6 +260,23 @@ class WaveformDisplay(ctk.CTkFrame):
         """Update the zoom level display and redraw."""
         self.zoom_label.configure(text=f"{self._zoom_level:.0f}x")
         self._redraw_display()
+
+    def get_zoom_state(self) -> tuple:
+        """Return current zoom level and offset."""
+        return (self._zoom_level, self._zoom_offset)
+
+    def set_zoom_state(self, level: float, offset: float):
+        """Apply zoom level/offset with clamping and redraw."""
+        if level < 1.0:
+            level = 1.0
+        # Max zoom matches controls
+        level = min(level, 16.0)
+        # Offset must keep view in range
+        max_offset = max(0.0, 1.0 - 1.0 / level)
+        offset = max(0.0, min(offset, max_offset))
+        self._zoom_level = level
+        self._zoom_offset = offset
+        self._update_zoom()
 
     def get_visible_time_range(self) -> tuple:
         """Get the currently visible time range based on zoom."""
@@ -295,6 +331,10 @@ class WaveformDisplay(ctk.CTkFrame):
         self.ax.set_xlim(visible_start, visible_end)
         self.ax.set_ylim(-1, 1)
 
+        # Keep x-axis in plain seconds (no scientific notation)
+        self.ax.xaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=False))
+        self.ax.ticklabel_format(axis='x', style='plain', useOffset=False)
+
         # Restore selection if any and it's visible
         if self._selected_region:
             sel_start, sel_end = self._selected_region
@@ -314,6 +354,32 @@ class WaveformDisplay(ctk.CTkFrame):
             self.update_playhead(self._current_position)
 
     def _plot_spectrogram_internal(self):
+        """
+        Internal method to plot spectrogram with zoom support and aggressive performance optimization.
+        This method renders a mel-scaled spectrogram of the audio data with the following features:
+        Performance Optimizations:
+        - Adaptive frame targeting based on zoom level (320-1200 frames)
+        - Dynamic hop length selection (256-8192) rounded to powers of 2
+        - Audio downsampling for segments longer than ~4.5 seconds
+        - Maximum frequency capping at 12kHz to reduce computation
+        - FFT size optimized relative to hop length (n_fft = hop_length * 4, max 2048)
+        Visualization Features:
+        - Displays mel-scaled spectrogram with 'magma' colormap on dark background (#1a1a2e)
+        - Shows zoom level indicator in title when zoomed beyond 1x
+        - Preserves and renders any active time selection as overlay rectangle
+        - Restores playhead position indicator after redraw
+        - Color-coded labels and axes for dark theme (#888888 text, #ffffff title)
+        Zoom & Pan:
+        - Clips spectrogram to visible time range based on current zoom level
+        - Pads edges (±512 samples) for smoother rendering at boundaries
+        - Maintains correct time coordinate mapping through offset calculations
+        - Effective sample rate adjusted when downsampling is applied
+        Args:
+            None (uses instance variables: _audio_data, _sample_rate, _zoom_level,
+                  _selected_region, _current_position, _title)
+        Returns:
+            None (updates self.ax canvas and internal playhead/selection state)
+        """
         """Internal method to plot spectrogram with zoom support and aggressive performance optimization."""
         self.ax.clear()
         self.ax.set_facecolor('#1a1a2e')
@@ -338,65 +404,74 @@ class WaveformDisplay(ctk.CTkFrame):
         padded_end = min(len(audio), end_sample + pad_samples)
         visible_audio = audio[padded_start:padded_end]
 
-        # AGGRESSIVE performance optimization - much larger hop lengths
-        # Target approximately 500-800 time frames max for smooth display
-        target_frames = 600
+        # Adaptive frame target based on zoom: more detail when zoomed in, fewer frames when zoomed out
+        zoom_factor = max(1.0, self._zoom_level)
+        target_frames = min(1200, int(320 * zoom_factor))
         audio_len = len(visible_audio)
 
         # Calculate hop length to achieve target frames
         ideal_hop = max(512, audio_len // target_frames)
 
-        # Round to power of 2 for efficiency
-        hop_length = 512
-        for h in [512, 1024, 2048, 4096]:
+        # Round to power of 2 for efficiency; allow smaller hops when zoomed in for more detail
+        hop_length = 1024
+        for h in [256, 512, 1024, 2048, 4096, 8192]:
             if h >= ideal_hop:
                 hop_length = h
                 break
         else:
-            hop_length = 4096
+            hop_length = 8192
 
-        # FFT size - use smaller for better performance
-        n_fft = min(2048, hop_length * 4)
+        # FFT size - keep modest for speed while allowing finer resolution when hop is small
+        n_fft = min(4096, hop_length * 4)
 
-        # Downsample audio for very long segments (additional speedup)
-        # BUT limit downsampling to ensure we can still display up to 12kHz
-        # (need effective_sr >= 24000 Hz for 12kHz Nyquist limit)
-        max_downsample = max(1, sr // 24000)  # Ensure effective_sr >= 24kHz
+        # Downsample audio for very long segments (more aggressive for perf)
+        max_downsample = max(1, sr // 16000)  # keep >=16kHz effective for voice/music clarity
 
-        if audio_len > 500000:  # > ~11 seconds at 44.1kHz
-            downsample_factor = min(max_downsample, audio_len // 200000)
-            if downsample_factor > 1:
-                visible_audio = visible_audio[::downsample_factor]
-                effective_sr = sr // downsample_factor
-                hop_length = max(256, hop_length // downsample_factor)
-                n_fft = min(1024, hop_length * 4)
-            else:
-                effective_sr = sr
+        if audio_len > 200000:  # > ~4.5s at 44.1kHz
+            downsample_factor = min(max_downsample, max(2, audio_len // 150000))
+            visible_audio = visible_audio[::downsample_factor]
+            effective_sr = sr // downsample_factor
+            hop_length = max(512, hop_length // downsample_factor)
+            n_fft = min(4096, hop_length * 4)
         else:
             effective_sr = sr
 
-        # Compute spectrogram for visible region only
-        D = librosa.amplitude_to_db(
-            np.abs(librosa.stft(visible_audio, n_fft=n_fft, hop_length=hop_length)),
-            ref=np.max
+        # Compute mel spectrogram for visible region only (fewer bins for speed)
+        max_freq = min(12000, effective_sr / 2)
+        mel_spec = librosa.feature.melspectrogram(
+            y=visible_audio,
+            sr=effective_sr,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            n_mels=256,
+            fmax=max_freq,
+            power=2.0,
         )
+        D = librosa.power_to_db(mel_spec, ref=np.max)
 
         # Calculate time offset for correct positioning
         time_offset = padded_start / sr
         time_end = padded_end / sr
 
-        # Cap display band to keep mel plot readable and avoid undefined variable errors
-        max_freq = min(12000, effective_sr / 2)
-
-        # Plot mel spectrogram - y_axis='mel' uses mel scale (non-linear)
+        # Plot mel spectrogram with native mel scaling
         img = librosa.display.specshow(
-            D, sr=effective_sr, hop_length=hop_length, x_axis='time', y_axis='mel',
-            ax=self.ax, cmap='magma', x_coords=np.linspace(time_offset, time_end, D.shape[1]),
-            fmax=max_freq
+            D,
+            sr=effective_sr,
+            hop_length=hop_length,
+            x_axis='time',
+            y_axis='mel',
+            ax=self.ax,
+            cmap='magma',
+            x_coords=np.linspace(time_offset, time_end, D.shape[1]),
+            fmax=max_freq,
         )
 
         # Set axis limits - X is zoom-dependent
         self.ax.set_xlim(visible_start, visible_end)
+
+        # Keep x-axis in plain seconds (no scientific notation)
+        self.ax.xaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=False))
+        self.ax.ticklabel_format(axis='x', style='plain', useOffset=False)
 
         # Restore selection if any and it's visible
         if self._selected_region:
@@ -946,28 +1021,6 @@ class NoiseProfilePanel(ctk.CTkFrame):
         sep = ctk.CTkFrame(self, height=1, fg_color="#333333")
         sep.pack(fill="x", padx=10, pady=10)
 
-        # Make Selection button at TOP
-        self.select_mode_btn = ctk.CTkButton(
-            self,
-            text="Make Selection",
-            command=self._toggle_selection,
-            font=ctk.CTkFont(size=12, weight="bold"),
-            fg_color="#1a5276",
-            hover_color="#2471a3",
-            height=36,
-            corner_radius=6,
-            state="disabled"
-        )
-        self.select_mode_btn.pack(fill="x", padx=10, pady=(0, 5))
-
-        self.select_hint = ctk.CTkLabel(
-            self,
-            text="Click to enable, then drag on waveform",
-            font=ctk.CTkFont(size=9),
-            text_color="#666666"
-        )
-        self.select_hint.pack(padx=10, anchor="w")
-
         # Selections list section
         self.selections_frame = ctk.CTkFrame(self, fg_color="#1a2a3a", corner_radius=6)
         self.selections_frame.pack(fill="x", padx=10, pady=10)
@@ -1073,33 +1126,9 @@ class NoiseProfilePanel(ctk.CTkFrame):
         """Handle use profile toggle."""
         self.on_toggle_use(self.use_profile_var.get())
 
-    def _toggle_selection(self):
-        """Toggle selection mode on the waveform."""
-        self._selection_enabled = not self._selection_enabled
-
-        if self._selection_enabled:
-            self.select_mode_btn.configure(
-                text="Selection Mode ON",
-                fg_color="#ff6b6b",
-                hover_color="#ff8f8f"
-            )
-            self.select_hint.configure(
-                text="Drag on waveform to add region",
-                text_color="#ff6b6b"
-            )
-        else:
-            self.select_mode_btn.configure(
-                text="Make Selection",
-                fg_color="#1a5276",
-                hover_color="#2471a3"
-            )
-            self.select_hint.configure(
-                text="Click to enable, then drag on waveform",
-                text_color="#666666"
-            )
-
-        if self.on_toggle_selection:
-            self.on_toggle_selection(self._selection_enabled)
+    def set_selection_enabled(self, enable: bool):
+        """Track selection mode state for external controls."""
+        self._selection_enabled = enable
 
     def add_selection(self, start: float, end: float):
         """Add a selection to the list."""
@@ -1193,7 +1222,6 @@ class NoiseProfilePanel(ctk.CTkFrame):
         """Enable or disable controls."""
         state = "normal" if enable else "disabled"
         self.auto_btn.configure(state=state)
-        self.select_mode_btn.configure(state=state)
 
     def enable_learn_button(self, enable: bool = True):
         """Enable or disable the learn button based on selections."""
@@ -1242,6 +1270,7 @@ class SoundDenoiserApp(ctk.CTk):
         self.current_player: Optional[AudioPlayer] = None
         self.active_waveform_view = "original"  # "original" or "processed"
         self.noise_selection_enabled = False
+        self.track_title = "No Track"
 
         # State
         self.input_path: Optional[Path] = None
@@ -1249,6 +1278,8 @@ class SoundDenoiserApp(ctk.CTk):
         self.is_processing = False
         self.processing_queue = queue.Queue()
         self.selected_noise_region: Optional[Tuple[float, float]] = None
+        self.config_path = Path.home() / ".sound_denoiser_config.json"
+        self.config = self._load_config()
 
         # Build UI
         self._create_ui()
@@ -1258,6 +1289,24 @@ class SoundDenoiserApp(ctk.CTk):
 
         # Start update loop
         self._update_ui()
+
+    def _load_config(self) -> dict:
+        """Load persisted config (last directories, etc.)."""
+        try:
+            if self.config_path.exists():
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
+
+    def _save_config(self):
+        """Persist config to disk."""
+        try:
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                json.dump(self.config, f)
+        except Exception:
+            pass
 
     def _setup_drag_and_drop(self):
         """Setup drag and drop file loading using windnd."""
@@ -1343,16 +1392,6 @@ class SoundDenoiserApp(ctk.CTk):
             text_color="#00d9ff"
         )
         title.pack(side="left")
-
-        subtitle = ctk.CTkLabel(
-            title_frame,
-            text="  |  Hiss Removal for Vintage Recordings",
-            font=ctk.CTkFont(size=14),
-            text_color="#888888"
-        )
-        subtitle.pack(side="left", padx=(10, 0))
-
-        # File controls
         file_frame = ctk.CTkFrame(header, fg_color="transparent")
         file_frame.grid(row=0, column=1, padx=20, pady=15, sticky="e")
 
@@ -1384,7 +1423,7 @@ class SoundDenoiserApp(ctk.CTk):
     def _create_main_content(self):
         """Create main content area."""
         main_frame = ctk.CTkFrame(self, fg_color="transparent")
-        main_frame.grid(row=1, column=0, sticky="nsew", padx=15, pady=10)
+        main_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=8)
         main_frame.grid_columnconfigure(0, weight=3)
         main_frame.grid_columnconfigure(1, weight=1)
         main_frame.grid_rowconfigure(0, weight=1)
@@ -1398,13 +1437,13 @@ class SoundDenoiserApp(ctk.CTk):
     def _create_waveform_panel(self, parent):
         """Create waveform display and playback controls."""
         left_panel = ctk.CTkFrame(parent, fg_color="#0f0f1a", corner_radius=12)
-        left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 10), pady=0)
+        left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=0)
         left_panel.grid_rowconfigure(0, weight=1)
         left_panel.grid_rowconfigure(1, weight=0)
         left_panel.grid_columnconfigure(0, weight=1)
 
         waveform_frame = ctk.CTkFrame(left_panel, fg_color="#151525", corner_radius=10)
-        waveform_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 5))
+        waveform_frame.grid(row=0, column=0, sticky="nsew", padx=8, pady=(6, 2))
         waveform_frame.grid_rowconfigure(0, weight=1)
         waveform_frame.grid_columnconfigure(0, weight=1)
 
@@ -1414,20 +1453,20 @@ class SoundDenoiserApp(ctk.CTk):
             on_region_select=self._on_noise_region_selected,
             on_seek=lambda pos: self._on_seek("original", pos)
         )
-        self.waveform_original.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
-        self.waveform_original.plot_waveform(None, 44100, "Original Audio (Click to seek, drag to select noise)", "#ff9f43")
+        self.waveform_original.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        self.waveform_original.plot_waveform(None, 44100, f"{self.track_title} (Original)", "#ff9f43")
 
         self.waveform_processed = WaveformDisplay(
             waveform_frame,
             on_seek=lambda pos: self._on_seek("processed", pos)
         )
-        self.waveform_processed.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
-        self.waveform_processed.plot_waveform(None, 44100, "Processed Audio (Denoised)", "#00d9ff")
+        self.waveform_processed.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        self.waveform_processed.plot_waveform(None, 44100, f"{self.track_title} (Denoised)", "#00d9ff")
         self.waveform_processed.grid_remove()  # Start hidden for a single-panel view
 
         # Unified playback and view controls
         controls = ctk.CTkFrame(left_panel, fg_color="transparent")
-        controls.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+        controls.grid(row=1, column=0, sticky="ew", padx=8, pady=(2, 6))
 
         self.play_btn = ctk.CTkButton(
             controls,
@@ -1445,7 +1484,7 @@ class SoundDenoiserApp(ctk.CTk):
 
         self.stop_btn = ctk.CTkButton(
             controls,
-            text="⏹",
+            text="⏸",
             width=60,
             height=32,
             command=self._stop_play,
@@ -1469,26 +1508,31 @@ class SoundDenoiserApp(ctk.CTk):
         )
         self.view_toggle_btn.pack(side="left", padx=6)
 
-        self.sync_btn = ctk.CTkButton(
+        self.selection_btn = ctk.CTkButton(
             controls,
-            text="🔗 Sync",
-            width=70,
+            text="Make Selection",
+            width=130,
             height=32,
-            command=self._sync_to_original,
-            fg_color="#6c3483",
-            hover_color="#8e44ad",
-            font=ctk.CTkFont(size=12),
+            command=self._toggle_selection_button,
+            fg_color="#1a5276",
+            hover_color="#2471a3",
+            font=ctk.CTkFont(size=12, weight="bold"),
             state="disabled"
         )
-        self.sync_btn.pack(side="left", padx=4)
+        self.selection_btn.pack(side="left", padx=6)
 
-        hint_label = ctk.CTkLabel(
+        self.process_btn = ctk.CTkButton(
             controls,
-            text="Click on waveform to seek",
-            font=ctk.CTkFont(size=10),
-            text_color="#666666"
+            text="🔄 Apply Denoising",
+            command=self._process_audio,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#6c3483",
+            hover_color="#8e44ad",
+            height=32,
+            corner_radius=8,
+            state="disabled"
         )
-        hint_label.pack(side="right", padx=5)
+        self.process_btn.pack(side="left", padx=6)
 
     def _create_parameter_panel(self, parent):
         """Create parameter controls panel."""
@@ -1742,26 +1786,12 @@ class SoundDenoiserApp(ctk.CTk):
         )
         self.noise_threshold_slider.pack(fill="x", pady=(0, 5))
 
-        # Buttons Section
+        # Buttons Section (reset only; Apply Denoising moved to transport row)
         buttons_frame = ctk.CTkFrame(scroll_frame, fg_color="#151525", corner_radius=10)
         buttons_frame.pack(fill="x", padx=5, pady=(0, 10))
 
         buttons_inner = ctk.CTkFrame(buttons_frame, fg_color="transparent")
         buttons_inner.pack(fill="x", padx=10, pady=10)
-
-        # Process button
-        self.process_btn = ctk.CTkButton(
-            buttons_inner,
-            text="🔄 Apply Denoising",
-            command=self._process_audio,
-            font=ctk.CTkFont(size=14, weight="bold"),
-            fg_color="#6c3483",
-            hover_color="#8e44ad",
-            height=45,
-            corner_radius=10,
-            state="disabled"
-        )
-        self.process_btn.pack(fill="x", pady=(0, 8))
 
         # Reset button
         self.reset_btn = ctk.CTkButton(
@@ -1914,11 +1944,16 @@ class SoundDenoiserApp(ctk.CTk):
     def _toggle_noise_selection(self, enable: bool):
         """Toggle noise selection mode on the original waveform."""
         self.noise_selection_enabled = enable
-        if self.active_waveform_view == "original":
-            self.waveform_original.enable_selection(enable)
+        if enable:
+            # Force view to original for selecting noise regions, keep position/play state
+            self._set_active_waveform_view("original", preserve_position=True, preserve_play_state=True)
+            self.waveform_original.set_view_mode("waveform")
+            self.waveform_original.enable_selection(True)
         else:
-            # Keep selection off while processed view is visible
             self.waveform_original.enable_selection(False)
+
+        # Reflect state in panel
+        self.noise_profile_panel.set_selection_enabled(enable)
 
         if enable:
             self._set_status("Selection mode ON - drag on waveform to add noise regions")
@@ -1948,8 +1983,12 @@ class SoundDenoiserApp(ctk.CTk):
             ("All Files", "*.*")
         ]
 
-        # Try to start in example_tracks folder
-        initial_dir = Path(__file__).parent.parent.parent.parent / "example_tracks"
+        # Try to start in last used folder, fall back to example_tracks then home
+        last_dir = self.config.get("last_dir")
+        if last_dir:
+            initial_dir = Path(last_dir)
+        else:
+            initial_dir = Path(__file__).parent.parent.parent.parent / "example_tracks"
         if not initial_dir.exists():
             initial_dir = Path.home()
 
@@ -1960,6 +1999,9 @@ class SoundDenoiserApp(ctk.CTk):
         )
 
         if file_path:
+            # Persist last used directory
+            self.config["last_dir"] = str(Path(file_path).parent)
+            self._save_config()
             self._load_audio_file(file_path)
 
     def _load_audio_file(self, file_path: str):
@@ -1977,6 +2019,8 @@ class SoundDenoiserApp(ctk.CTk):
         self.view_toggle_btn.configure(state="disabled")
         self.play_btn.configure(state="disabled", text="▶")
         self.stop_btn.configure(state="disabled")
+        self.selection_btn.configure(state="disabled", text="Select Noise", fg_color="#1a5276")
+        self.process_btn.configure(state="disabled", text="Apply Denoising")
 
         # Load in background thread
         def load_thread():
@@ -2141,13 +2185,44 @@ class SoundDenoiserApp(ctk.CTk):
         active_player = self._get_player(self.active_waveform_view)
         self.play_btn.configure(text="⏸" if active_player.is_playing() else "▶")
 
-    def _set_active_waveform_view(self, view: str):
-        """Show the requested waveform and adjust controls to match the current view."""
+    def _set_active_waveform_view(self, view: str, preserve_position: bool = False, preserve_play_state: bool = False):
+        """Show the requested waveform and adjust controls, optionally preserving position/state."""
         if view not in ("original", "processed"):
             return
-        # Pause playback when swapping views so the single control set stays in sync
-        self.player_original.pause()
-        self.player_processed.pause()
+
+        if view == self.active_waveform_view:
+            return
+
+        # Capture current context
+        current_view = self.active_waveform_view
+        current_player = self._get_player(current_view)
+        target_player = self._get_player(view)
+
+        current_waveform = self._get_waveform(current_view)
+        target_waveform = self._get_waveform(view)
+
+        current_mode = current_waveform.get_view_mode()
+        current_zoom = current_waveform.get_zoom_state()
+        current_pos = current_player.get_position()
+        was_playing = current_player.is_playing()
+
+        # Sync position to target player for seamless bypass
+        if preserve_position:
+            target_player.seek(current_pos)
+            target_waveform.update_playhead(current_pos)
+
+        # Preserve play state: pause current, play target if it was playing
+        if preserve_play_state and was_playing:
+            current_player.pause()
+            target_player.play()
+        else:
+            current_player.pause()
+            target_player.pause()
+
+        # Keep same view mode (waveform/spectrogram)
+        target_waveform.set_view_mode(current_mode)
+        target_waveform.set_zoom_state(*current_zoom)
+
         self.active_waveform_view = view
 
         if view == "original":
@@ -2164,12 +2239,24 @@ class SoundDenoiserApp(ctk.CTk):
             self.play_btn.configure(fg_color="#00d9ff", hover_color="#00b8d4")
             self.waveform_original.enable_selection(False)
             self.waveform_processed.enable_selection(False)
+
         self._refresh_play_button_label()
 
     def _toggle_waveform_view(self):
         """Toggle between original and processed views in the single waveform panel."""
         next_view = "processed" if self.active_waveform_view == "original" else "original"
-        self._set_active_waveform_view(next_view)
+        # Preserve position and play state for a bypass-like toggle
+        self._set_active_waveform_view(next_view, preserve_position=True, preserve_play_state=True)
+
+    def _toggle_selection_button(self):
+        """Handle Make Selection button in the transport row."""
+        enable = not self.noise_selection_enabled
+        # Update button styling/text
+        if enable:
+            self.selection_btn.configure(text="Selection ON", fg_color="#ff6b6b", hover_color="#ff8f8f")
+        else:
+            self.selection_btn.configure(text="Make Selection", fg_color="#1a5276", hover_color="#2471a3")
+        self._toggle_noise_selection(enable)
 
     def _toggle_play(self, which: Optional[str] = None):
         """Toggle play/pause for the active waveform (or a specific one)."""
@@ -2203,26 +2290,6 @@ class SoundDenoiserApp(ctk.CTk):
         waveform = self._get_waveform(which)
         player.seek(position)
         waveform.update_playhead(position)
-
-    def _sync_to_original(self):
-        """Sync processed player position to original player position."""
-        # Get the original player's position
-        orig_position = self.player_original.get_position()
-
-        # Set the processed player to the same position
-        self.player_processed.seek(orig_position)
-        self.waveform_processed.update_playhead(orig_position)
-
-        # If original is playing, also play processed (and stop original for A/B comparison)
-        if self.player_original.is_playing():
-            self.player_original.pause()
-            self.player_processed.play()
-        self._refresh_play_button_label()
-
-        # Format the time for status
-        duration = self.waveform_original._duration
-        current_time = orig_position * duration
-        self._set_status(f"Synced to position: {self.waveform_original._format_time(current_time)}")
 
     def _set_status(self, message: str):
         """Update status bar message."""
@@ -2286,15 +2353,17 @@ class SoundDenoiserApp(ctk.CTk):
         """Handle audio loaded event."""
         # Update waveform display
         display_audio = audio[0] if audio.ndim == 2 else audio
+        self.track_title = self.input_path.stem if self.input_path else "Audio"
         self.waveform_original.plot_waveform(
             display_audio, sr,
-            "Original Audio (Click to seek)", "#ff9f43"
+            f"{self.track_title} (Original)", "#ff9f43"
         )
-        self.waveform_processed.plot_waveform(None, sr, "Processed Audio (Denoised)", "#00d9ff")
+        self.waveform_processed.plot_waveform(None, sr, f"{self.track_title} (Denoised)", "#00d9ff")
 
         # Selection mode starts OFF - user enables via noise profile panel toggle
         self.noise_selection_enabled = False
         self.waveform_original.enable_selection(False)
+        self.noise_profile_panel.set_selection_enabled(False)
 
         # Load into player
         self.player_original.load(audio, sr)
@@ -2304,11 +2373,11 @@ class SoundDenoiserApp(ctk.CTk):
         self.play_btn.configure(state="normal", text="▶")
         self.stop_btn.configure(state="normal")
         self.view_toggle_btn.configure(state="disabled")
+        self.selection_btn.configure(state="normal")
         self.process_btn.configure(state="normal")
         self.noise_profile_panel.enable_controls(True)
 
         # Disable processed controls until processing
-        self.sync_btn.configure(state="disabled")
         self.save_btn.configure(state="disabled")
 
         # Update status
@@ -2326,14 +2395,13 @@ class SoundDenoiserApp(ctk.CTk):
         # Update waveform display
         sr = self.denoiser.get_sample_rate()
         display_audio = processed[0] if processed.ndim == 2 else processed
-        self.waveform_processed.plot_waveform(display_audio, sr, "Processed Audio (Denoised)", "#00d9ff")
+        self.waveform_processed.plot_waveform(display_audio, sr, f"{self.track_title} (Denoised)", "#00d9ff")
 
         # Load into player
         self.player_processed.load(processed, sr)
 
         # Enable controls
         self.view_toggle_btn.configure(state="normal")
-        self.sync_btn.configure(state="normal")
         self.save_btn.configure(state="normal")
         self.process_btn.configure(state="normal", text="🔄 Apply Denoising", fg_color="#6c3483")
         self._refresh_play_button_label()
@@ -2346,6 +2414,9 @@ class SoundDenoiserApp(ctk.CTk):
         """Handle noise profile learned from auto-detect."""
         self.selected_noise_region = region
         self.waveform_original.set_noise_region(*region)
+        # Add detected region to selections list/display
+        self.noise_profile_panel.add_selection(*region)
+        self.waveform_original.add_selection_rect(*region)
         self.noise_profile_panel.update_status(profile, region)
         self.noise_profile_panel.enable_learn_button(True)
         self._set_status(f"Auto-detected noise region: {region[0]:.2f}s - {region[1]:.2f}s")
