@@ -16,5 +16,17 @@ __version__ = "0.1.0"
 
 from .denoiser import AudioDenoiser, NoiseProfile, DenoiseMethod
 from .audio_player import AudioPlayer
+from .waveform_display import WaveformDisplay
+from .ui_components import SeekBar, ParameterSlider, NoiseProfilePanel
 
-__all__ = ["AudioDenoiser", "NoiseProfile", "DenoiseMethod", "AudioPlayer", "__version__"]
+__all__ = [
+	"AudioDenoiser",
+	"NoiseProfile",
+	"DenoiseMethod",
+	"AudioPlayer",
+	"WaveformDisplay",
+	"SeekBar",
+	"ParameterSlider",
+	"NoiseProfilePanel",
+	"__version__",
+]
