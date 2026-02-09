@@ -14,6 +14,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 from matplotlib.widgets import SpanSelector
+import json
 import librosa
 import librosa.display
 import threading
@@ -216,6 +217,22 @@ class WaveformDisplay(ctk.CTkFrame):
         if new_mode != self._view_mode:
             self._view_mode = new_mode
             self._redraw_display()
+
+    def set_view_mode(self, mode: str):
+        """Programmatically set view mode and redraw."""
+        normalized = mode.lower()
+        if normalized not in ("waveform", "spectrogram"):
+            return
+        self._view_mode = normalized
+        try:
+            self.view_toggle.set("Waveform" if normalized == "waveform" else "Spectrogram")
+        except Exception:
+            pass
+        self._redraw_display()
+
+    def get_view_mode(self) -> str:
+        """Return current view mode."""
+        return self._view_mode
 
     def _zoom_in(self):
         """Zoom in on the waveform."""
@@ -1249,6 +1266,8 @@ class SoundDenoiserApp(ctk.CTk):
         self.is_processing = False
         self.processing_queue = queue.Queue()
         self.selected_noise_region: Optional[Tuple[float, float]] = None
+        self.config_path = Path.home() / ".sound_denoiser_config.json"
+        self.config = self._load_config()
 
         # Build UI
         self._create_ui()
@@ -1258,6 +1277,24 @@ class SoundDenoiserApp(ctk.CTk):
 
         # Start update loop
         self._update_ui()
+
+    def _load_config(self) -> dict:
+        """Load persisted config (last directories, etc.)."""
+        try:
+            if self.config_path.exists():
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
+
+    def _save_config(self):
+        """Persist config to disk."""
+        try:
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                json.dump(self.config, f)
+        except Exception:
+            pass
 
     def _setup_drag_and_drop(self):
         """Setup drag and drop file loading using windnd."""
@@ -1948,8 +1985,12 @@ class SoundDenoiserApp(ctk.CTk):
             ("All Files", "*.*")
         ]
 
-        # Try to start in example_tracks folder
-        initial_dir = Path(__file__).parent.parent.parent.parent / "example_tracks"
+        # Try to start in last used folder, fall back to example_tracks then home
+        last_dir = self.config.get("last_dir")
+        if last_dir:
+            initial_dir = Path(last_dir)
+        else:
+            initial_dir = Path(__file__).parent.parent.parent.parent / "example_tracks"
         if not initial_dir.exists():
             initial_dir = Path.home()
 
@@ -1960,6 +2001,9 @@ class SoundDenoiserApp(ctk.CTk):
         )
 
         if file_path:
+            # Persist last used directory
+            self.config["last_dir"] = str(Path(file_path).parent)
+            self._save_config()
             self._load_audio_file(file_path)
 
     def _load_audio_file(self, file_path: str):
@@ -2141,13 +2185,41 @@ class SoundDenoiserApp(ctk.CTk):
         active_player = self._get_player(self.active_waveform_view)
         self.play_btn.configure(text="⏸" if active_player.is_playing() else "▶")
 
-    def _set_active_waveform_view(self, view: str):
-        """Show the requested waveform and adjust controls to match the current view."""
+    def _set_active_waveform_view(self, view: str, preserve_position: bool = False, preserve_play_state: bool = False):
+        """Show the requested waveform and adjust controls, optionally preserving position/state."""
         if view not in ("original", "processed"):
             return
-        # Pause playback when swapping views so the single control set stays in sync
-        self.player_original.pause()
-        self.player_processed.pause()
+
+        if view == self.active_waveform_view:
+            return
+
+        # Capture current context
+        current_view = self.active_waveform_view
+        current_player = self._get_player(current_view)
+        target_player = self._get_player(view)
+        current_waveform = self._get_waveform(current_view)
+        target_waveform = self._get_waveform(view)
+
+        current_mode = current_waveform.get_view_mode()
+        current_pos = current_player.get_position()
+        was_playing = current_player.is_playing()
+
+        # Sync position to target player for seamless bypass
+        if preserve_position:
+            target_player.seek(current_pos)
+            target_waveform.update_playhead(current_pos)
+
+        # Preserve play state: pause current, play target if it was playing
+        if preserve_play_state and was_playing:
+            current_player.pause()
+            target_player.play()
+        else:
+            current_player.pause()
+            target_player.pause()
+
+        # Keep same view mode (waveform/spectrogram)
+        target_waveform.set_view_mode(current_mode)
+
         self.active_waveform_view = view
 
         if view == "original":
@@ -2164,12 +2236,14 @@ class SoundDenoiserApp(ctk.CTk):
             self.play_btn.configure(fg_color="#00d9ff", hover_color="#00b8d4")
             self.waveform_original.enable_selection(False)
             self.waveform_processed.enable_selection(False)
+
         self._refresh_play_button_label()
 
     def _toggle_waveform_view(self):
         """Toggle between original and processed views in the single waveform panel."""
         next_view = "processed" if self.active_waveform_view == "original" else "original"
-        self._set_active_waveform_view(next_view)
+        # Preserve position and play state for a bypass-like toggle
+        self._set_active_waveform_view(next_view, preserve_position=True, preserve_play_state=True)
 
     def _toggle_play(self, which: Optional[str] = None):
         """Toggle play/pause for the active waveform (or a specific one)."""
