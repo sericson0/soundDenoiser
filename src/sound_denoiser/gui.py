@@ -48,17 +48,26 @@ ctk.set_default_color_theme("blue")
 class WaveformDisplay(ctk.CTkFrame):
     """Widget for displaying audio waveforms/spectrograms with click-to-seek and noise region selection."""
 
-    def __init__(self, master, on_region_select=None, on_seek=None, waveform_color='#00d9ff', **kwargs):
+    def __init__(
+        self,
+        master,
+        on_region_select=None,
+        on_seek=None,
+        on_threshold_change=None,
+        waveform_color='#00d9ff',
+        **kwargs,
+    ):
         super().__init__(master, **kwargs)
 
         self.on_region_select = on_region_select
         self.on_seek = on_seek  # Callback for click-to-seek
+        self.on_threshold_change = on_threshold_change  # Callback when spectrum threshold points move
         self._duration = 0.0
         self._selection_enabled = False
         self._selected_region: Optional[Tuple[float, float]] = None
         self._waveform_color = waveform_color
         self._current_position = 0.0
-        self._view_mode = "waveform"  # "waveform" or "spectrogram"
+        self._view_mode = "waveform"  # "waveform", "spectrogram", or "spectrum"
 
         # Store waveform data for redrawing
         self._audio_data = None
@@ -72,7 +81,7 @@ class WaveformDisplay(ctk.CTkFrame):
         # View mode segmented button
         self.view_toggle = ctk.CTkSegmentedButton(
             toggle_frame,
-            values=["Waveform", "Spectrogram"],
+            values=["Waveform", "Spectrogram", "Frequency"],
             command=self._on_view_change,
             font=ctk.CTkFont(size=11),
             height=24,
@@ -87,6 +96,22 @@ class WaveformDisplay(ctk.CTkFrame):
 
         # Selection mode state (controlled externally via enable_selection)
         self._selection_mode_enabled = False
+
+        # Spectrum/frequency threshold curve (freq Hz, level dB)
+        self.threshold_freqs = np.array([30, 80, 150, 300, 600, 1200, 2400, 4800, 8000, 12000, 16000], dtype=float)
+        self.threshold_levels = np.array([-70, -65, -60, -55, -52, -50, -48, -48, -52, -58, -65], dtype=float)
+        self._dragging_threshold_idx: Optional[int] = None
+        self.noise_floor_freqs: Optional[np.ndarray] = None
+        self.noise_floor_levels: Optional[np.ndarray] = None
+        self.threshold_smooth_plot = None
+        self.noise_floor_plot = None
+        self.noise_fill = None
+        self.analyzer_img = None
+        self._analyzer_freqs: Optional[np.ndarray] = None
+        self._analyzer_levels: Optional[np.ndarray] = None
+        self._analyzer_floor_db = -110.0
+        self._analyzer_ceiling_db = 10.0
+        self._analyzer_nfft = 2048
 
         # Separator before zoom controls
         sep1 = ctk.CTkFrame(toggle_frame, width=1, height=20, fg_color="#444444")
@@ -169,7 +194,7 @@ class WaveformDisplay(ctk.CTkFrame):
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
 
-        # Bind click events for seeking
+        # Bind click events for seeking and spectrum drag
         self.canvas.mpl_connect('button_press_event', self._on_canvas_click)
         self.canvas.mpl_connect('motion_notify_event', self._on_canvas_drag)
         self.canvas.mpl_connect('button_release_event', self._on_canvas_release)
@@ -191,6 +216,170 @@ class WaveformDisplay(ctk.CTkFrame):
 
         # Span selector for region selection
         self.span_selector = None
+
+    def _begin_threshold_drag(self, event):
+        """Start dragging the nearest threshold point if within hit radius."""
+        if event.xdata is None or event.ydata is None:
+            return
+
+        click_px = np.array(self.ax.transData.transform((event.xdata, event.ydata)))
+        points_px = [self.ax.transData.transform((fx, fy)) for fx, fy in zip(self.threshold_freqs, self.threshold_levels)]
+        dists = [np.hypot(click_px[0] - px, click_px[1] - py) for px, py in points_px]
+
+        if not dists:
+            return
+
+        idx = int(np.argmin(dists))
+        if dists[idx] > 12:  # pixel threshold
+            return
+
+        self._dragging_threshold_idx = idx
+
+    def _drag_threshold_point(self, event):
+        """Drag the active threshold point, keeping ordering and bounds."""
+        if self._dragging_threshold_idx is None or event.xdata is None or event.ydata is None:
+            return
+
+        idx = self._dragging_threshold_idx
+        nyquist = max(2000.0, self._sample_rate / 2)
+
+        # Keep points ordered left-to-right
+        lower_bound = self.threshold_freqs[idx - 1] + 10 if idx > 0 else 20
+        upper_bound = self.threshold_freqs[idx + 1] - 10 if idx < len(self.threshold_freqs) - 1 else nyquist
+
+        new_freq = float(np.clip(event.xdata, lower_bound, upper_bound))
+        new_level = float(np.clip(event.ydata, -120.0, 20.0))
+
+        self.threshold_freqs[idx] = new_freq
+        self.threshold_levels[idx] = new_level
+
+        if hasattr(self, "threshold_plot"):
+            self.threshold_plot.set_data(self.threshold_freqs, self.threshold_levels)
+            self._refresh_threshold_artists()
+
+    def _end_threshold_drag(self):
+        """Finish drag and notify listeners."""
+        self._dragging_threshold_idx = None
+        if self.on_threshold_change:
+            self.on_threshold_change(self.threshold_freqs.copy(), self.threshold_levels.copy())
+        self._drag_seeking = False
+
+    def set_threshold_curve(self, freqs: np.ndarray, levels: np.ndarray):
+        """Update threshold curve programmatically and redraw if visible."""
+        self.threshold_freqs = np.asarray(freqs, dtype=float)
+        self.threshold_levels = np.asarray(levels, dtype=float)
+
+        # Keep monotonic freq ordering
+        order = np.argsort(self.threshold_freqs)
+        self.threshold_freqs = self.threshold_freqs[order]
+        self.threshold_levels = self.threshold_levels[order]
+
+        if hasattr(self, "threshold_plot"):
+            self.threshold_plot.set_data(self.threshold_freqs, self.threshold_levels)
+        if self._view_mode == "spectrum":
+            self._plot_spectrum_internal()
+
+    def set_noise_floor_curve(self, freqs: Optional[np.ndarray], levels: Optional[np.ndarray]):
+        """Set or clear the learned noise floor trace used in spectrum view."""
+        if freqs is None or levels is None:
+            self.noise_floor_freqs = None
+            self.noise_floor_levels = None
+        else:
+            self.noise_floor_freqs = np.asarray(freqs, dtype=float)
+            self.noise_floor_levels = np.asarray(levels, dtype=float)
+            order = np.argsort(self.noise_floor_freqs)
+            self.noise_floor_freqs = self.noise_floor_freqs[order]
+            self.noise_floor_levels = self.noise_floor_levels[order]
+
+        if self._view_mode == "spectrum":
+            self._plot_spectrum_internal()
+
+    def _smooth_threshold_curve(self, dense_points: int = 400) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """Return a lightly smoothed threshold curve for RX-like visuals."""
+        if len(self.threshold_freqs) < 2:
+            return None
+
+        nyquist = max(2000.0, self._sample_rate / 2)
+        f_min = max(20.0, float(self.threshold_freqs.min()))
+        f_max = min(nyquist, float(self.threshold_freqs.max()))
+        dense_freqs = np.linspace(f_min, f_max, dense_points)
+
+        interp_levels = np.interp(dense_freqs, self.threshold_freqs, self.threshold_levels)
+
+        # Simple moving average smoothing; keep odd window and avoid oversmoothing short curves
+        window = max(3, min(25, int(len(interp_levels) * 0.08)))
+        if window % 2 == 0:
+            window += 1
+        kernel = np.ones(window) / window
+        smooth_levels = np.convolve(interp_levels, kernel, mode="same")
+
+        return dense_freqs, smooth_levels
+
+    def _refresh_threshold_artists(self):
+        """Update smoothed line, learned floor trace, and shaded noise gap."""
+        if not hasattr(self, "ax"):
+            return
+
+        # Remove prior fill if present (fill_between returns a collection, easiest to recreate)
+        if self.noise_fill is not None:
+            try:
+                self.noise_fill.remove()
+            except Exception:
+                pass
+            self.noise_fill = None
+
+        smoothed = self._smooth_threshold_curve()
+        floor_freqs = self.noise_floor_freqs
+        floor_levels = self.noise_floor_levels
+
+        if smoothed:
+            dense_freqs, smooth_levels = smoothed
+
+            if self.threshold_smooth_plot is None:
+                (self.threshold_smooth_plot,) = self.ax.plot(
+                    dense_freqs,
+                    smooth_levels,
+                    color="#00d9ff",
+                    linewidth=2.5,
+                    alpha=0.7,
+                    linestyle="-",
+                )
+            else:
+                self.threshold_smooth_plot.set_data(dense_freqs, smooth_levels)
+
+            if floor_freqs is not None and floor_levels is not None:
+                floor_interp = np.interp(dense_freqs, floor_freqs, floor_levels)
+                self.noise_fill = self.ax.fill_between(
+                    dense_freqs,
+                    floor_interp,
+                    smooth_levels,
+                    where=smooth_levels > floor_interp,
+                    color="#00d9ff",
+                    alpha=0.14,
+                    interpolate=True,
+                    linewidth=0,
+                )
+        else:
+            if self.threshold_smooth_plot is not None:
+                self.threshold_smooth_plot.set_data([], [])
+
+        if floor_freqs is not None and floor_levels is not None:
+            if self.noise_floor_plot is None:
+                (self.noise_floor_plot,) = self.ax.plot(
+                    floor_freqs,
+                    floor_levels,
+                    color="#b187ff",
+                    linewidth=1.4,
+                    linestyle="--",
+                    alpha=0.9,
+                )
+            else:
+                self.noise_floor_plot.set_data(floor_freqs, floor_levels)
+        else:
+            if self.noise_floor_plot is not None:
+                self.noise_floor_plot.set_data([], [])
+
+        self.canvas.draw_idle()
 
     def _format_time(self, seconds: float) -> str:
         """Format seconds as M:SS."""
@@ -215,7 +404,13 @@ class WaveformDisplay(ctk.CTkFrame):
 
     def _on_view_change(self, value: str):
         """Handle view mode change."""
-        new_mode = "waveform" if value == "Waveform" else "spectrogram"
+        if value == "Waveform":
+            new_mode = "waveform"
+        elif value == "Spectrogram":
+            new_mode = "spectrogram"
+        else:
+            new_mode = "spectrum"
+
         if new_mode != self._view_mode:
             self._view_mode = new_mode
             self._redraw_display()
@@ -223,11 +418,16 @@ class WaveformDisplay(ctk.CTkFrame):
     def set_view_mode(self, mode: str):
         """Programmatically set view mode and redraw."""
         normalized = mode.lower()
-        if normalized not in ("waveform", "spectrogram"):
+        if normalized not in ("waveform", "spectrogram", "spectrum"):
             return
         self._view_mode = normalized
         try:
-            self.view_toggle.set("Waveform" if normalized == "waveform" else "Spectrogram")
+            if normalized == "waveform":
+                self.view_toggle.set("Waveform")
+            elif normalized == "spectrogram":
+                self.view_toggle.set("Spectrogram")
+            else:
+                self.view_toggle.set("Frequency")
         except Exception:
             pass
         self._redraw_display()
@@ -286,14 +486,16 @@ class WaveformDisplay(ctk.CTkFrame):
         return (start_time, end_time)
 
     def _redraw_display(self):
-        """Redraw the current display (waveform or spectrogram)."""
+        """Redraw the current display (waveform, spectrogram, or spectrum)."""
         if self._audio_data is None:
             return
 
         if self._view_mode == "waveform":
             self._plot_waveform_internal()
-        else:
+        elif self._view_mode == "spectrogram":
             self._plot_spectrogram_internal()
+        else:
+            self._plot_spectrum_internal()
 
     def _plot_waveform_internal(self):
         """Internal method to plot waveform with zoom support."""
@@ -302,6 +504,11 @@ class WaveformDisplay(ctk.CTkFrame):
         self.selection_rect = None
         self.playhead = None
         self.played_area = None
+        self.threshold_smooth_plot = None
+        self.noise_floor_plot = None
+        self.noise_fill = None
+        self.analyzer_img = None
+        self.analyzer_img = None
 
         audio = self._audio_data
         sr = self._sample_rate
@@ -492,9 +699,119 @@ class WaveformDisplay(ctk.CTkFrame):
         if self._current_position > 0:
             self.update_playhead(self._current_position)
 
+    def _plot_spectrum_internal(self):
+        """Plot a frequency spectrum with draggable threshold curve."""
+        self.ax.clear()
+        self.ax.set_facecolor('#1a1a2e')
+        self.selection_rect = None
+        self.playhead = None
+        self.played_area = None
+        self.analyzer_img = None
+        self._analyzer_levels = None
+
+        audio = self._audio_data
+        sr = self._sample_rate
+
+        nyquist = max(2000.0, sr / 2)
+
+        # Initialize analyzer background (Prism-style bar wash)
+        self._analyzer_freqs = np.geomspace(20.0, min(nyquist, 20000.0), 256)
+        zero_levels = np.full_like(self._analyzer_freqs, self._analyzer_floor_db)
+        norm = np.clip(
+            (zero_levels - self._analyzer_floor_db) / (self._analyzer_ceiling_db - self._analyzer_floor_db),
+            0,
+            1,
+        )
+        analyzer_grid = np.tile(norm, (2, 1))
+        self.analyzer_img = self.ax.imshow(
+            analyzer_grid,
+            extent=(self._analyzer_freqs[0], self._analyzer_freqs[-1], self._analyzer_floor_db, self._analyzer_ceiling_db),
+            aspect="auto",
+            origin="lower",
+            cmap="magma",
+            alpha=0.55,
+            interpolation="nearest",
+            zorder=0,
+        )
+
+        # Plot threshold curve (clamp to Nyquist for display)
+        plot_freqs = np.clip(self.threshold_freqs, 20, nyquist)
+        self.threshold_plot, = self.ax.plot(
+            plot_freqs,
+            self.threshold_levels,
+            color="#00d9ff",
+            linewidth=0.0,
+            marker=None,
+        )
+
+        # Smoothed curve + learned floor and shaded reduction area
+        self._refresh_threshold_artists()
+
+        # Axes styling
+        self.ax.set_xlim(20, min(nyquist, 20000))
+        self.ax.set_ylim(self._analyzer_floor_db, self._analyzer_ceiling_db)
+        self.ax.set_xlabel('Frequency (Hz)', color='#888888', fontsize=8)
+        self.ax.set_ylabel('Level (dB)', color='#888888', fontsize=8)
+        self.ax.tick_params(colors='#888888', labelsize=8)
+        self.ax.grid(True, color='#222222', linestyle='--', linewidth=0.5, alpha=0.6)
+        self.ax.set_title('Frequency Analyzer', color='#ffffff', fontsize=10, fontweight='bold')
+        self.ax.xaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=False))
+        self.ax.ticklabel_format(axis='x', style='plain', useOffset=False)
+
+        self.canvas.draw()
+
+    def update_frequency_analyzer(self, audio: Optional[np.ndarray], sr: int, position: float):
+        """Update the live frequency analyzer with a short FFT slice around the playhead."""
+        if self._view_mode != "spectrum":
+            return
+        if audio is None or sr <= 0 or self.analyzer_img is None or self._analyzer_freqs is None:
+            return
+
+        # Map playhead position to sample window
+        center = int(position * len(audio))
+        if center <= 0:
+            center = len(audio) // 20  # small offset to avoid empty slice at start
+
+        window_len = int(sr * 0.18)  # ~180ms window for stable visuals
+        window_len = min(max(1024, window_len), len(audio))
+        start = max(0, center - window_len // 2)
+        end = min(len(audio), start + window_len)
+        if end - start < 512:
+            return
+
+        window = audio[start:end]
+        window = window * np.hanning(len(window))
+
+        spec = np.abs(np.fft.rfft(window, n=self._analyzer_nfft))
+        freqs = np.fft.rfftfreq(self._analyzer_nfft, d=1.0 / sr)
+        spec_db = 20 * np.log10(np.maximum(spec, 1e-9))
+
+        # Log-spaced interpolation for smoother, RX/Prism-like distribution
+        interp_levels = np.interp(self._analyzer_freqs, freqs, spec_db, left=self._analyzer_floor_db, right=self._analyzer_floor_db)
+
+        if self._analyzer_levels is None or len(self._analyzer_levels) != len(interp_levels):
+            self._analyzer_levels = interp_levels
+        else:
+            # Exponential smoothing to keep motion fluid
+            self._analyzer_levels = 0.82 * self._analyzer_levels + 0.18 * interp_levels
+
+        norm = np.clip(
+            (self._analyzer_levels - self._analyzer_floor_db) / (self._analyzer_ceiling_db - self._analyzer_floor_db),
+            0,
+            1,
+        )
+
+        analyzer_grid = np.tile(norm, (2, 1))
+        self.analyzer_img.set_data(analyzer_grid)
+        self.canvas.draw_idle()
+
     def _on_canvas_click(self, event):
-        """Handle mouse click on canvas for seeking."""
+        """Handle mouse click on canvas for seeking or spectrum dragging."""
         if event.inaxes != self.ax or self._duration <= 0:
+            return
+
+        if self._view_mode == "spectrum":
+            self._begin_threshold_drag(event)
             return
 
         # Check if we're in selection mode
@@ -514,8 +831,15 @@ class WaveformDisplay(ctk.CTkFrame):
                 self.on_seek(position)
 
     def _on_canvas_drag(self, event):
-        """Handle mouse drag on canvas for seeking."""
-        if not self._drag_seeking or event.inaxes != self.ax or self._duration <= 0:
+        """Handle mouse drag on canvas for seeking or spectrum drag."""
+        if event.inaxes != self.ax or self._duration <= 0:
+            return
+
+        if self._view_mode == "spectrum":
+            self._drag_threshold_point(event)
+            return
+
+        if not self._drag_seeking:
             return
 
         x_pos = event.xdata
@@ -529,11 +853,17 @@ class WaveformDisplay(ctk.CTkFrame):
                 self.on_seek(position)
 
     def _on_canvas_release(self, event):
-        """Handle mouse release after seeking."""
+        """Handle mouse release after seeking or spectrum drag."""
+        if self._view_mode == "spectrum" and self._dragging_threshold_idx is not None:
+            self._end_threshold_drag()
+            return
         self._drag_seeking = False
 
     def _on_scroll(self, event):
         """Handle scroll wheel for panning when zoomed."""
+        if self._view_mode == "spectrum":
+            return  # No scroll interaction for spectrum
+
         if self._zoom_level <= 1.0:
             return  # No panning needed at 1x zoom
 
@@ -708,6 +1038,10 @@ class WaveformDisplay(ctk.CTkFrame):
 
         # Update time label (always do this)
         self._update_time_label(position)
+
+        # Spectrum view is static (no playhead overlay)
+        if self._view_mode == "spectrum":
+            return
 
         if skip_draw:
             return
@@ -1280,6 +1614,7 @@ class SoundDenoiserApp(ctk.CTk):
         self.selected_noise_region: Optional[Tuple[float, float]] = None
         self.config_path = Path.home() / ".sound_denoiser_config.json"
         self.config = self._load_config()
+        self.threshold_curve: List[Tuple[float, float]] = []
 
         # Build UI
         self._create_ui()
@@ -1451,14 +1786,16 @@ class SoundDenoiserApp(ctk.CTk):
         self.waveform_original = WaveformDisplay(
             waveform_frame,
             on_region_select=self._on_noise_region_selected,
-            on_seek=lambda pos: self._on_seek("original", pos)
+            on_seek=lambda pos: self._on_seek("original", pos),
+            on_threshold_change=self._on_threshold_curve_change,
         )
         self.waveform_original.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
         self.waveform_original.plot_waveform(None, 44100, f"{self.track_title} (Original)", "#ff9f43")
 
         self.waveform_processed = WaveformDisplay(
             waveform_frame,
-            on_seek=lambda pos: self._on_seek("processed", pos)
+            on_seek=lambda pos: self._on_seek("processed", pos),
+            on_threshold_change=self._on_threshold_curve_change,
         )
         self.waveform_processed.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
         self.waveform_processed.plot_waveform(None, 44100, f"{self.track_title} (Denoised)", "#00d9ff")
@@ -1877,6 +2214,12 @@ class SoundDenoiserApp(ctk.CTk):
         self.noise_profile_panel.add_selection(start, end)
         count = len(self.noise_profile_panel.get_selections())
         self._set_status(f"Added noise region: {start:.2f}s - {end:.2f}s (Total: {count} selection(s))")
+        self._update_threshold_from_params()
+
+    def _on_threshold_curve_change(self, freqs: np.ndarray, levels: np.ndarray):
+        """Persist spectrum threshold curve changes and surface in status."""
+        self.threshold_curve = list(zip(freqs.tolist(), levels.tolist()))
+        self._set_status("Updated threshold curve")
 
     def _learn_noise_profile_manual(self):
         """Learn noise profile from manually selected regions."""
@@ -1898,6 +2241,7 @@ class SoundDenoiserApp(ctk.CTk):
             # Learn from all selections combined
             profile = self.denoiser.learn_noise_profile_from_regions(selections)
             self.noise_profile_panel.update_status(profile, selections)
+            self._update_noise_floor_trace(profile)
 
             total_duration = sum(end - start for start, end in selections)
             self._set_status(f"Noise profile learned from {len(selections)} region(s) ({total_duration:.2f}s total)")
@@ -1925,11 +2269,27 @@ class SoundDenoiserApp(ctk.CTk):
 
         threading.Thread(target=auto_learn_thread, daemon=True).start()
 
+    def _update_noise_floor_trace(self, profile: Optional[NoiseProfile]):
+        """Push learned noise spectrum into frequency view overlays."""
+        if profile is None:
+            self.waveform_original.set_noise_floor_curve(None, None)
+            self.waveform_processed.set_noise_floor_curve(None, None)
+            return
+
+        # Recreate the frequency axis that matches the stored spectral mean
+        n_fft = max(2, (len(profile.spectral_mean) - 1) * 2)
+        freqs = librosa.fft_frequencies(sr=profile.sample_rate, n_fft=n_fft)
+        floor_db = 20 * np.log10(np.maximum(profile.spectral_mean, 1e-12))
+
+        self.waveform_original.set_noise_floor_curve(freqs, floor_db)
+        self.waveform_processed.set_noise_floor_curve(freqs, floor_db)
+
     def _clear_noise_profile(self):
         """Clear the learned noise profile and all selections."""
         self.denoiser.clear_noise_profile()
         self.waveform_original.clear_selection()
         self.waveform_original.clear_noise_region()
+        self._update_noise_floor_trace(None)
         self._set_status("Noise profile and selections cleared")
 
     def _toggle_use_profile(self, use: bool):
@@ -2021,6 +2381,7 @@ class SoundDenoiserApp(ctk.CTk):
         self.stop_btn.configure(state="disabled")
         self.selection_btn.configure(state="disabled", text="Select Noise", fg_color="#1a5276")
         self.process_btn.configure(state="disabled", text="Apply Denoising")
+        self._update_threshold_from_params()
 
         # Load in background thread
         def load_thread():
@@ -2115,6 +2476,52 @@ class SoundDenoiserApp(ctk.CTk):
         """Handle parameter change - enable reprocessing hint."""
         if self.denoiser.get_original() is not None and not self.is_processing:
             self.process_btn.configure(fg_color="#884499")
+        self._update_threshold_from_params()
+
+    def _update_threshold_from_params(self):
+        """Recalculate the frequency threshold curve based on current params."""
+        # Base grid of frequencies (more points for finer control)
+        freqs = np.array([30, 60, 90, 140, 200, 300, 450, 650, 900, 1300, 1800, 2500, 3400, 4600, 6000, 8000, 10000, 13000, 16000], dtype=float)
+
+        # Parameter influences
+        noise_thresh = self.noise_threshold_slider.get() if hasattr(self, "noise_threshold_slider") else 1.0
+        hiss_start = self.hiss_start_slider.get() if hasattr(self, "hiss_start_slider") else 2000.0
+        hiss_peak = self.hiss_peak_slider.get() if hasattr(self, "hiss_peak_slider") else 6000.0
+        low_cut = self.low_cut_slider.get() if hasattr(self, "low_cut_slider") else 0.0
+        hf_emphasis = self.hf_emphasis_slider.get() if hasattr(self, "hf_emphasis_slider") else 1.0
+
+        # Baseline slope: gently rising then falling in highs
+        base_levels = np.linspace(-72, -50, len(freqs))
+
+        # Global lift/drop from noise threshold (UI now lifts the line when threshold increases)
+        levels = base_levels + (noise_thresh - 1.0) * 6.0
+
+        # Low-cut: strongly attenuate below low_cut
+        if low_cut > 0:
+            low_mask = freqs < low_cut
+            levels[low_mask] = np.minimum(levels[low_mask], -90.0)
+
+        # Hiss band emphasis: dip around hiss peak scaled by hf_emphasis
+        band_mask = (freqs >= max(200.0, hiss_start * 0.6)) & (freqs <= hiss_peak * 1.4)
+        band_depth = (hf_emphasis - 1.0) * 8.0
+        levels[band_mask] -= band_depth
+
+        # Smooth edges near hiss peak
+        if hiss_peak > hiss_start:
+            span = hiss_peak - hiss_start
+            taper_start = hiss_start + 0.3 * span
+            taper_end = hiss_peak + 0.3 * span
+            taper_mask = (freqs >= taper_start) & (freqs <= taper_end)
+            taper_ratio = np.clip((freqs[taper_mask] - taper_start) / (taper_end - taper_start), 0, 1)
+            levels[taper_mask] -= band_depth * (1 - taper_ratio)
+
+        # Clamp to sensible bounds
+        levels = np.clip(levels, -110.0, 10.0)
+
+        # Persist and push into displays
+        self.threshold_curve = list(zip(freqs.tolist(), levels.tolist()))
+        self.waveform_original.set_threshold_curve(freqs, levels)
+        self.waveform_processed.set_threshold_curve(freqs, levels)
 
     def _on_method_change(self, method_name: str):
         """Handle denoising method change."""
@@ -2153,6 +2560,7 @@ class SoundDenoiserApp(ctk.CTk):
         # Highlight process button to indicate reprocessing needed
         if self.denoiser.get_original() is not None and not self.is_processing:
             self.process_btn.configure(fg_color="#884499")
+        self._update_threshold_from_params()
 
     def _reset_parameters(self):
         """Reset parameters to defaults."""
@@ -2335,10 +2743,12 @@ class SoundDenoiserApp(ctk.CTk):
         if self.player_original.is_playing():
             pos = self.player_original.get_position()
             self.waveform_original.update_playhead(pos)
+            self.waveform_original.update_frequency_analyzer(self.waveform_original._audio_data, self.waveform_original._sample_rate, pos)
 
         if self.player_processed.is_playing():
             pos = self.player_processed.get_position()
             self.waveform_processed.update_playhead(pos)
+            self.waveform_processed.update_frequency_analyzer(self.waveform_processed._audio_data, self.waveform_processed._sample_rate, pos)
 
         # Update play buttons on completion
         if self.active_waveform_view == "original" and self.player_original.get_state() == PlaybackState.STOPPED:
@@ -2419,6 +2829,7 @@ class SoundDenoiserApp(ctk.CTk):
         self.waveform_original.add_selection_rect(*region)
         self.noise_profile_panel.update_status(profile, region)
         self.noise_profile_panel.enable_learn_button(True)
+        self._update_noise_floor_trace(profile)
         self._set_status(f"Auto-detected noise region: {region[0]:.2f}s - {region[1]:.2f}s")
 
         # Auto-reprocess
