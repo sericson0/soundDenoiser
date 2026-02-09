@@ -1563,19 +1563,6 @@ class SoundDenoiserApp(ctk.CTk):
         )
         self.view_toggle_btn.pack(side="left", padx=6)
 
-        self.sync_btn = ctk.CTkButton(
-            controls,
-            text="🔗 Sync",
-            width=70,
-            height=32,
-            command=self._sync_to_original,
-            fg_color="#6c3483",
-            hover_color="#8e44ad",
-            font=ctk.CTkFont(size=12),
-            state="disabled"
-        )
-        self.sync_btn.pack(side="left", padx=4)
-
         hint_label = ctk.CTkLabel(
             controls,
             text="Click on waveform to seek",
@@ -2337,26 +2324,6 @@ class SoundDenoiserApp(ctk.CTk):
         player.seek(position)
         waveform.update_playhead(position)
 
-    def _sync_to_original(self):
-        """Sync processed player position to original player position."""
-        # Get the original player's position
-        orig_position = self.player_original.get_position()
-
-        # Set the processed player to the same position
-        self.player_processed.seek(orig_position)
-        self.waveform_processed.update_playhead(orig_position)
-
-        # If original is playing, also play processed (and stop original for A/B comparison)
-        if self.player_original.is_playing():
-            self.player_original.pause()
-            self.player_processed.play()
-        self._refresh_play_button_label()
-
-        # Format the time for status
-        duration = self.waveform_original._duration
-        current_time = orig_position * duration
-        self._set_status(f"Synced to position: {self.waveform_original._format_time(current_time)}")
-
     def _set_status(self, message: str):
         """Update status bar message."""
         self.status_label.configure(text=message)
@@ -2441,7 +2408,6 @@ class SoundDenoiserApp(ctk.CTk):
         self.noise_profile_panel.enable_controls(True)
 
         # Disable processed controls until processing
-        self.sync_btn.configure(state="disabled")
         self.save_btn.configure(state="disabled")
 
         # Update status
@@ -2466,7 +2432,6 @@ class SoundDenoiserApp(ctk.CTk):
 
         # Enable controls
         self.view_toggle_btn.configure(state="normal")
-        self.sync_btn.configure(state="normal")
         self.save_btn.configure(state="normal")
         self.process_btn.configure(state="normal", text="🔄 Apply Denoising", fg_color="#6c3483")
         self._refresh_play_button_label()
