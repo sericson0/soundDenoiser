@@ -109,6 +109,8 @@ class WaveformDisplay(ctk.CTkFrame):
         self.noise_threshold_plot = None
         self.noise_fill = None
         self.analyzer_img = None
+        self.analyzer_line = None
+        self.analyzer_fill = None
         self._analyzer_freqs: Optional[np.ndarray] = None
         self._analyzer_levels: Optional[np.ndarray] = None
         self._analyzer_floor_db = -110.0
@@ -341,6 +343,12 @@ class WaveformDisplay(ctk.CTkFrame):
             except Exception:
                 pass
             self.noise_fill = None
+        if self.analyzer_fill is not None:
+            try:
+                self.analyzer_fill.remove()
+            except Exception:
+                pass
+            self.analyzer_fill = None
 
         smoothed = self._smooth_threshold_curve()
         floor_freqs = self.noise_floor_freqs
@@ -411,6 +419,9 @@ class WaveformDisplay(ctk.CTkFrame):
                 self.noise_floor_plot.set_data([], [])
             if self.noise_threshold_plot is not None:
                 self.noise_threshold_plot.set_data([], [])
+
+        if self.analyzer_line is not None:
+            self.analyzer_line.set_zorder(0.5)
 
         self.canvas.draw_idle()
 
@@ -763,6 +774,8 @@ class WaveformDisplay(ctk.CTkFrame):
         self.played_area = None
         self.analyzer_img = None
         self._analyzer_levels = None
+        self.analyzer_line = None
+        self.analyzer_fill = None
         self.threshold_smooth_plot = None
         self.noise_floor_plot = None
         self.noise_threshold_plot = None
@@ -776,7 +789,8 @@ class WaveformDisplay(ctk.CTkFrame):
         # Initialize mel-space analyzer background (Prism-style wash)
         if self._analyzer_filter is None or self._analyzer_filter_sr != sr:
             self._build_analyzer_filter(sr)
-        zero_levels = np.full_like(self._analyzer_freqs, self._analyzer_floor_db)
+        # Seed with a faint baseline so the analyzer is visible immediately
+        zero_levels = np.full_like(self._analyzer_freqs, self._analyzer_floor_db + 6.0)
         norm = np.clip(
             (zero_levels - self._analyzer_floor_db) / (self._analyzer_ceiling_db - self._analyzer_floor_db),
             0,
@@ -816,8 +830,8 @@ class WaveformDisplay(ctk.CTkFrame):
         self.ax.tick_params(colors='#888888', labelsize=8)
         self.ax.grid(True, color='#222222', linestyle='--', linewidth=0.5, alpha=0.6)
         self.ax.set_title('Frequency Analyzer', color='#ffffff', fontsize=10, fontweight='bold')
-        self.ax.xaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=False))
-        self.ax.ticklabel_format(axis='x', style='plain', useOffset=False)
+        self.ax.xaxis.set_major_formatter(mticker.LogFormatter())
+        self.ax.xaxis.set_minor_formatter(mticker.NullFormatter())
 
         # Seed analyzer with current frame so it's visible immediately
         self.update_frequency_analyzer(audio, sr, self._current_position)
