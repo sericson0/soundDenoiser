@@ -154,7 +154,8 @@ class WaveformDisplay(ctk.CTkFrame):
         self.fig = Figure(figsize=(10, 2.2), dpi=100, facecolor='#1a1a2e')
         self.ax = self.fig.add_subplot(111)
         self.ax.set_facecolor('#1a1a2e')
-        self.fig.subplots_adjust(left=0.05, right=0.95, top=0.88, bottom=0.18)
+        # Extra space on the left for the frequency label, tighter on the right to reclaim width
+        self.fig.subplots_adjust(left=0.08, right=0.98, top=0.88, bottom=0.18)
 
         # Style the axes
         self.ax.tick_params(colors='#888888', labelsize=8)
@@ -1422,7 +1423,7 @@ class SoundDenoiserApp(ctk.CTk):
     def _create_main_content(self):
         """Create main content area."""
         main_frame = ctk.CTkFrame(self, fg_color="transparent")
-        main_frame.grid(row=1, column=0, sticky="nsew", padx=15, pady=10)
+        main_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=8)
         main_frame.grid_columnconfigure(0, weight=3)
         main_frame.grid_columnconfigure(1, weight=1)
         main_frame.grid_rowconfigure(0, weight=1)
@@ -1436,13 +1437,13 @@ class SoundDenoiserApp(ctk.CTk):
     def _create_waveform_panel(self, parent):
         """Create waveform display and playback controls."""
         left_panel = ctk.CTkFrame(parent, fg_color="#0f0f1a", corner_radius=12)
-        left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 10), pady=0)
+        left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=0)
         left_panel.grid_rowconfigure(0, weight=1)
         left_panel.grid_rowconfigure(1, weight=0)
         left_panel.grid_columnconfigure(0, weight=1)
 
         waveform_frame = ctk.CTkFrame(left_panel, fg_color="#151525", corner_radius=10)
-        waveform_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=(10, 5))
+        waveform_frame.grid(row=0, column=0, sticky="nsew", padx=8, pady=(6, 2))
         waveform_frame.grid_rowconfigure(0, weight=1)
         waveform_frame.grid_columnconfigure(0, weight=1)
 
@@ -1452,20 +1453,20 @@ class SoundDenoiserApp(ctk.CTk):
             on_region_select=self._on_noise_region_selected,
             on_seek=lambda pos: self._on_seek("original", pos)
         )
-        self.waveform_original.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+        self.waveform_original.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
         self.waveform_original.plot_waveform(None, 44100, f"{self.track_title} (Original)", "#ff9f43")
 
         self.waveform_processed = WaveformDisplay(
             waveform_frame,
             on_seek=lambda pos: self._on_seek("processed", pos)
         )
-        self.waveform_processed.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+        self.waveform_processed.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
         self.waveform_processed.plot_waveform(None, 44100, f"{self.track_title} (Denoised)", "#00d9ff")
         self.waveform_processed.grid_remove()  # Start hidden for a single-panel view
 
         # Unified playback and view controls
         controls = ctk.CTkFrame(left_panel, fg_color="transparent")
-        controls.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+        controls.grid(row=1, column=0, sticky="ew", padx=8, pady=(2, 6))
 
         self.play_btn = ctk.CTkButton(
             controls,
