@@ -1193,15 +1193,18 @@ class SoundDenoiserApp(ctk.CTk):
 
         # Update waveform playheads during playback
         # Note: update_playhead automatically skips canvas redraws in spectrogram mode
+        # Update both frequency analyzers to keep them in sync during playback
         if self.player_original.is_playing():
             pos = self.player_original.get_position()
             self.waveform_original.update_playhead(pos)
             self.waveform_original.update_frequency_analyzer(self.waveform_original._audio_data, self.waveform_original._sample_rate, pos)
+            self.waveform_processed.update_frequency_analyzer(self.waveform_processed._audio_data, self.waveform_processed._sample_rate, pos)
 
         if self.player_processed.is_playing():
             pos = self.player_processed.get_position()
             self.waveform_processed.update_playhead(pos)
             self.waveform_processed.update_frequency_analyzer(self.waveform_processed._audio_data, self.waveform_processed._sample_rate, pos)
+            self.waveform_original.update_frequency_analyzer(self.waveform_original._audio_data, self.waveform_original._sample_rate, pos)
 
         # Update play buttons on completion
         if self.active_waveform_view == "original" and self.player_original.get_state() == PlaybackState.STOPPED:
@@ -1222,6 +1225,9 @@ class SoundDenoiserApp(ctk.CTk):
             f"{self.track_title} (Original)", "#ff9f43"
         )
         self.waveform_processed.plot_waveform(None, sr, f"{self.track_title} (Denoised)", "#00d9ff")
+
+        # Clear any previous comparison audio
+        self.waveform_original.set_comparison_audio(None)
 
         # Selection mode starts OFF - user enables via noise profile panel toggle
         self.noise_selection_enabled = False
@@ -1259,6 +1265,14 @@ class SoundDenoiserApp(ctk.CTk):
         sr = self.denoiser.get_sample_rate()
         display_audio = processed[0] if processed.ndim == 2 else processed
         self.waveform_processed.plot_waveform(display_audio, sr, f"{self.track_title} (Denoised)", "#00d9ff")
+
+        # Set cross-comparison overlays so both views show both spectra
+        # Original waveform shows denoised as comparison
+        self.waveform_original.set_comparison_audio(display_audio, sr)
+        # Processed waveform shows original as comparison
+        original_audio = self.waveform_original._audio_data
+        if original_audio is not None:
+            self.waveform_processed.set_comparison_audio(original_audio, self.waveform_original._sample_rate)
 
         # Load into player
         self.player_processed.load(processed, sr)

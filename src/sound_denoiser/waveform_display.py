@@ -80,11 +80,20 @@ class WaveformDisplay(ctk.CTkFrame):
         self.analyzer_fill = None
         self._analyzer_freqs: Optional[np.ndarray] = None
         self._analyzer_levels: Optional[np.ndarray] = None
-        self._analyzer_floor_db = -90.0
-        self._analyzer_ceiling_db = 60.0
+        self._analyzer_peak_levels: Optional[np.ndarray] = None  # Peak hold levels
+        self._analyzer_floor_db = -60.0
+        self._analyzer_ceiling_db = 40.0
         self._analyzer_nfft = 2048
         self._analyzer_filter = None
         self._analyzer_filter_sr = None
+
+        # Comparison audio for overlay (e.g., denoised vs original)
+        self._comparison_audio: Optional[np.ndarray] = None
+        self._comparison_sr: int = 44100
+        self._comparison_levels: Optional[np.ndarray] = None
+        self._comparison_peak_levels: Optional[np.ndarray] = None
+        self.comparison_line = None
+        self.comparison_fill = None
 
         # Separator before zoom controls
         sep1 = ctk.CTkFrame(toggle_frame, width=1, height=20, fg_color="#444444")
@@ -390,7 +399,7 @@ class WaveformDisplay(ctk.CTkFrame):
         """Prepare mel filter bank for the analyzer based on current sample rate."""
         nyquist = max(2000.0, sr / 2)
         n_mels = 256
-        fmin = 30.0
+        fmin = 40.0
         fmax = min(nyquist, 20000.0)
         self._analyzer_filter = librosa.filters.mel(
             sr=sr,
@@ -682,8 +691,13 @@ class WaveformDisplay(ctk.CTkFrame):
         self.played_area = None
         self.analyzer_img = None
         self._analyzer_levels = None
+        self._analyzer_peak_levels = None
         self.analyzer_line = None
         self.analyzer_fill = None
+        self._comparison_levels = None
+        self._comparison_peak_levels = None
+        self.comparison_line = None
+        self.comparison_fill = None
         self.threshold_smooth_plot = None
         self.noise_floor_plot = None
         self.noise_threshold_plot = None
@@ -700,13 +714,32 @@ class WaveformDisplay(ctk.CTkFrame):
         # Initialize with floor levels - will be updated with real audio data
         initial_levels = np.full_like(self._analyzer_freqs, self._analyzer_floor_db)
 
-        # Use line plot + fill for spectrum (works correctly with log x-axis)
+        # If comparison audio exists, draw it first (behind original)
+        if self._comparison_audio is not None:
+            self.comparison_fill = self.ax.fill_between(
+                self._analyzer_freqs,
+                self._analyzer_floor_db,
+                initial_levels,
+                color="#00d9ff",
+                alpha=0.35,
+                zorder=0.5,
+            )
+            (self.comparison_line,) = self.ax.plot(
+                self._analyzer_freqs,
+                initial_levels,
+                color="#00d9ff",
+                linewidth=1.5,
+                alpha=0.8,
+                zorder=1.5,
+            )
+
+        # Use line plot + fill for original spectrum (works correctly with log x-axis)
         self.analyzer_fill = self.ax.fill_between(
             self._analyzer_freqs,
             self._analyzer_floor_db,
             initial_levels,
             color="#ff9f43",
-            alpha=0.6,
+            alpha=0.5,
             zorder=1,
         )
         (self.analyzer_line,) = self.ax.plot(
@@ -731,7 +764,7 @@ class WaveformDisplay(ctk.CTkFrame):
 
         self._refresh_threshold_artists()
 
-        self.ax.set_xlim(max(30, float(self._analyzer_freqs[0])), min(nyquist, float(self._analyzer_freqs[-1])))
+        self.ax.set_xlim(max(40, float(self._analyzer_freqs[0])), min(nyquist, float(self._analyzer_freqs[-1])))
         self.ax.set_ylim(self._analyzer_floor_db, self._analyzer_ceiling_db)
         self.ax.set_xscale("log")
         self.ax.set_xlabel("Frequency (Hz)", color="#888888", fontsize=8)
@@ -746,25 +779,36 @@ class WaveformDisplay(ctk.CTkFrame):
 
         self.canvas.draw()
 
-    def update_frequency_analyzer(self, audio: Optional[np.ndarray], sr: int, position: float):
-        """Update the live frequency analyzer with a short FFT slice around the playhead."""
-        if self._view_mode != "spectrum":
-            return
-        if audio is None or sr <= 0 or self.analyzer_img is None or self._analyzer_freqs is None:
-            return
-        if self.analyzer_line is None:
-            return
+    def set_comparison_audio(self, audio: Optional[np.ndarray], sr: int = 44100):
+        """Set comparison audio (e.g., denoised) for overlay on spectrum view."""
+        if audio is None:
+            self._comparison_audio = None
+            self._comparison_sr = 44100
+        else:
+            if len(audio.shape) > 1:
+                audio = audio[0] if audio.shape[0] <= 2 else audio[:, 0]
+            self._comparison_audio = audio.copy()
+            self._comparison_sr = sr
+        self._comparison_levels = None
+        self._comparison_peak_levels = None
+        if self._view_mode == "spectrum":
+            self._redraw_display()
+
+    def _compute_spectrum_db(self, audio: np.ndarray, sr: int, position: float) -> Optional[np.ndarray]:
+        """Compute mel spectrum in dB for audio at given position."""
+        if audio is None or sr <= 0:
+            return None
 
         center = int(position * len(audio))
         if center <= 0:
             center = len(audio) // 20
 
-        window_len = int(sr * 0.18)
+        window_len = int(sr * 0.10)  # Shorter window for better peak response
         window_len = min(max(1024, window_len), len(audio))
         start = max(0, center - window_len // 2)
         end = min(len(audio), start + window_len)
         if end - start < 512:
-            return
+            return None
 
         window = audio[start:end]
         window = window * np.hanning(len(window))
@@ -777,11 +821,31 @@ class WaveformDisplay(ctk.CTkFrame):
 
         mel_power = self._analyzer_filter @ spec_power[: self._analyzer_filter.shape[1]]
         mel_db = 10 * np.log10(np.maximum(mel_power, 1e-12))
+        return mel_db
 
+    def update_frequency_analyzer(self, audio: Optional[np.ndarray], sr: int, position: float):
+        """Update the live frequency analyzer with a short FFT slice around the playhead."""
+        if self._view_mode != "spectrum":
+            return
+        if audio is None or sr <= 0 or self.analyzer_img is None or self._analyzer_freqs is None:
+            return
+        if self.analyzer_line is None:
+            return
+
+        # Compute original audio spectrum
+        mel_db = self._compute_spectrum_db(audio, sr, position)
+        if mel_db is None:
+            return
+
+        # Peak detection algorithm: fast attack, slow decay
         if self._analyzer_levels is None or len(self._analyzer_levels) != len(mel_db):
-            self._analyzer_levels = mel_db
+            self._analyzer_levels = mel_db.copy()
+            self._analyzer_peak_levels = mel_db.copy()
         else:
-            self._analyzer_levels = 0.82 * self._analyzer_levels + 0.18 * mel_db
+            # Fast attack (instant rise), slower decay for peaks
+            self._analyzer_levels = np.maximum(mel_db, self._analyzer_levels * 0.85 + mel_db * 0.15)
+            # Peak hold with slow decay
+            self._analyzer_peak_levels = np.maximum(mel_db, self._analyzer_peak_levels * 0.95)
 
         # Clip levels to the display range
         display_levels = np.clip(self._analyzer_levels, self._analyzer_floor_db, self._analyzer_ceiling_db)
@@ -797,11 +861,38 @@ class WaveformDisplay(ctk.CTkFrame):
             self._analyzer_floor_db,
             display_levels,
             color="#ff9f43",
-            alpha=0.6,
+            alpha=0.5,
             zorder=1,
         )
         # Ensure line stays on top
         self.analyzer_line.set_zorder(2)
+
+        # Update comparison audio if present
+        if self._comparison_audio is not None and self.comparison_line is not None:
+            comp_db = self._compute_spectrum_db(self._comparison_audio, self._comparison_sr, position)
+            if comp_db is not None:
+                if self._comparison_levels is None or len(self._comparison_levels) != len(comp_db):
+                    self._comparison_levels = comp_db.copy()
+                    self._comparison_peak_levels = comp_db.copy()
+                else:
+                    # Same peak algorithm for comparison
+                    self._comparison_levels = np.maximum(comp_db, self._comparison_levels * 0.85 + comp_db * 0.15)
+                    self._comparison_peak_levels = np.maximum(comp_db, self._comparison_peak_levels * 0.95)
+
+                comp_display = np.clip(self._comparison_levels, self._analyzer_floor_db, self._analyzer_ceiling_db)
+                self.comparison_line.set_ydata(comp_display)
+
+                if self.comparison_fill is not None:
+                    self.comparison_fill.remove()
+                self.comparison_fill = self.ax.fill_between(
+                    self._analyzer_freqs,
+                    self._analyzer_floor_db,
+                    comp_display,
+                    color="#00d9ff",
+                    alpha=0.35,
+                    zorder=0.5,
+                )
+                self.comparison_line.set_zorder(1.5)
 
         self.canvas.draw_idle()
 
