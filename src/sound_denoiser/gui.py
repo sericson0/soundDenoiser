@@ -1020,28 +1020,6 @@ class NoiseProfilePanel(ctk.CTkFrame):
         sep = ctk.CTkFrame(self, height=1, fg_color="#333333")
         sep.pack(fill="x", padx=10, pady=10)
 
-        # Make Selection button at TOP
-        self.select_mode_btn = ctk.CTkButton(
-            self,
-            text="Make Selection",
-            command=self._toggle_selection,
-            font=ctk.CTkFont(size=12, weight="bold"),
-            fg_color="#1a5276",
-            hover_color="#2471a3",
-            height=36,
-            corner_radius=6,
-            state="disabled"
-        )
-        self.select_mode_btn.pack(fill="x", padx=10, pady=(0, 5))
-
-        self.select_hint = ctk.CTkLabel(
-            self,
-            text="Click to enable, then drag on waveform",
-            font=ctk.CTkFont(size=9),
-            text_color="#666666"
-        )
-        self.select_hint.pack(padx=10, anchor="w")
-
         # Selections list section
         self.selections_frame = ctk.CTkFrame(self, fg_color="#1a2a3a", corner_radius=6)
         self.selections_frame.pack(fill="x", padx=10, pady=10)
@@ -1147,33 +1125,9 @@ class NoiseProfilePanel(ctk.CTkFrame):
         """Handle use profile toggle."""
         self.on_toggle_use(self.use_profile_var.get())
 
-    def _toggle_selection(self):
-        """Toggle selection mode on the waveform."""
-        self._selection_enabled = not self._selection_enabled
-
-        if self._selection_enabled:
-            self.select_mode_btn.configure(
-                text="Selection Mode ON",
-                fg_color="#ff6b6b",
-                hover_color="#ff8f8f"
-            )
-            self.select_hint.configure(
-                text="Drag on waveform to add region",
-                text_color="#ff6b6b"
-            )
-        else:
-            self.select_mode_btn.configure(
-                text="Make Selection",
-                fg_color="#1a5276",
-                hover_color="#2471a3"
-            )
-            self.select_hint.configure(
-                text="Click to enable, then drag on waveform",
-                text_color="#666666"
-            )
-
-        if self.on_toggle_selection:
-            self.on_toggle_selection(self._selection_enabled)
+    def set_selection_enabled(self, enable: bool):
+        """Track selection mode state for external controls."""
+        self._selection_enabled = enable
 
     def add_selection(self, start: float, end: float):
         """Add a selection to the list."""
@@ -1267,7 +1221,6 @@ class NoiseProfilePanel(ctk.CTkFrame):
         """Enable or disable controls."""
         state = "normal" if enable else "disabled"
         self.auto_btn.configure(state=state)
-        self.select_mode_btn.configure(state=state)
 
     def enable_learn_button(self, enable: bool = True):
         """Enable or disable the learn button based on selections."""
@@ -1316,6 +1269,7 @@ class SoundDenoiserApp(ctk.CTk):
         self.current_player: Optional[AudioPlayer] = None
         self.active_waveform_view = "original"  # "original" or "processed"
         self.noise_selection_enabled = False
+        self.track_title = "No Track"
 
         # State
         self.input_path: Optional[Path] = None
@@ -1437,16 +1391,6 @@ class SoundDenoiserApp(ctk.CTk):
             text_color="#00d9ff"
         )
         title.pack(side="left")
-
-        subtitle = ctk.CTkLabel(
-            title_frame,
-            text="  |  Hiss Removal for Vintage Recordings",
-            font=ctk.CTkFont(size=14),
-            text_color="#888888"
-        )
-        subtitle.pack(side="left", padx=(10, 0))
-
-        # File controls
         file_frame = ctk.CTkFrame(header, fg_color="transparent")
         file_frame.grid(row=0, column=1, padx=20, pady=15, sticky="e")
 
@@ -1509,14 +1453,14 @@ class SoundDenoiserApp(ctk.CTk):
             on_seek=lambda pos: self._on_seek("original", pos)
         )
         self.waveform_original.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
-        self.waveform_original.plot_waveform(None, 44100, "Original Audio (Click to seek, drag to select noise)", "#ff9f43")
+        self.waveform_original.plot_waveform(None, 44100, f"{self.track_title} (Original)", "#ff9f43")
 
         self.waveform_processed = WaveformDisplay(
             waveform_frame,
             on_seek=lambda pos: self._on_seek("processed", pos)
         )
         self.waveform_processed.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
-        self.waveform_processed.plot_waveform(None, 44100, "Processed Audio (Denoised)", "#00d9ff")
+        self.waveform_processed.plot_waveform(None, 44100, f"{self.track_title} (Denoised)", "#00d9ff")
         self.waveform_processed.grid_remove()  # Start hidden for a single-panel view
 
         # Unified playback and view controls
@@ -1539,7 +1483,7 @@ class SoundDenoiserApp(ctk.CTk):
 
         self.stop_btn = ctk.CTkButton(
             controls,
-            text="⏹",
+            text="⏸",
             width=60,
             height=32,
             command=self._stop_play,
@@ -1563,13 +1507,31 @@ class SoundDenoiserApp(ctk.CTk):
         )
         self.view_toggle_btn.pack(side="left", padx=6)
 
-        hint_label = ctk.CTkLabel(
+        self.selection_btn = ctk.CTkButton(
             controls,
-            text="Click on waveform to seek",
-            font=ctk.CTkFont(size=10),
-            text_color="#666666"
+            text="Make Selection",
+            width=130,
+            height=32,
+            command=self._toggle_selection_button,
+            fg_color="#1a5276",
+            hover_color="#2471a3",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            state="disabled"
         )
-        hint_label.pack(side="right", padx=5)
+        self.selection_btn.pack(side="left", padx=6)
+
+        self.process_btn = ctk.CTkButton(
+            controls,
+            text="🔄 Apply Denoising",
+            command=self._process_audio,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#6c3483",
+            hover_color="#8e44ad",
+            height=32,
+            corner_radius=8,
+            state="disabled"
+        )
+        self.process_btn.pack(side="left", padx=6)
 
     def _create_parameter_panel(self, parent):
         """Create parameter controls panel."""
@@ -1823,26 +1785,12 @@ class SoundDenoiserApp(ctk.CTk):
         )
         self.noise_threshold_slider.pack(fill="x", pady=(0, 5))
 
-        # Buttons Section
+        # Buttons Section (reset only; Apply Denoising moved to transport row)
         buttons_frame = ctk.CTkFrame(scroll_frame, fg_color="#151525", corner_radius=10)
         buttons_frame.pack(fill="x", padx=5, pady=(0, 10))
 
         buttons_inner = ctk.CTkFrame(buttons_frame, fg_color="transparent")
         buttons_inner.pack(fill="x", padx=10, pady=10)
-
-        # Process button
-        self.process_btn = ctk.CTkButton(
-            buttons_inner,
-            text="🔄 Apply Denoising",
-            command=self._process_audio,
-            font=ctk.CTkFont(size=14, weight="bold"),
-            fg_color="#6c3483",
-            hover_color="#8e44ad",
-            height=45,
-            corner_radius=10,
-            state="disabled"
-        )
-        self.process_btn.pack(fill="x", pady=(0, 8))
 
         # Reset button
         self.reset_btn = ctk.CTkButton(
@@ -1995,11 +1943,16 @@ class SoundDenoiserApp(ctk.CTk):
     def _toggle_noise_selection(self, enable: bool):
         """Toggle noise selection mode on the original waveform."""
         self.noise_selection_enabled = enable
-        if self.active_waveform_view == "original":
-            self.waveform_original.enable_selection(enable)
+        if enable:
+            # Force view to original for selecting noise regions, keep position/play state
+            self._set_active_waveform_view("original", preserve_position=True, preserve_play_state=True)
+            self.waveform_original.set_view_mode("waveform")
+            self.waveform_original.enable_selection(True)
         else:
-            # Keep selection off while processed view is visible
             self.waveform_original.enable_selection(False)
+
+        # Reflect state in panel
+        self.noise_profile_panel.set_selection_enabled(enable)
 
         if enable:
             self._set_status("Selection mode ON - drag on waveform to add noise regions")
@@ -2065,6 +2018,8 @@ class SoundDenoiserApp(ctk.CTk):
         self.view_toggle_btn.configure(state="disabled")
         self.play_btn.configure(state="disabled", text="▶")
         self.stop_btn.configure(state="disabled")
+        self.selection_btn.configure(state="disabled", text="Select Noise", fg_color="#1a5276")
+        self.process_btn.configure(state="disabled", text="Apply Denoising")
 
         # Load in background thread
         def load_thread():
@@ -2241,6 +2196,7 @@ class SoundDenoiserApp(ctk.CTk):
         current_view = self.active_waveform_view
         current_player = self._get_player(current_view)
         target_player = self._get_player(view)
+
         current_waveform = self._get_waveform(current_view)
         target_waveform = self._get_waveform(view)
 
@@ -2290,6 +2246,16 @@ class SoundDenoiserApp(ctk.CTk):
         next_view = "processed" if self.active_waveform_view == "original" else "original"
         # Preserve position and play state for a bypass-like toggle
         self._set_active_waveform_view(next_view, preserve_position=True, preserve_play_state=True)
+
+    def _toggle_selection_button(self):
+        """Handle Make Selection button in the transport row."""
+        enable = not self.noise_selection_enabled
+        # Update button styling/text
+        if enable:
+            self.selection_btn.configure(text="Selection ON", fg_color="#ff6b6b", hover_color="#ff8f8f")
+        else:
+            self.selection_btn.configure(text="Make Selection", fg_color="#1a5276", hover_color="#2471a3")
+        self._toggle_noise_selection(enable)
 
     def _toggle_play(self, which: Optional[str] = None):
         """Toggle play/pause for the active waveform (or a specific one)."""
@@ -2386,15 +2352,17 @@ class SoundDenoiserApp(ctk.CTk):
         """Handle audio loaded event."""
         # Update waveform display
         display_audio = audio[0] if audio.ndim == 2 else audio
+        self.track_title = self.input_path.stem if self.input_path else "Audio"
         self.waveform_original.plot_waveform(
             display_audio, sr,
-            "Original Audio (Click to seek)", "#ff9f43"
+            f"{self.track_title} (Original)", "#ff9f43"
         )
-        self.waveform_processed.plot_waveform(None, sr, "Processed Audio (Denoised)", "#00d9ff")
+        self.waveform_processed.plot_waveform(None, sr, f"{self.track_title} (Denoised)", "#00d9ff")
 
         # Selection mode starts OFF - user enables via noise profile panel toggle
         self.noise_selection_enabled = False
         self.waveform_original.enable_selection(False)
+        self.noise_profile_panel.set_selection_enabled(False)
 
         # Load into player
         self.player_original.load(audio, sr)
@@ -2404,6 +2372,7 @@ class SoundDenoiserApp(ctk.CTk):
         self.play_btn.configure(state="normal", text="▶")
         self.stop_btn.configure(state="normal")
         self.view_toggle_btn.configure(state="disabled")
+        self.selection_btn.configure(state="normal")
         self.process_btn.configure(state="normal")
         self.noise_profile_panel.enable_controls(True)
 
@@ -2425,7 +2394,7 @@ class SoundDenoiserApp(ctk.CTk):
         # Update waveform display
         sr = self.denoiser.get_sample_rate()
         display_audio = processed[0] if processed.ndim == 2 else processed
-        self.waveform_processed.plot_waveform(display_audio, sr, "Processed Audio (Denoised)", "#00d9ff")
+        self.waveform_processed.plot_waveform(display_audio, sr, f"{self.track_title} (Denoised)", "#00d9ff")
 
         # Load into player
         self.player_processed.load(processed, sr)
@@ -2444,6 +2413,9 @@ class SoundDenoiserApp(ctk.CTk):
         """Handle noise profile learned from auto-detect."""
         self.selected_noise_region = region
         self.waveform_original.set_noise_region(*region)
+        # Add detected region to selections list/display
+        self.noise_profile_panel.add_selection(*region)
+        self.waveform_original.add_selection_rect(*region)
         self.noise_profile_panel.update_status(profile, region)
         self.noise_profile_panel.enable_learn_button(True)
         self._set_status(f"Auto-detected noise region: {region[0]:.2f}s - {region[1]:.2f}s")
