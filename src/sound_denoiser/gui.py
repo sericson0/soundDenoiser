@@ -259,6 +259,23 @@ class WaveformDisplay(ctk.CTkFrame):
         self.zoom_label.configure(text=f"{self._zoom_level:.0f}x")
         self._redraw_display()
 
+    def get_zoom_state(self) -> tuple:
+        """Return current zoom level and offset."""
+        return (self._zoom_level, self._zoom_offset)
+
+    def set_zoom_state(self, level: float, offset: float):
+        """Apply zoom level/offset with clamping and redraw."""
+        if level < 1.0:
+            level = 1.0
+        # Max zoom matches controls
+        level = min(level, 16.0)
+        # Offset must keep view in range
+        max_offset = max(0.0, 1.0 - 1.0 / level)
+        offset = max(0.0, min(offset, max_offset))
+        self._zoom_level = level
+        self._zoom_offset = offset
+        self._update_zoom()
+
     def get_visible_time_range(self) -> tuple:
         """Get the currently visible time range based on zoom."""
         visible_duration = self._duration / self._zoom_level
@@ -355,61 +372,66 @@ class WaveformDisplay(ctk.CTkFrame):
         padded_end = min(len(audio), end_sample + pad_samples)
         visible_audio = audio[padded_start:padded_end]
 
-        # AGGRESSIVE performance optimization - much larger hop lengths
-        # Target approximately 500-800 time frames max for smooth display
-        target_frames = 600
+        # AGGRESSIVE performance optimization - larger hop lengths and fewer frames
+        # Target approximately 250-400 time frames max for smooth display
+        target_frames = 320
         audio_len = len(visible_audio)
 
         # Calculate hop length to achieve target frames
         ideal_hop = max(512, audio_len // target_frames)
 
-        # Round to power of 2 for efficiency
-        hop_length = 512
-        for h in [512, 1024, 2048, 4096]:
+        # Round to power of 2 for efficiency, favor bigger hops to reduce columns
+        hop_length = 1024
+        for h in [1024, 2048, 4096, 8192]:
             if h >= ideal_hop:
                 hop_length = h
                 break
         else:
-            hop_length = 4096
+            hop_length = 8192
 
-        # FFT size - use smaller for better performance
-        n_fft = min(2048, hop_length * 4)
+        # FFT size - small for speed
+        n_fft = min(1024, hop_length * 2)
 
-        # Downsample audio for very long segments (additional speedup)
-        # BUT limit downsampling to ensure we can still display up to 12kHz
-        # (need effective_sr >= 24000 Hz for 12kHz Nyquist limit)
-        max_downsample = max(1, sr // 24000)  # Ensure effective_sr >= 24kHz
+        # Downsample audio for very long segments (more aggressive for perf)
+        max_downsample = max(1, sr // 16000)  # keep >=16kHz effective for voice/music clarity
 
-        if audio_len > 500000:  # > ~11 seconds at 44.1kHz
-            downsample_factor = min(max_downsample, audio_len // 200000)
-            if downsample_factor > 1:
-                visible_audio = visible_audio[::downsample_factor]
-                effective_sr = sr // downsample_factor
-                hop_length = max(256, hop_length // downsample_factor)
-                n_fft = min(1024, hop_length * 4)
-            else:
-                effective_sr = sr
+        if audio_len > 200000:  # > ~4.5s at 44.1kHz
+            downsample_factor = min(max_downsample, max(2, audio_len // 150000))
+            visible_audio = visible_audio[::downsample_factor]
+            effective_sr = sr // downsample_factor
+            hop_length = max(512, hop_length // downsample_factor)
+            n_fft = min(1024, hop_length * 2)
         else:
             effective_sr = sr
 
-        # Compute spectrogram for visible region only
-        D = librosa.amplitude_to_db(
-            np.abs(librosa.stft(visible_audio, n_fft=n_fft, hop_length=hop_length)),
-            ref=np.max
+        # Compute mel spectrogram for visible region only (fewer bins for speed)
+        max_freq = min(12000, effective_sr / 2)
+        mel_spec = librosa.feature.melspectrogram(
+            y=visible_audio,
+            sr=effective_sr,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            n_mels=128,
+            fmax=max_freq,
+            power=2.0,
         )
+        D = librosa.power_to_db(mel_spec, ref=np.max)
 
         # Calculate time offset for correct positioning
         time_offset = padded_start / sr
         time_end = padded_end / sr
 
-        # Cap display band to keep mel plot readable and avoid undefined variable errors
-        max_freq = min(12000, effective_sr / 2)
-
-        # Plot mel spectrogram - y_axis='mel' uses mel scale (non-linear)
+        # Plot mel spectrogram with native mel scaling
         img = librosa.display.specshow(
-            D, sr=effective_sr, hop_length=hop_length, x_axis='time', y_axis='mel',
-            ax=self.ax, cmap='magma', x_coords=np.linspace(time_offset, time_end, D.shape[1]),
-            fmax=max_freq
+            D,
+            sr=effective_sr,
+            hop_length=hop_length,
+            x_axis='time',
+            y_axis='mel',
+            ax=self.ax,
+            cmap='magma',
+            x_coords=np.linspace(time_offset, time_end, D.shape[1]),
+            fmax=max_freq,
         )
 
         # Set axis limits - X is zoom-dependent
@@ -2201,6 +2223,7 @@ class SoundDenoiserApp(ctk.CTk):
         target_waveform = self._get_waveform(view)
 
         current_mode = current_waveform.get_view_mode()
+        current_zoom = current_waveform.get_zoom_state()
         current_pos = current_player.get_position()
         was_playing = current_player.is_playing()
 
@@ -2219,6 +2242,7 @@ class SoundDenoiserApp(ctk.CTk):
 
         # Keep same view mode (waveform/spectrogram)
         target_waveform.set_view_mode(current_mode)
+        target_waveform.set_zoom_state(*current_zoom)
 
         self.active_waveform_view = view
 
