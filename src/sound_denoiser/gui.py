@@ -18,7 +18,7 @@ import librosa
 import librosa.display
 import threading
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 import queue
 
 # Try to import windnd for drag and drop support (Windows)
@@ -83,29 +83,12 @@ class WaveformDisplay(ctk.CTkFrame):
         self.view_toggle.set("Waveform")
         self.view_toggle.pack(side="left", padx=2)
         
-        # Separator
+        # Selection mode state (controlled externally via enable_selection)
+        self._selection_mode_enabled = False
+        
+        # Separator before zoom controls
         sep1 = ctk.CTkFrame(toggle_frame, width=1, height=20, fg_color="#444444")
         sep1.pack(side="left", padx=8)
-        
-        # Selection mode toggle
-        self._selection_mode_enabled = False
-        self.selection_mode_btn = ctk.CTkButton(
-            toggle_frame,
-            text="[+] Select",
-            command=self._toggle_selection_mode,
-            font=ctk.CTkFont(size=10),
-            width=70,
-            height=24,
-            fg_color="#1a1a2e",
-            hover_color="#252535",
-            border_width=1,
-            border_color="#444444"
-        )
-        self.selection_mode_btn.pack(side="left", padx=2)
-        
-        # Separator
-        sep2 = ctk.CTkFrame(toggle_frame, width=1, height=20, fg_color="#444444")
-        sep2.pack(side="left", padx=8)
         
         # Zoom controls
         self._zoom_level = 1.0
@@ -233,24 +216,6 @@ class WaveformDisplay(ctk.CTkFrame):
         if new_mode != self._view_mode:
             self._view_mode = new_mode
             self._redraw_display()
-    
-    def _toggle_selection_mode(self):
-        """Toggle between seek mode and selection mode."""
-        self._selection_mode_enabled = not self._selection_mode_enabled
-        self.enable_selection(self._selection_mode_enabled)
-        
-        if self._selection_mode_enabled:
-            self.selection_mode_btn.configure(
-                fg_color="#ff6b6b",
-                hover_color="#ff8f8f",
-                text="[*] Select"
-            )
-        else:
-            self.selection_mode_btn.configure(
-                fg_color="#1a1a2e",
-                hover_color="#252535",
-                text="[+] Select"
-            )
     
     def _zoom_in(self):
         """Zoom in on the waveform."""
@@ -545,10 +510,13 @@ class WaveformDisplay(ctk.CTkFrame):
             self.on_region_select(xmin, xmax)
             
     def _draw_selection_rect(self, start: float, end: float):
-        """Draw selection rectangle on waveform."""
+        """Draw selection rectangle on waveform (legacy - draws current selection)."""
         # Remove existing rectangle
         if self.selection_rect:
-            self.selection_rect.remove()
+            try:
+                self.selection_rect.remove()
+            except:
+                pass
             self.selection_rect = None
             
         # Draw new rectangle
@@ -558,6 +526,40 @@ class WaveformDisplay(ctk.CTkFrame):
             color='#ff6b6b',
             label='Noise Region'
         )
+        self.canvas.draw_idle()
+    
+    def add_selection_rect(self, start: float, end: float):
+        """Add a selection rectangle without removing existing ones."""
+        rect = self.ax.axvspan(
+            start, end,
+            alpha=0.3,
+            color='#ff6b6b'
+        )
+        if not hasattr(self, '_selection_rects'):
+            self._selection_rects = []
+        self._selection_rects.append(rect)
+        self.canvas.draw_idle()
+    
+    def clear_selection(self):
+        """Clear all selection rectangles."""
+        # Clear main selection rect
+        if self.selection_rect:
+            try:
+                self.selection_rect.remove()
+            except:
+                pass
+            self.selection_rect = None
+        
+        # Clear all additional selection rects
+        if hasattr(self, '_selection_rects'):
+            for rect in self._selection_rects:
+                try:
+                    rect.remove()
+                except:
+                    pass
+            self._selection_rects = []
+        
+        self._selected_region = None
         self.canvas.draw_idle()
         
     def set_noise_region(self, start: float, end: float):
@@ -889,7 +891,7 @@ class ParameterSlider(ctk.CTkFrame):
 
 
 class NoiseProfilePanel(ctk.CTkFrame):
-    """Panel for noise profile learning controls."""
+    """Panel for noise profile learning controls with multiple selection support."""
     
     def __init__(
         self,
@@ -898,6 +900,8 @@ class NoiseProfilePanel(ctk.CTkFrame):
         on_learn_auto,
         on_clear,
         on_toggle_use,
+        on_toggle_selection=None,
+        on_remove_selection=None,
         **kwargs
     ):
         super().__init__(master, fg_color="#151525", corner_radius=10, **kwargs)
@@ -906,6 +910,11 @@ class NoiseProfilePanel(ctk.CTkFrame):
         self.on_learn_auto = on_learn_auto
         self.on_clear = on_clear
         self.on_toggle_use = on_toggle_use
+        self.on_toggle_selection = on_toggle_selection
+        self.on_remove_selection = on_remove_selection
+        self._selection_enabled = False
+        self._selections = []  # List of (start, end) tuples
+        self._selection_widgets = []  # List of widget references for cleanup
         
         self._setup_ui()
         
@@ -914,7 +923,7 @@ class NoiseProfilePanel(ctk.CTkFrame):
         # Title
         title = ctk.CTkLabel(
             self,
-            text="🎯 Noise Profile Learning",
+            text="Noise Profile Learning",
             font=ctk.CTkFont(size=14, weight="bold"),
             text_color="#ff6b6b"
         )
@@ -923,7 +932,7 @@ class NoiseProfilePanel(ctk.CTkFrame):
         # Description
         desc = ctk.CTkLabel(
             self,
-            text="Select a region with only noise (hiss) for better results",
+            text="Select regions with only noise (hiss) for better results",
             font=ctk.CTkFont(size=10),
             text_color="#888888",
             wraplength=200
@@ -934,25 +943,99 @@ class NoiseProfilePanel(ctk.CTkFrame):
         sep = ctk.CTkFrame(self, height=1, fg_color="#333333")
         sep.pack(fill="x", padx=10, pady=10)
         
+        # Make Selection button at TOP
+        self.select_mode_btn = ctk.CTkButton(
+            self,
+            text="Make Selection",
+            command=self._toggle_selection,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#1a5276",
+            hover_color="#2471a3",
+            height=36,
+            corner_radius=6,
+            state="disabled"
+        )
+        self.select_mode_btn.pack(fill="x", padx=10, pady=(0, 5))
+        
+        self.select_hint = ctk.CTkLabel(
+            self,
+            text="Click to enable, then drag on waveform",
+            font=ctk.CTkFont(size=9),
+            text_color="#666666"
+        )
+        self.select_hint.pack(padx=10, anchor="w")
+        
+        # Selections list section
+        self.selections_frame = ctk.CTkFrame(self, fg_color="#1a2a3a", corner_radius=6)
+        self.selections_frame.pack(fill="x", padx=10, pady=10)
+        
+        self.selections_title = ctk.CTkLabel(
+            self.selections_frame,
+            text="Selected Regions (0):",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color="#aaaaaa"
+        )
+        self.selections_title.pack(pady=(8, 5), padx=10, anchor="w")
+        
+        # Container for selection items
+        self.selections_list = ctk.CTkFrame(self.selections_frame, fg_color="transparent")
+        self.selections_list.pack(fill="x", padx=5, pady=(0, 8))
+        
+        self.no_selections_label = ctk.CTkLabel(
+            self.selections_list,
+            text="No regions selected",
+            font=ctk.CTkFont(size=10),
+            text_color="#555555"
+        )
+        self.no_selections_label.pack(pady=5)
+        
+        # Separator
+        sep2 = ctk.CTkFrame(self, height=1, fg_color="#333333")
+        sep2.pack(fill="x", padx=10, pady=5)
+        
+        # Buttons frame
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=10, pady=(0, 10))
+        
+        # Learn from selections button
+        self.learn_btn = ctk.CTkButton(
+            btn_frame,
+            text="Learn from Selections",
+            command=self.on_learn_manual,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="#2d5a27",
+            hover_color="#3d7a37",
+            height=32,
+            corner_radius=6,
+            state="disabled"
+        )
+        self.learn_btn.pack(fill="x", pady=(0, 5))
+        
+        # Auto-detect button
+        self.auto_btn = ctk.CTkButton(
+            btn_frame,
+            text="Auto Detect Noise",
+            command=self.on_learn_auto,
+            font=ctk.CTkFont(size=11),
+            fg_color="#444444",
+            hover_color="#555555",
+            height=28,
+            corner_radius=6,
+            state="disabled"
+        )
+        self.auto_btn.pack(fill="x", pady=(0, 8))
+        
         # Status indicator
         self.status_frame = ctk.CTkFrame(self, fg_color="#1a2a3a", corner_radius=6)
         self.status_frame.pack(fill="x", padx=10, pady=(0, 10))
         
         self.status_label = ctk.CTkLabel(
             self.status_frame,
-            text="⚪ No noise profile learned",
+            text="No noise profile learned",
             font=ctk.CTkFont(size=11),
             text_color="#888888"
         )
         self.status_label.pack(pady=8, padx=10, anchor="w")
-        
-        self.region_label = ctk.CTkLabel(
-            self.status_frame,
-            text="",
-            font=ctk.CTkFont(size=10),
-            text_color="#666666"
-        )
-        self.region_label.pack(pady=(0, 8), padx=10, anchor="w")
         
         # Use profile toggle
         self.use_profile_var = ctk.BooleanVar(value=False)
@@ -967,69 +1050,139 @@ class NoiseProfilePanel(ctk.CTkFrame):
             button_hover_color="#ff8f8f",
             state="disabled"
         )
-        self.use_profile_switch.pack(pady=(0, 10), padx=10, anchor="w")
-        
-        # Buttons frame
-        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.pack(fill="x", padx=10, pady=(0, 10))
-        
-        # Auto-detect button
-        self.auto_btn = ctk.CTkButton(
-            btn_frame,
-            text="🔍 Auto Detect",
-            command=self.on_learn_auto,
-            font=ctk.CTkFont(size=11, weight="bold"),
-            fg_color="#2d5a27",
-            hover_color="#3d7a37",
-            height=32,
-            corner_radius=6,
-            state="disabled"
-        )
-        self.auto_btn.pack(fill="x", pady=(0, 5))
-        
-        # Manual selection instruction
-        self.select_label = ctk.CTkLabel(
-            btn_frame,
-            text="Or click & drag on waveform to select",
-            font=ctk.CTkFont(size=10),
-            text_color="#666666"
-        )
-        self.select_label.pack(pady=(5, 5))
-        
-        # Learn from selection button
-        self.learn_btn = ctk.CTkButton(
-            btn_frame,
-            text="📝 Learn from Selection",
-            command=self.on_learn_manual,
-            font=ctk.CTkFont(size=11, weight="bold"),
-            fg_color="#1a5276",
-            hover_color="#2471a3",
-            height=32,
-            corner_radius=6,
-            state="disabled"
-        )
-        self.learn_btn.pack(fill="x", pady=(0, 5))
+        self.use_profile_switch.pack(pady=(0, 5), padx=10, anchor="w")
         
         # Clear button
         self.clear_btn = ctk.CTkButton(
-            btn_frame,
-            text="✖ Clear Profile",
+            self,
+            text="Clear All",
             command=self._on_clear,
-            font=ctk.CTkFont(size=11),
+            font=ctk.CTkFont(size=10),
             fg_color="#555555",
             hover_color="#777777",
-            height=28,
+            height=24,
             corner_radius=6,
             state="disabled"
         )
-        self.clear_btn.pack(fill="x")
+        self.clear_btn.pack(fill="x", padx=10, pady=(0, 10))
         
     def _on_toggle(self):
         """Handle use profile toggle."""
         self.on_toggle_use(self.use_profile_var.get())
+    
+    def _toggle_selection(self):
+        """Toggle selection mode on the waveform."""
+        self._selection_enabled = not self._selection_enabled
+        
+        if self._selection_enabled:
+            self.select_mode_btn.configure(
+                text="Selection Mode ON",
+                fg_color="#ff6b6b",
+                hover_color="#ff8f8f"
+            )
+            self.select_hint.configure(
+                text="Drag on waveform to add region",
+                text_color="#ff6b6b"
+            )
+        else:
+            self.select_mode_btn.configure(
+                text="Make Selection",
+                fg_color="#1a5276",
+                hover_color="#2471a3"
+            )
+            self.select_hint.configure(
+                text="Click to enable, then drag on waveform",
+                text_color="#666666"
+            )
+        
+        if self.on_toggle_selection:
+            self.on_toggle_selection(self._selection_enabled)
+    
+    def add_selection(self, start: float, end: float):
+        """Add a selection to the list."""
+        self._selections.append((start, end))
+        self._update_selections_display()
+        self._update_learn_button()
+    
+    def remove_selection(self, index: int):
+        """Remove a selection by index."""
+        if 0 <= index < len(self._selections):
+            removed = self._selections.pop(index)
+            self._update_selections_display()
+            self._update_learn_button()
+            if self.on_remove_selection:
+                self.on_remove_selection(index, removed)
+    
+    def clear_selections(self):
+        """Clear all selections."""
+        self._selections = []
+        self._update_selections_display()
+        self._update_learn_button()
+    
+    def get_selections(self) -> List[Tuple[float, float]]:
+        """Get all current selections."""
+        return self._selections.copy()
+    
+    def _update_selections_display(self):
+        """Update the selections list display."""
+        # Clear existing widgets
+        for widget in self._selection_widgets:
+            widget.destroy()
+        self._selection_widgets = []
+        
+        # Update title
+        count = len(self._selections)
+        self.selections_title.configure(text=f"Selected Regions ({count}):")
+        
+        if count == 0:
+            self.no_selections_label.pack(pady=5)
+        else:
+            self.no_selections_label.pack_forget()
+            
+            for i, (start, end) in enumerate(self._selections):
+                duration = end - start
+                
+                # Create row frame
+                row = ctk.CTkFrame(self.selections_list, fg_color="transparent")
+                row.pack(fill="x", pady=1)
+                self._selection_widgets.append(row)
+                
+                # Selection label
+                label = ctk.CTkLabel(
+                    row,
+                    text=f"{i+1}. {start:.2f}s - {end:.2f}s ({duration:.2f}s)",
+                    font=ctk.CTkFont(size=10),
+                    text_color="#aaaaaa"
+                )
+                label.pack(side="left", padx=(5, 0))
+                
+                # Delete button
+                del_btn = ctk.CTkButton(
+                    row,
+                    text="X",
+                    command=lambda idx=i: self.remove_selection(idx),
+                    font=ctk.CTkFont(size=10, weight="bold"),
+                    fg_color="#662222",
+                    hover_color="#883333",
+                    width=24,
+                    height=20,
+                    corner_radius=4
+                )
+                del_btn.pack(side="right", padx=5)
+    
+    def _update_learn_button(self):
+        """Update learn button state based on selections."""
+        if len(self._selections) > 0:
+            self.learn_btn.configure(state="normal")
+            total_duration = sum(end - start for start, end in self._selections)
+            self.learn_btn.configure(text=f"Learn from {len(self._selections)} Selection(s)")
+        else:
+            self.learn_btn.configure(state="disabled")
+            self.learn_btn.configure(text="Learn from Selections")
         
     def _on_clear(self):
         """Handle clear button."""
+        self.clear_selections()
         self.on_clear()
         self.update_status(None)
         
@@ -1037,33 +1190,32 @@ class NoiseProfilePanel(ctk.CTkFrame):
         """Enable or disable controls."""
         state = "normal" if enable else "disabled"
         self.auto_btn.configure(state=state)
+        self.select_mode_btn.configure(state=state)
         
     def enable_learn_button(self, enable: bool = True):
-        """Enable or disable the learn button."""
-        state = "normal" if enable else "disabled"
-        self.learn_btn.configure(state=state)
+        """Enable or disable the learn button based on selections."""
+        # Only enable if there are selections
+        if enable and len(self._selections) > 0:
+            self.learn_btn.configure(state="normal")
+        elif not enable:
+            self.learn_btn.configure(state="disabled")
         
-    def update_status(self, profile: Optional[NoiseProfile], region: Optional[Tuple[float, float]] = None):
+    def update_status(self, profile: Optional[NoiseProfile], regions: Optional[List[Tuple[float, float]]] = None):
         """Update the status display."""
         if profile is not None:
             self.status_label.configure(
-                text="🟢 Noise profile learned",
+                text="Noise profile learned",
                 text_color="#4ade80"
             )
-            if region:
-                self.region_label.configure(
-                    text=f"Region: {region[0]:.2f}s - {region[1]:.2f}s ({region[1]-region[0]:.2f}s)"
-                )
             self.use_profile_switch.configure(state="normal")
             self.use_profile_var.set(True)
             self.clear_btn.configure(state="normal")
             self._on_toggle()  # Trigger callback
         else:
             self.status_label.configure(
-                text="⚪ No noise profile learned",
+                text="No noise profile learned",
                 text_color="#888888"
             )
-            self.region_label.configure(text="")
             self.use_profile_switch.configure(state="disabled")
             self.use_profile_var.set(False)
             self.clear_btn.configure(state="disabled")
@@ -1378,6 +1530,8 @@ class SoundDenoiserApp(ctk.CTk):
             on_learn_auto=self._learn_noise_profile_auto,
             on_clear=self._clear_noise_profile,
             on_toggle_use=self._toggle_use_profile,
+            on_toggle_selection=self._toggle_noise_selection,
+            on_remove_selection=self._on_remove_noise_selection,
         )
         self.noise_profile_panel.pack(fill="x", padx=5, pady=(5, 10))
         
@@ -1708,29 +1862,35 @@ class SoundDenoiserApp(ctk.CTk):
         self.file_label.pack(side="right", padx=15, pady=5)
         
     def _on_noise_region_selected(self, start: float, end: float):
-        """Handle noise region selection from waveform."""
-        self.selected_noise_region = (start, end)
-        self.noise_profile_panel.enable_learn_button(True)
-        self._set_status(f"Noise region selected: {start:.2f}s - {end:.2f}s ({end-start:.2f}s)")
+        """Handle noise region selection from waveform - adds to multiple selections."""
+        # Add to the panel's selections list
+        self.noise_profile_panel.add_selection(start, end)
+        count = len(self.noise_profile_panel.get_selections())
+        self._set_status(f"Added noise region: {start:.2f}s - {end:.2f}s (Total: {count} selection(s))")
         
     def _learn_noise_profile_manual(self):
-        """Learn noise profile from manually selected region."""
-        if self.selected_noise_region is None:
+        """Learn noise profile from manually selected regions."""
+        selections = self.noise_profile_panel.get_selections()
+        
+        if not selections:
             messagebox.showwarning(
                 "No Selection",
-                "Please select a noise region on the waveform first.\n\n"
-                "Click and drag on the original waveform to select a region "
-                "that contains only noise (no music/vocals)."
+                "Please select noise region(s) on the waveform first.\n\n"
+                "1. Click 'Make Selection' button\n"
+                "2. Click and drag on the waveform to select regions with only noise\n"
+                "3. You can add multiple selections"
             )
             return
-            
-        start, end = self.selected_noise_region
         
         try:
-            self._set_status("Learning noise profile...")
-            profile = self.denoiser.learn_noise_profile(start, end)
-            self.noise_profile_panel.update_status(profile, (start, end))
-            self._set_status(f"Noise profile learned from {start:.2f}s - {end:.2f}s")
+            self._set_status(f"Learning noise profile from {len(selections)} region(s)...")
+            
+            # Learn from all selections combined
+            profile = self.denoiser.learn_noise_profile_from_regions(selections)
+            self.noise_profile_panel.update_status(profile, selections)
+            
+            total_duration = sum(end - start for start, end in selections)
+            self._set_status(f"Noise profile learned from {len(selections)} region(s) ({total_duration:.2f}s total)")
             
             # Auto-reprocess
             if self.denoiser.get_original() is not None:
@@ -1756,12 +1916,11 @@ class SoundDenoiserApp(ctk.CTk):
         threading.Thread(target=auto_learn_thread, daemon=True).start()
         
     def _clear_noise_profile(self):
-        """Clear the learned noise profile."""
+        """Clear the learned noise profile and all selections."""
         self.denoiser.clear_noise_profile()
+        self.waveform_original.clear_selection()
         self.waveform_original.clear_noise_region()
-        self.selected_noise_region = None
-        self.noise_profile_panel.enable_learn_button(False)
-        self._set_status("Noise profile cleared - using adaptive estimation")
+        self._set_status("Noise profile and selections cleared")
         
     def _toggle_use_profile(self, use: bool):
         """Toggle use of learned noise profile."""
@@ -1771,6 +1930,26 @@ class SoundDenoiserApp(ctk.CTk):
             self._set_status("Using learned noise profile for denoising")
         else:
             self._set_status("Using adaptive noise estimation")
+    
+    def _toggle_noise_selection(self, enable: bool):
+        """Toggle noise selection mode on the original waveform."""
+        self.waveform_original.enable_selection(enable)
+        
+        if enable:
+            self._set_status("Selection mode ON - drag on waveform to add noise regions")
+        else:
+            self._set_status("Selection mode OFF - click on waveform to seek")
+    
+    def _on_remove_noise_selection(self, index: int, region: Tuple[float, float]):
+        """Handle removal of a noise selection."""
+        # Update the waveform display to remove the visual selection
+        self.waveform_original.clear_selection()
+        # Redraw all remaining selections
+        selections = self.noise_profile_panel.get_selections()
+        for start, end in selections:
+            self.waveform_original.add_selection_rect(start, end)
+        count = len(selections)
+        self._set_status(f"Removed selection. {count} region(s) remaining.")
         
     def _load_audio(self):
         """Open file dialog to load audio file."""
@@ -2091,12 +2270,12 @@ class SoundDenoiserApp(ctk.CTk):
         display_audio = audio[0] if audio.ndim == 2 else audio
         self.waveform_original.plot_waveform(
             display_audio, sr,
-            "Original Audio (Click to seek, drag to select noise)", "#ff9f43"
+            "Original Audio (Click to seek)", "#ff9f43"
         )
         self.waveform_processed.plot_waveform(None, sr, "Processed Audio (Denoised)", "#00d9ff")
         
-        # Enable noise region selection
-        self.waveform_original.enable_selection(True)
+        # Selection mode starts OFF - user enables via noise profile panel toggle
+        self.waveform_original.enable_selection(False)
         
         # Load into player
         self.player_original.load(audio, sr)

@@ -209,6 +209,78 @@ class AudioDenoiser:
         self._use_learned_profile = True
         return self._noise_profile
     
+    def learn_noise_profile_from_regions(self, regions: List[Tuple[float, float]]) -> NoiseProfile:
+        """
+        Learn noise profile from multiple regions of the audio.
+        
+        Combines spectral statistics from all regions for a more robust noise estimate.
+        
+        Args:
+            regions: List of (start_time, end_time) tuples in seconds
+            
+        Returns:
+            NoiseProfile containing learned noise characteristics
+        """
+        if self._audio is None or self._sr is None:
+            raise ValueError("No audio loaded. Call load_audio() first.")
+        
+        if not regions:
+            raise ValueError("No regions provided.")
+        
+        all_noise_clips = []
+        all_stft_mags = []
+        total_duration = 0.0
+        
+        for start_time, end_time in regions:
+            start_sample = int(start_time * self._sr)
+            end_sample = int(end_time * self._sr)
+            start_sample = max(0, start_sample)
+            end_sample = min(self._audio.shape[1], end_sample)
+            
+            if end_sample <= start_sample:
+                continue
+            
+            # Extract noise region (use first channel for profile)
+            noise_clip = self._audio[0, start_sample:end_sample].copy()
+            all_noise_clips.append(noise_clip)
+            
+            # Compute STFT for this region
+            stft = librosa.stft(noise_clip, n_fft=self.N_FFT, hop_length=self.HOP_LENGTH)
+            stft_mag = np.abs(stft)
+            all_stft_mags.append(stft_mag)
+            
+            total_duration += end_time - start_time
+        
+        if not all_stft_mags:
+            raise ValueError("No valid audio data in the selected regions.")
+        
+        # Combine all STFT magnitudes horizontally (along time axis)
+        combined_stft_mag = np.concatenate(all_stft_mags, axis=1)
+        
+        # Compute combined spectral statistics
+        spectral_mean = np.mean(combined_stft_mag, axis=1)
+        spectral_std = np.std(combined_stft_mag, axis=1)
+        
+        # Combine noise clips for the profile
+        combined_noise_clip = np.concatenate(all_noise_clips)
+        
+        # Use first region's times for reference
+        first_start = regions[0][0]
+        last_end = regions[-1][1]
+        
+        self._noise_profile = NoiseProfile(
+            noise_clip=combined_noise_clip,
+            spectral_mean=spectral_mean,
+            spectral_std=spectral_std,
+            sample_rate=self._sr,
+            duration=total_duration,
+            start_time=first_start,
+            end_time=last_end,
+        )
+        
+        self._use_learned_profile = True
+        return self._noise_profile
+    
     def auto_detect_noise_region(self, min_duration: float = 0.5) -> Tuple[float, float]:
         """
         Automatically detect a region with noise but without music or silence.
