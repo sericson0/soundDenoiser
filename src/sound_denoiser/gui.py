@@ -550,18 +550,6 @@ class SoundDenoiserApp(ctk.CTk):
         )
         self.spectral_floor_slider.pack(fill="x", pady=(0, 12))
 
-        # Low Cut Frequency (rumble removal)
-        self.low_cut_slider = ParameterSlider(
-            fine_tune_inner,
-            label="Low Cut (Rumble)",
-            from_=0.0,
-            to=200.0,
-            default=0.0,
-            unit="Hz",
-            command=self._on_parameter_change
-        )
-        self.low_cut_slider.pack(fill="x", pady=(0, 12))
-
         # Noise Threshold (noise/signal boundary)
         self.noise_threshold_slider = ParameterSlider(
             fine_tune_inner,
@@ -909,7 +897,6 @@ class SoundDenoiserApp(ctk.CTk):
             hiss_start_freq=self.hiss_start_slider.get(),
             hiss_peak_freq=self.hiss_peak_slider.get(),
             spectral_floor=self.spectral_floor_slider.get() / 100.0,
-            low_cut_freq=self.low_cut_slider.get(),
             noise_threshold=self.noise_threshold_slider.get(),
         )
 
@@ -938,7 +925,6 @@ class SoundDenoiserApp(ctk.CTk):
         noise_thresh = self.noise_threshold_slider.get() if hasattr(self, "noise_threshold_slider") else 1.0
         hiss_start = self.hiss_start_slider.get() if hasattr(self, "hiss_start_slider") else 2000.0
         hiss_peak = self.hiss_peak_slider.get() if hasattr(self, "hiss_peak_slider") else 6000.0
-        low_cut = self.low_cut_slider.get() if hasattr(self, "low_cut_slider") else 0.0
         hf_emphasis = self.hf_emphasis_slider.get() if hasattr(self, "hf_emphasis_slider") else 1.0
 
         # Baseline slope: gently rising then falling in highs
@@ -946,11 +932,6 @@ class SoundDenoiserApp(ctk.CTk):
 
         # Global lift/drop from noise threshold (UI now lifts the line when threshold increases)
         levels = base_levels + (noise_thresh - 1.0) * 6.0
-
-        # Low-cut: strongly attenuate below low_cut
-        if low_cut > 0:
-            low_mask = freqs < low_cut
-            levels[low_mask] = np.minimum(levels[low_mask], -90.0)
 
         # Hiss band emphasis: dip around hiss peak scaled by hf_emphasis
         band_mask = (freqs >= max(200.0, hiss_start * 0.6)) & (freqs <= hiss_peak * 1.4)
@@ -1002,9 +983,6 @@ class SoundDenoiserApp(ctk.CTk):
         floor_relevant = method_name in ["Spectral Subtraction", "Wiener Filter", "Combined (All Methods)", "Spectral Gating (Learned Profile)"]
         self.spectral_floor_slider.label.configure(text_color=active_color if floor_relevant else dim_color)
 
-        # Low cut - relevant for all methods (always applied post-processing)
-        self.low_cut_slider.label.configure(text_color=active_color)
-
         # Noise threshold - relevant for all spectral methods
         threshold_relevant = True
         self.noise_threshold_slider.label.configure(text_color=active_color if threshold_relevant else dim_color)
@@ -1027,7 +1005,6 @@ class SoundDenoiserApp(ctk.CTk):
         self.hiss_start_slider.set(2000.0)
         self.hiss_peak_slider.set(6000.0)
         self.spectral_floor_slider.set(5.0)
-        self.low_cut_slider.set(0.0)
         self.noise_threshold_slider.set(1.0)
         # Method default
         self.method_dropdown.set("Spectral Subtraction")
