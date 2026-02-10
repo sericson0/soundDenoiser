@@ -384,7 +384,6 @@ class SoundDenoiserApp(ctk.CTk):
         self._method_names = {
             "Spectral Subtraction": DenoiseMethod.SPECTRAL_SUBTRACTION,
             "Wiener Filter": DenoiseMethod.WIENER,
-            "Multi-Band Adaptive": DenoiseMethod.MULTIBAND,
             "Combined (All Methods)": DenoiseMethod.COMBINED,
             "Shellac/78rpm (Hiss+Groove)": DenoiseMethod.SHELLAC,
             "Spectral Gating (Learned Profile)": DenoiseMethod.SPECTRAL_GATING,
@@ -409,7 +408,6 @@ class SoundDenoiserApp(ctk.CTk):
         self._method_descriptions = {
             "Spectral Subtraction": "Best for: General hiss. Key params: Strength, Noise Threshold, HF Reduction",
             "Wiener Filter": "Best for: Broadband noise. Key params: Strength, Noise Threshold",
-            "Multi-Band Adaptive": "Best for: Complex noise. Key params: Strength, Noise Threshold",
             "Combined (All Methods)": "Best for: Heavy noise. Uses Spectral + Wiener + Threshold",
             "Shellac/78rpm (Hiss+Groove)": "Best for: Old 78s. Key params: Strength, Noise Threshold",
             "Spectral Gating (Learned Profile)": "Best with learned profile. Soft gate based on noise floor",
@@ -957,8 +955,8 @@ class SoundDenoiserApp(ctk.CTk):
         dim_color = "#666666"
         active_color = "#cccccc"
 
-        # HF slider is less relevant for Multiband (has own bands) and Shellac (auto-tuned)
-        hf_relevant = method_name not in ["Multi-Band Adaptive", "Shellac/78rpm (Hiss+Groove)"]
+        # HF slider is less relevant for Shellac (auto-tuned)
+        hf_relevant = method_name not in ["Shellac/78rpm (Hiss+Groove)"]
         self.hf_emphasis_slider.label.configure(text_color=active_color if hf_relevant else dim_color)
 
         # Hiss frequency sliders - relevant for Spectral, Wiener, Combined, Spectral Gating

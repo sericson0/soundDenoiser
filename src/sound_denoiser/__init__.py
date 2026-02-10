@@ -8,7 +8,7 @@ Multiple denoising methods are available:
 - spectral gating (best with learned noise profile)
 - spectral subtraction
 - Wiener filtering
-- multi-band adaptive reduction
+- shellac/78rpm optimized reduction
 - combined approach
 """
 

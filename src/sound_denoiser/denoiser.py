@@ -4,8 +4,8 @@ Core audio denoising module using multiple techniques for hiss removal.
 Implements:
 - Spectral gating with learned noise profiles
 - Spectral subtraction for broadband noise
-- Multi-band adaptive noise reduction
 - Wiener filtering for optimal noise estimation
+- Shellac/78rpm optimized reduction
 - High-frequency focused processing where hiss typically lives
 - Noise profile learning for targeted removal
 - Perceptual weighting to preserve audio quality
@@ -37,7 +37,6 @@ class DenoiseMethod(Enum):
     """Available denoising methods."""
     SPECTRAL_SUBTRACTION = "spectral"    # Classic spectral subtraction (good for shellac/vinyl)
     WIENER = "wiener"                    # Wiener filtering (good for broadband noise)
-    MULTIBAND = "multiband"              # Multi-band adaptive reduction
     COMBINED = "combined"                # Combine multiple methods
     SHELLAC = "shellac"                  # Optimized for 78rpm shellac records (hiss + groove)
     SPECTRAL_GATING = "gating"           # Pure spectral gating using learned noise profile
@@ -66,7 +65,7 @@ class AudioDenoiser:
     Multi-technique denoiser for removing hiss from audio recordings.
 
     Features:
-    - Multiple denoising algorithms (spectral gating, spectral subtraction, Wiener, multiband)
+    - Multiple denoising algorithms (spectral gating, spectral subtraction, Wiener, shellac)
     - Spectral gating with learned noise profiles
     - High-frequency emphasis for hiss targeting (2kHz-20kHz)
     - Transient preservation
@@ -77,9 +76,6 @@ class AudioDenoiser:
     # STFT parameters
     N_FFT = 2048
     HOP_LENGTH = 512
-
-    # Frequency bands for multi-band processing (Hz)
-    BAND_EDGES = [0, 300, 1000, 3000, 8000, 20000]
 
     # Shellac-specific frequency bands (Hz) - optimized for 78rpm records
     SHELLAC_BANDS = [0, 100, 300, 800, 2000, 4000, 8000, 16000]
@@ -598,74 +594,12 @@ class AudioDenoiser:
 
         return librosa.istft(stft_clean, hop_length=self.HOP_LENGTH, length=len(audio))
 
-    def _multiband_reduction(self, audio: np.ndarray) -> np.ndarray:
-        """
-        Multi-band adaptive noise reduction.
-
-        Splits the audio into frequency bands and applies different
-        reduction levels based on the noise characteristics in each band.
-        """
-        # Compute STFT
-        stft = librosa.stft(audio, n_fft=self.N_FFT, hop_length=self.HOP_LENGTH)
-        stft_mag = np.abs(stft)
-        stft_phase = np.angle(stft)
-
-        # Get frequency bins
-        freqs = librosa.fft_frequencies(sr=self._sr, n_fft=self.N_FFT)
-
-        # Get noise estimate per band
-        if self._use_learned_profile and self._noise_profile is not None:
-            noise_estimate = self._noise_profile.spectral_mean
-        else:
-            noise_estimate = self._estimate_noise_spectrum(stft_mag)
-
-        # Apply noise threshold - multiplies the noise estimate to define the boundary
-        noise_estimate = noise_estimate * self.noise_threshold
-
-        # Create gain matrix
-        gain = np.ones_like(stft_mag)
-
-        # Process each band
-        for i in range(len(self.BAND_EDGES) - 1):
-            low_freq = self.BAND_EDGES[i]
-            high_freq = self.BAND_EDGES[i + 1]
-
-            # Find frequency bin indices for this band
-            band_mask = (freqs >= low_freq) & (freqs < high_freq)
-
-            if not np.any(band_mask):
-                continue
-
-            # Estimate noise level in this band
-            band_noise = np.mean(noise_estimate[band_mask])
-
-            # Higher reduction for higher frequency bands (where hiss lives)
-            freq_factor = 1.0 + (i / (len(self.BAND_EDGES) - 1)) * (self.high_freq_emphasis - 1.0)
-
-            # Calculate band-specific reduction
-            for j, is_in_band in enumerate(band_mask):
-                if is_in_band:
-                    # Calculate SNR for each frame
-                    snr = stft_mag[j, :] / (band_noise + 1e-10)
-
-                    # Adaptive gain based on SNR
-                    band_gain = np.clip(1 - (freq_factor * self.noise_reduction_strength) / (snr + 1), 0.1, 1.0)
-                    gain[j, :] = band_gain
-
-        # Smooth gain temporally
-        gain = uniform_filter1d(gain, size=5, axis=1)
-
-        # Apply gain
-        stft_clean = stft_mag * gain * np.exp(1j * stft_phase)
-
-        return librosa.istft(stft_clean, hop_length=self.HOP_LENGTH, length=len(audio))
-
     def _combined_reduction(self, audio: np.ndarray) -> np.ndarray:
         """
         Combined approach using multiple methods.
 
         Applies spectral subtraction first, then Wiener filtering,
-        and finally multi-band processing for optimal results.
+        and finally high-frequency reduction for optimal results.
         """
         # Stage 1: Gentle spectral subtraction
         temp_strength = self.noise_reduction_strength
@@ -786,9 +720,6 @@ class AudioDenoiser:
             denoised = self._wiener_filter(audio_channel)
             if self.high_freq_emphasis > 1.0:
                 denoised = self._apply_high_frequency_reduction(denoised, self._sr)
-
-        elif self.method == DenoiseMethod.MULTIBAND:
-            denoised = self._multiband_reduction(audio_channel)
 
         elif self.method == DenoiseMethod.COMBINED:
             denoised = self._combined_reduction(audio_channel)
