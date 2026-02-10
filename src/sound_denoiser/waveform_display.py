@@ -20,7 +20,6 @@ class WaveformDisplay(ctk.CTkFrame):
         master,
         on_region_select=None,
         on_seek=None,
-        on_threshold_change=None,
         waveform_color: str = "#00d9ff",
         **kwargs,
     ):
@@ -28,7 +27,6 @@ class WaveformDisplay(ctk.CTkFrame):
 
         self.on_region_select = on_region_select
         self.on_seek = on_seek
-        self.on_threshold_change = on_threshold_change
         self._duration = 0.0
         self._selection_enabled = False
         self._selected_region: Optional[Tuple[float, float]] = None
@@ -64,14 +62,10 @@ class WaveformDisplay(ctk.CTkFrame):
         # Selection mode state (controlled externally via enable_selection)
         self._selection_mode_enabled = False
 
-        # Spectrum/frequency threshold curve (freq Hz, level dB)
-        self.threshold_freqs = np.array([30, 80, 150, 300, 600, 1200, 2400, 4800, 8000, 12000, 16000], dtype=float)
-        self.threshold_levels = np.array([-70, -65, -60, -55, -52, -50, -48, -48, -52, -58, -65], dtype=float)
-        self._dragging_threshold_idx: Optional[int] = None
+        # Noise floor visualization
         self.noise_floor_freqs: Optional[np.ndarray] = None
         self.noise_floor_levels: Optional[np.ndarray] = None
         self.noise_threshold_mult: float = 1.0
-        self.threshold_smooth_plot = None
         self.noise_floor_plot = None
         self.noise_threshold_plot = None
         self.noise_fill = None
