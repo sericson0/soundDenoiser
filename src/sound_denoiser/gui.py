@@ -484,18 +484,6 @@ class SoundDenoiserApp(ctk.CTk):
         )
         self.hf_emphasis_slider.pack(fill="x", pady=(0, 12))
 
-        # Smoothing Factor
-        self.smoothing_slider = ParameterSlider(
-            params_inner,
-            label="Temporal Smoothing",
-            from_=0.0,
-            to=50.0,
-            default=20.0,
-            unit="%",
-            command=self._on_parameter_change
-        )
-        self.smoothing_slider.pack(fill="x", pady=(0, 5))
-
         # Fine-Tuning Section
         fine_tune_frame = ctk.CTkFrame(scroll_frame, fg_color="#151525", corner_radius=10)
         fine_tune_frame.pack(fill="x", padx=5, pady=(0, 10))
@@ -893,7 +881,6 @@ class SoundDenoiserApp(ctk.CTk):
             noise_reduction_strength=self.strength_slider.get() / 100.0,
             transient_protection=self.transient_slider.get() / 100.0,
             high_freq_emphasis=self.hf_emphasis_slider.get(),
-            smoothing_factor=self.smoothing_slider.get() / 100.0,
             hiss_start_freq=self.hiss_start_slider.get(),
             hiss_peak_freq=self.hiss_peak_slider.get(),
             spectral_floor=self.spectral_floor_slider.get() / 100.0,
@@ -1000,7 +987,6 @@ class SoundDenoiserApp(ctk.CTk):
         self.strength_slider.set(85.0)
         self.transient_slider.set(30.0)
         self.hf_emphasis_slider.set(1.5)
-        self.smoothing_slider.set(20.0)
         # Fine-tuning defaults
         self.hiss_start_slider.set(2000.0)
         self.hiss_peak_slider.set(6000.0)

@@ -33,7 +33,6 @@ def test_denoiser_produces_different_output():
         noise_reduction_strength=0.95,
         transient_protection=0.2,
         high_freq_emphasis=2.0,
-        smoothing_factor=0.2,
     )
     
     # Load audio

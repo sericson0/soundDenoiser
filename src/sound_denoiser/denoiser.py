@@ -91,7 +91,6 @@ class AudioDenoiser:
         noise_reduction_strength: float = 0.85,
         transient_protection: float = 0.3,
         high_freq_emphasis: float = 1.5,
-        smoothing_factor: float = 0.2,
         method: DenoiseMethod = DenoiseMethod.SPECTRAL_SUBTRACTION,
         # New fine-tuning parameters
         hiss_start_freq: float = 3000.0,
@@ -108,7 +107,6 @@ class AudioDenoiser:
             noise_reduction_strength: Overall strength of noise reduction (0-1, default: 0.85)
             transient_protection: How much to protect transients (0-1, default: 0.3)
             high_freq_emphasis: Extra reduction for high frequencies where hiss lives (default: 1.5)
-            smoothing_factor: Temporal smoothing for noise estimate (0-1, default: 0.2)
             method: Denoising method to use (default: SPECTRAL_SUBTRACTION)
             hiss_start_freq: Frequency where hiss reduction begins (Hz, default: 2000)
             hiss_peak_freq: Frequency where hiss reduction is maximum (Hz, default: 6000)
@@ -122,7 +120,6 @@ class AudioDenoiser:
         self.noise_reduction_strength = noise_reduction_strength
         self.transient_protection = transient_protection
         self.high_freq_emphasis = high_freq_emphasis
-        self.smoothing_factor = smoothing_factor
         self.method = method
 
         # Fine-tuning parameters
@@ -1118,7 +1115,6 @@ class AudioDenoiser:
         noise_reduction_strength: Optional[float] = None,
         transient_protection: Optional[float] = None,
         high_freq_emphasis: Optional[float] = None,
-        smoothing_factor: Optional[float] = None,
         method: Optional[DenoiseMethod] = None,
         hiss_start_freq: Optional[float] = None,
         hiss_peak_freq: Optional[float] = None,
@@ -1136,8 +1132,6 @@ class AudioDenoiser:
             self.transient_protection = transient_protection
         if high_freq_emphasis is not None:
             self.high_freq_emphasis = high_freq_emphasis
-        if smoothing_factor is not None:
-            self.smoothing_factor = smoothing_factor
         if method is not None:
             self.method = method
         if hiss_start_freq is not None:
