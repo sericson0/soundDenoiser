@@ -68,7 +68,6 @@ class AudioDenoiser:
     Features:
     - Multiple denoising algorithms (spectral gating, spectral subtraction, Wiener, shellac)
     - Spectral gating with learned noise profiles
-    - High-frequency emphasis for hiss targeting (2kHz-20kHz)
     - Transient preservation
     - Original signal blending
     - Perceptual weighting to preserve audio quality
@@ -87,11 +86,7 @@ class AudioDenoiser:
         blend_original: float = 0.08,
         noise_reduction_strength: float = 0.85,
         transient_protection: float = 0.3,
-        high_freq_emphasis: float = 1.5,
         method: DenoiseMethod = DenoiseMethod.SPECTRAL_SUBTRACTION,
-        # New fine-tuning parameters
-        hiss_start_freq: float = 3000.0,
-        hiss_peak_freq: float = 8000.0,
         spectral_floor: float = 0.05,
         noise_threshold: float = 1.2,
         artifact_control: float = 0.5,
@@ -105,10 +100,7 @@ class AudioDenoiser:
             blend_original: Amount of original signal to blend back (0-1, default: 0.05)
             noise_reduction_strength: Overall strength of noise reduction (0-1, default: 0.85)
             transient_protection: How much to protect transients (0-1, default: 0.3)
-            high_freq_emphasis: Extra reduction for high frequencies where hiss lives (default: 1.5)
             method: Denoising method to use (default: SPECTRAL_SUBTRACTION)
-            hiss_start_freq: Frequency where hiss reduction begins (Hz, default: 2000)
-            hiss_peak_freq: Frequency where hiss reduction is maximum (Hz, default: 6000)
             spectral_floor: Minimum signal to retain, prevents artifacts (0-1, default: 0.05)
             noise_threshold: Multiplier for noise estimate boundary (0.5-3.0, default: 1.0)
                 Higher values = more aggressive (treats more as noise)
@@ -119,18 +111,15 @@ class AudioDenoiser:
                 0.5 = balanced blend of both approaches
             adaptive_blend: When True, varies the blend based on signal characteristics (default: True)
                 Uses more gating at low frequencies and during transients,
-                more subtraction at high frequencies and during sustained sections
+                more subtraction during sustained sections
         """
         self.max_db_reduction = max_db_reduction
         self.blend_original = blend_original
         self.noise_reduction_strength = noise_reduction_strength
         self.transient_protection = transient_protection
-        self.high_freq_emphasis = high_freq_emphasis
         self.method = method
 
         # Fine-tuning parameters
-        self.hiss_start_freq = hiss_start_freq
-        self.hiss_peak_freq = hiss_peak_freq
         self.spectral_floor = spectral_floor
         self.noise_threshold = noise_threshold
         self.artifact_control = artifact_control
@@ -408,39 +397,7 @@ class AudioDenoiser:
     def set_use_learned_profile(self, use: bool):
         self._use_learned_profile = use and self._noise_profile is not None
 
-    def _apply_high_frequency_reduction(self, audio: np.ndarray, sr: int) -> np.ndarray:
-        """
-        Apply additional reduction to high frequencies where hiss typically lives.
-        Uses configurable hiss_start_freq and hiss_peak_freq parameters.
-        """
-        # Compute STFT
-        stft = librosa.stft(audio, n_fft=self.N_FFT, hop_length=self.HOP_LENGTH)
-        stft_mag = np.abs(stft)
-        stft_phase = np.angle(stft)
-
-        # Create frequency-dependent gain
-        freq_bins = stft_mag.shape[0]
-        freqs = librosa.fft_frequencies(sr=sr, n_fft=self.N_FFT)
-
-        # Use configurable hiss frequency range
-        hiss_start = self.hiss_start_freq
-        hiss_peak = self.hiss_peak_freq
-
-        # Create smooth reduction curve
-        gain = np.ones(freq_bins)
-        for i, freq in enumerate(freqs):
-            if freq > hiss_start:
-                # Gradually increase reduction for higher frequencies
-                reduction_amount = min(1.0, (freq - hiss_start) / (hiss_peak - hiss_start + 1))
-                reduction_amount *= self.high_freq_emphasis - 1.0
-                # Use spectral_floor as minimum gain to prevent artifacts
-                min_gain = max(0.1, self.spectral_floor)
-                gain[i] = max(min_gain, 1.0 - reduction_amount * self.noise_reduction_strength)
-
-        # Apply gain
-        stft_reduced = stft_mag * gain[:, np.newaxis] * np.exp(1j * stft_phase)
-
-        return librosa.istft(stft_reduced, hop_length=self.HOP_LENGTH, length=len(audio))
+    # (Removed _apply_high_frequency_reduction and all related code)
 
     def _detect_transients(self, audio: np.ndarray, sr: int) -> np.ndarray:
         """Detect transients for protection."""
@@ -724,9 +681,7 @@ class AudioDenoiser:
         # Restore strength
         self.noise_reduction_strength = temp_strength
 
-        # Stage 3: Final high-frequency cleanup
-        if self.high_freq_emphasis > 1.0:
-            denoised = self._apply_high_frequency_reduction(denoised, self._sr)
+        # Stage 3: Final high-frequency cleanup (removed)
 
         return denoised
     def _shellac_reduction(self, audio: np.ndarray) -> np.ndarray:
@@ -806,9 +761,7 @@ class AudioDenoiser:
         # Inverse STFT
         denoised = librosa.istft(stft_clean, hop_length=self.HOP_LENGTH, length=len(audio))
 
-        # Optional: Apply gentle high-frequency shelf for additional hiss control
-        if self.high_freq_emphasis > 1.0:
-            denoised = self._apply_high_frequency_reduction(denoised, self._sr)
+        # (Removed high-frequency shelf for hiss control)
 
         return denoised
 
@@ -817,37 +770,19 @@ class AudioDenoiser:
 
         # Apply the selected denoising method
         if self.method == DenoiseMethod.SPECTRAL_GATING:
-            # Pure spectral gating using learned noise profile
             denoised = self._spectral_gating(audio_channel)
-            if self.high_freq_emphasis > 1.0:
-                denoised = self._apply_high_frequency_reduction(denoised, self._sr)
-
         elif self.method == DenoiseMethod.SPECTRAL_SUBTRACTION:
             denoised = self._spectral_subtraction(audio_channel)
-            if self.high_freq_emphasis > 1.0:
-                denoised = self._apply_high_frequency_reduction(denoised, self._sr)
-
         elif self.method == DenoiseMethod.WIENER:
             denoised = self._wiener_filter(audio_channel)
-            if self.high_freq_emphasis > 1.0:
-                denoised = self._apply_high_frequency_reduction(denoised, self._sr)
-
         elif self.method == DenoiseMethod.COMBINED:
             denoised = self._combined_reduction(audio_channel)
-
         elif self.method == DenoiseMethod.SHELLAC:
             denoised = self._shellac_reduction(audio_channel)
-
         elif self.method == DenoiseMethod.ADAPTIVE_BLEND:
             denoised = self._adaptive_blend_denoise(audio_channel)
-            if self.high_freq_emphasis > 1.0:
-                denoised = self._apply_high_frequency_reduction(denoised, self._sr)
-
         else:
-            # Default to spectral subtraction (better for old recordings)
             denoised = self._spectral_subtraction(audio_channel)
-            if self.high_freq_emphasis > 1.0:
-                denoised = self._apply_high_frequency_reduction(denoised, self._sr)
 
         # Apply maximum dB reduction limit (prevents over-processing)
         max_reduction_linear = 10 ** (-self.max_db_reduction / 20)
@@ -1161,7 +1096,6 @@ class AudioDenoiser:
         blend_original: Optional[float] = None,
         noise_reduction_strength: Optional[float] = None,
         transient_protection: Optional[float] = None,
-        high_freq_emphasis: Optional[float] = None,
         method: Optional[DenoiseMethod] = None,
         hiss_start_freq: Optional[float] = None,
         hiss_peak_freq: Optional[float] = None,
@@ -1179,8 +1113,6 @@ class AudioDenoiser:
             self.noise_reduction_strength = noise_reduction_strength
         if transient_protection is not None:
             self.transient_protection = transient_protection
-        if high_freq_emphasis is not None:
-            self.high_freq_emphasis = high_freq_emphasis
         if method is not None:
             self.method = method
         if hiss_start_freq is not None:

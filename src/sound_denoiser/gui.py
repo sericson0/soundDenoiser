@@ -472,17 +472,6 @@ class SoundDenoiserApp(ctk.CTk):
         )
         self.transient_slider.pack(fill="x", pady=(0, 12))
 
-        # High Frequency Emphasis (extra reduction for hiss frequencies)
-        self.hf_emphasis_slider = ParameterSlider(
-            params_inner,
-            label="High Freq Hiss Reduction",
-            from_=1.0,
-            to=3.0,
-            default=1.5,
-            unit="x",
-            command=self._on_parameter_change
-        )
-        self.hf_emphasis_slider.pack(fill="x", pady=(0, 12))
 
         # Fine-Tuning Section
         fine_tune_frame = ctk.CTkFrame(scroll_frame, fg_color="#151525", corner_radius=10)
@@ -502,29 +491,6 @@ class SoundDenoiserApp(ctk.CTk):
         fine_tune_inner = ctk.CTkFrame(fine_tune_frame, fg_color="transparent")
         fine_tune_inner.pack(fill="x", padx=10, pady=(0, 10))
 
-        # Hiss Start Frequency
-        self.hiss_start_slider = ParameterSlider(
-            fine_tune_inner,
-            label="Hiss Start Freq",
-            from_=500.0,
-            to=5000.0,
-            default=2000.0,
-            unit="Hz",
-            command=self._on_parameter_change
-        )
-        self.hiss_start_slider.pack(fill="x", pady=(0, 12))
-
-        # Hiss Peak Frequency
-        self.hiss_peak_slider = ParameterSlider(
-            fine_tune_inner,
-            label="Hiss Peak Freq",
-            from_=3000.0,
-            to=12000.0,
-            default=6000.0,
-            unit="Hz",
-            command=self._on_parameter_change
-        )
-        self.hiss_peak_slider.pack(fill="x", pady=(0, 12))
 
         # Spectral Floor (artifact prevention)
         self.spectral_floor_slider = ParameterSlider(
@@ -915,9 +881,6 @@ class SoundDenoiserApp(ctk.CTk):
             blend_original=self.blend_slider.get() / 100.0,
             noise_reduction_strength=self.strength_slider.get() / 100.0,
             transient_protection=self.transient_slider.get() / 100.0,
-            high_freq_emphasis=self.hf_emphasis_slider.get(),
-            hiss_start_freq=self.hiss_start_slider.get(),
-            hiss_peak_freq=self.hiss_peak_slider.get(),
             spectral_floor=self.spectral_floor_slider.get() / 100.0,
             noise_threshold=self.noise_threshold_slider.get(),
             artifact_control=self.artifact_control_slider.get() / 100.0,
