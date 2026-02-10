@@ -192,66 +192,6 @@ class WaveformDisplay(ctk.CTkFrame):
         # Span selector for region selection
         self.span_selector = None
 
-    def _begin_threshold_drag(self, event):
-        """Start dragging the nearest threshold point if within hit radius."""
-        if event.xdata is None or event.ydata is None:
-            return
-
-        click_px = np.array(self.ax.transData.transform((event.xdata, event.ydata)))
-        points_px = [self.ax.transData.transform((fx, fy)) for fx, fy in zip(self.threshold_freqs, self.threshold_levels)]
-        dists = [np.hypot(click_px[0] - px, click_px[1] - py) for px, py in points_px]
-
-        if not dists:
-            return
-
-        idx = int(np.argmin(dists))
-        if dists[idx] > 12:
-            return
-
-        self._dragging_threshold_idx = idx
-
-    def _drag_threshold_point(self, event):
-        """Drag the active threshold point, keeping ordering and bounds."""
-        if self._dragging_threshold_idx is None or event.xdata is None or event.ydata is None:
-            return
-
-        idx = self._dragging_threshold_idx
-        nyquist = max(2000.0, self._sample_rate / 2)
-
-        lower_bound = self.threshold_freqs[idx - 1] + 10 if idx > 0 else 20
-        upper_bound = self.threshold_freqs[idx + 1] - 10 if idx < len(self.threshold_freqs) - 1 else nyquist
-
-        new_freq = float(np.clip(event.xdata, lower_bound, upper_bound))
-        new_level = float(np.clip(event.ydata, -120.0, 20.0))
-
-        self.threshold_freqs[idx] = new_freq
-        self.threshold_levels[idx] = new_level
-
-        if hasattr(self, "threshold_plot"):
-            self.threshold_plot.set_data(self.threshold_freqs, self.threshold_levels)
-            self._refresh_threshold_artists()
-
-    def _end_threshold_drag(self):
-        """Finish drag and notify listeners."""
-        self._dragging_threshold_idx = None
-        if self.on_threshold_change:
-            self.on_threshold_change(self.threshold_freqs.copy(), self.threshold_levels.copy())
-        self._drag_seeking = False
-
-    def set_threshold_curve(self, freqs: np.ndarray, levels: np.ndarray):
-        """Update threshold curve programmatically and redraw if visible."""
-        self.threshold_freqs = np.asarray(freqs, dtype=float)
-        self.threshold_levels = np.asarray(levels, dtype=float)
-
-        order = np.argsort(self.threshold_freqs)
-        self.threshold_freqs = self.threshold_freqs[order]
-        self.threshold_levels = self.threshold_levels[order]
-
-        if hasattr(self, "threshold_plot"):
-            self.threshold_plot.set_data(self.threshold_freqs, self.threshold_levels)
-        if self._view_mode == "spectrum":
-            self._plot_spectrum_internal()
-
     def set_noise_floor_curve(self, freqs: Optional[np.ndarray], levels: Optional[np.ndarray]):
         """Set or clear the learned noise floor trace used in spectrum view."""
         if freqs is None or levels is None:
@@ -277,28 +217,8 @@ class WaveformDisplay(ctk.CTkFrame):
         if self._view_mode == "spectrum":
             self._refresh_threshold_artists()
 
-    def _smooth_threshold_curve(self, dense_points: int = 400) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """Return a lightly smoothed threshold curve for RX-like visuals."""
-        if len(self.threshold_freqs) < 2:
-            return None
-
-        nyquist = max(2000.0, self._sample_rate / 2)
-        f_min = max(20.0, float(self.threshold_freqs.min()))
-        f_max = min(nyquist, float(self.threshold_freqs.max()))
-        dense_freqs = np.linspace(f_min, f_max, dense_points)
-
-        interp_levels = np.interp(dense_freqs, self.threshold_freqs, self.threshold_levels)
-
-        window = max(3, min(25, int(len(interp_levels) * 0.08)))
-        if window % 2 == 0:
-            window += 1
-        kernel = np.ones(window) / window
-        smooth_levels = np.convolve(interp_levels, kernel, mode="same")
-
-        return dense_freqs, smooth_levels
-
     def _refresh_threshold_artists(self):
-        """Update smoothed line, learned floor trace, and shaded noise gap."""
+        """Update learned floor trace and threshold visualization."""
         if not hasattr(self, "ax"):
             return
 
@@ -850,12 +770,8 @@ class WaveformDisplay(ctk.CTkFrame):
         self.canvas.draw_idle()
 
     def _on_canvas_click(self, event):
-        """Handle mouse click on canvas for seeking or spectrum dragging."""
+        """Handle mouse click on canvas for seeking."""
         if event.inaxes != self.ax or self._duration <= 0:
-            return
-
-        if self._view_mode == "spectrum":
-            self._begin_threshold_drag(event)
             return
 
         if self._selection_enabled:
@@ -873,12 +789,8 @@ class WaveformDisplay(ctk.CTkFrame):
                 self.on_seek(position)
 
     def _on_canvas_drag(self, event):
-        """Handle mouse drag on canvas for seeking or spectrum drag."""
+        """Handle mouse drag on canvas for seeking."""
         if event.inaxes != self.ax or self._duration <= 0:
-            return
-
-        if self._view_mode == "spectrum":
-            self._drag_threshold_point(event)
             return
 
         if not self._drag_seeking:
@@ -895,10 +807,7 @@ class WaveformDisplay(ctk.CTkFrame):
                 self.on_seek(position)
 
     def _on_canvas_release(self, event):
-        """Handle mouse release after seeking or spectrum drag."""
-        if self._view_mode == "spectrum" and self._dragging_threshold_idx is not None:
-            self._end_threshold_drag()
-            return
+        """Handle mouse release after seeking."""
         self._drag_seeking = False
 
     def _on_scroll(self, event):
