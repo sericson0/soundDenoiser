@@ -97,7 +97,6 @@ class AudioDenoiser:
         hiss_start_freq: float = 3000.0,
         hiss_peak_freq: float = 8000.0,
         spectral_floor: float = 0.05,
-        low_cut_freq: float = 0.0,
         noise_threshold: float = 1.2,
     ):
         """
@@ -114,7 +113,6 @@ class AudioDenoiser:
             hiss_start_freq: Frequency where hiss reduction begins (Hz, default: 2000)
             hiss_peak_freq: Frequency where hiss reduction is maximum (Hz, default: 6000)
             spectral_floor: Minimum signal to retain, prevents artifacts (0-1, default: 0.05)
-            low_cut_freq: High-pass filter frequency for rumble removal (Hz, 0=off, default: 0)
             noise_threshold: Multiplier for noise estimate boundary (0.5-3.0, default: 1.0)
                 Higher values = more aggressive (treats more as noise)
                 Lower values = more conservative (preserves more signal)
@@ -131,7 +129,6 @@ class AudioDenoiser:
         self.hiss_start_freq = hiss_start_freq
         self.hiss_peak_freq = hiss_peak_freq
         self.spectral_floor = spectral_floor
-        self.low_cut_freq = low_cut_freq
         self.noise_threshold = noise_threshold
 
         # Internal state
@@ -439,35 +436,6 @@ class AudioDenoiser:
         stft_reduced = stft_mag * gain[:, np.newaxis] * np.exp(1j * stft_phase)
 
         return librosa.istft(stft_reduced, hop_length=self.HOP_LENGTH, length=len(audio))
-
-    def _apply_low_cut_filter(self, audio: np.ndarray, sr: int) -> np.ndarray:
-        """
-        Apply a high-pass filter to remove low-frequency rumble.
-
-        Args:
-            audio: Input audio
-            sr: Sample rate
-
-        Returns:
-            Filtered audio with low frequencies removed
-        """
-        if self.low_cut_freq <= 0:
-            return audio
-
-        # Design a Butterworth high-pass filter
-        nyquist = sr / 2
-        normalized_cutoff = min(self.low_cut_freq / nyquist, 0.99)
-
-        if normalized_cutoff <= 0:
-            return audio
-
-        # 4th order Butterworth for smooth rolloff
-        b, a = signal.butter(4, normalized_cutoff, btype='high')
-
-        # Apply filter with zero-phase filtering (no phase distortion)
-        filtered = signal.filtfilt(b, a, audio)
-
-        return filtered
 
     def _detect_transients(self, audio: np.ndarray, sr: int) -> np.ndarray:
         """Detect transients for protection."""
@@ -859,10 +827,6 @@ class AudioDenoiser:
         if self.blend_original > 0:
             denoised = denoised * (1 - self.blend_original) + audio_channel * self.blend_original
 
-        # Apply low-cut filter for rumble removal (if enabled)
-        if self.low_cut_freq > 0:
-            denoised = self._apply_low_cut_filter(denoised, self._sr)
-
         return denoised
 
     def process(self, audio: Optional[np.ndarray] = None, sr: Optional[int] = None) -> np.ndarray:
@@ -1159,7 +1123,6 @@ class AudioDenoiser:
         hiss_start_freq: Optional[float] = None,
         hiss_peak_freq: Optional[float] = None,
         spectral_floor: Optional[float] = None,
-        low_cut_freq: Optional[float] = None,
         noise_threshold: Optional[float] = None,
     ):
         """Update denoiser parameters."""
@@ -1183,8 +1146,6 @@ class AudioDenoiser:
             self.hiss_peak_freq = hiss_peak_freq
         if spectral_floor is not None:
             self.spectral_floor = spectral_floor
-        if low_cut_freq is not None:
-            self.low_cut_freq = low_cut_freq
         if noise_threshold is not None:
             self.noise_threshold = noise_threshold
 
