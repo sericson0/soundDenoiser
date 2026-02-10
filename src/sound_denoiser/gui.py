@@ -65,7 +65,6 @@ class SoundDenoiserApp(ctk.CTk):
         self.selected_noise_region: Optional[Tuple[float, float]] = None
         self.config_path = Path.home() / ".sound_denoiser_config.json"
         self.config = self._load_config()
-        self.threshold_curve: List[Tuple[float, float]] = []
 
         # Build UI
         self._create_ui()
@@ -638,11 +637,6 @@ class SoundDenoiserApp(ctk.CTk):
         self.noise_profile_panel.add_selection(start, end)
         count = len(self.noise_profile_panel.get_selections())
         self._set_status(f"Added noise region: {start:.2f}s - {end:.2f}s (Total: {count} selection(s))")
-        self._update_threshold_from_params()
-
-    def _on_threshold_curve_change(self, freqs: np.ndarray, levels: np.ndarray):
-        """No-op: threshold curve display has been removed."""
-        pass
 
     def _learn_noise_profile_manual(self):
         """Learn noise profile from manually selected regions."""
@@ -804,7 +798,6 @@ class SoundDenoiserApp(ctk.CTk):
         self.stop_btn.configure(state="disabled")
         self.selection_btn.configure(state="disabled", text="Select Noise", fg_color="#1a5276")
         self.process_btn.configure(state="disabled", text="Apply Denoising")
-        self._update_threshold_from_params()
 
         # Load in background thread
         def load_thread():
@@ -896,11 +889,6 @@ class SoundDenoiserApp(ctk.CTk):
         """Handle parameter change - enable reprocessing hint."""
         if self.denoiser.get_original() is not None and not self.is_processing:
             self.process_btn.configure(fg_color="#884499")
-        self._update_threshold_from_params()
-
-    def _update_threshold_from_params(self):
-        """No-op: threshold curve display has been removed."""
-        pass
 
     def _on_method_change(self, method_name: str):
         """Handle denoising method change."""
@@ -927,7 +915,6 @@ class SoundDenoiserApp(ctk.CTk):
         # Highlight process button to indicate reprocessing needed
         if self.denoiser.get_original() is not None and not self.is_processing:
             self.process_btn.configure(fg_color="#884499")
-        self._update_threshold_from_params()
 
     def _reset_parameters(self):
         """Reset parameters to defaults."""
