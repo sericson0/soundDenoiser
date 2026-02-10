@@ -387,6 +387,7 @@ class SoundDenoiserApp(ctk.CTk):
             "Combined (All Methods)": DenoiseMethod.COMBINED,
             "Shellac/78rpm (Hiss+Groove)": DenoiseMethod.SHELLAC,
             "Spectral Gating (Learned Profile)": DenoiseMethod.SPECTRAL_GATING,
+            "Adaptive Blend (Subtraction+Gating)": DenoiseMethod.ADAPTIVE_BLEND,
         }
 
         self.method_dropdown = ctk.CTkOptionMenu(
@@ -411,6 +412,7 @@ class SoundDenoiserApp(ctk.CTk):
             "Combined (All Methods)": "Best for: Heavy noise. Uses Spectral + Wiener + Threshold",
             "Shellac/78rpm (Hiss+Groove)": "Best for: Old 78s. Key params: Strength, Noise Threshold",
             "Spectral Gating (Learned Profile)": "Best with learned profile. Soft gate based on noise floor",
+            "Adaptive Blend (Subtraction+Gating)": "Blends both methods. Use Artifact Control to balance",
         }
 
         self.method_desc_label = ctk.CTkLabel(
@@ -546,7 +548,42 @@ class SoundDenoiserApp(ctk.CTk):
             unit="x",
             command=self._on_parameter_change
         )
-        self.noise_threshold_slider.pack(fill="x", pady=(0, 5))
+        self.noise_threshold_slider.pack(fill="x", pady=(0, 12))
+
+        # Artifact Control (subtraction vs gating balance)
+        self.artifact_control_slider = ParameterSlider(
+            fine_tune_inner,
+            label="Artifact Control",
+            from_=0.0,
+            to=100.0,
+            default=50.0,
+            unit="%",
+            command=self._on_parameter_change
+        )
+        self.artifact_control_slider.pack(fill="x", pady=(0, 8))
+
+        # Artifact control description
+        artifact_desc = ctk.CTkLabel(
+            fine_tune_inner,
+            text="0%=Subtraction (chirpy) ↔ 100%=Gating (pumping)",
+            font=ctk.CTkFont(size=9),
+            text_color="#666666"
+        )
+        artifact_desc.pack(anchor="w", pady=(0, 8))
+
+        # Adaptive Blend checkbox
+        self.adaptive_blend_var = ctk.BooleanVar(value=True)
+        self.adaptive_blend_checkbox = ctk.CTkCheckBox(
+            fine_tune_inner,
+            text="Adaptive (varies by frequency/transients)",
+            variable=self.adaptive_blend_var,
+            command=self._on_parameter_change,
+            font=ctk.CTkFont(size=11),
+            fg_color="#6c3483",
+            hover_color="#8e44ad",
+            text_color="#cccccc"
+        )
+        self.adaptive_blend_checkbox.pack(anchor="w", pady=(0, 5))
 
         # Buttons Section (reset only; Apply Denoising moved to transport row)
         buttons_frame = ctk.CTkFrame(scroll_frame, fg_color="#151525", corner_radius=10)
@@ -883,6 +920,8 @@ class SoundDenoiserApp(ctk.CTk):
             hiss_peak_freq=self.hiss_peak_slider.get(),
             spectral_floor=self.spectral_floor_slider.get() / 100.0,
             noise_threshold=self.noise_threshold_slider.get(),
+            artifact_control=self.artifact_control_slider.get() / 100.0,
+            adaptive_blend=self.adaptive_blend_var.get(),
         )
 
         # Process in background thread
@@ -990,6 +1029,8 @@ class SoundDenoiserApp(ctk.CTk):
         self.hiss_peak_slider.set(6000.0)
         self.spectral_floor_slider.set(5.0)
         self.noise_threshold_slider.set(1.0)
+        self.artifact_control_slider.set(50.0)
+        self.adaptive_blend_var.set(True)
         # Method default
         self.method_dropdown.set("Spectral Subtraction")
         self.denoiser.set_method(DenoiseMethod.SPECTRAL_SUBTRACTION)
