@@ -32,7 +32,6 @@ def test_denoiser_produces_different_output():
         blend_original=0.0,     # No blending for clear difference
         noise_reduction_strength=0.95,
         transient_protection=0.2,
-        high_freq_emphasis=2.0,
     )
 
     # Load audio

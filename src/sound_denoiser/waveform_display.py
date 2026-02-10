@@ -321,41 +321,9 @@ class WaveformDisplay(ctk.CTkFrame):
                 pass
             self.analyzer_fill = None
 
-        smoothed = self._smooth_threshold_curve()
         floor_freqs = self.noise_floor_freqs
         floor_levels = self.noise_floor_levels
         threshold_mult = self.noise_threshold_mult
-
-        if smoothed:
-            dense_freqs, smooth_levels = smoothed
-
-            if self.threshold_smooth_plot is None:
-                (self.threshold_smooth_plot,) = self.ax.plot(
-                    dense_freqs,
-                    smooth_levels,
-                    color="#00d9ff",
-                    linewidth=2.5,
-                    alpha=0.7,
-                    linestyle="-",
-                )
-            else:
-                self.threshold_smooth_plot.set_data(dense_freqs, smooth_levels)
-
-            if floor_freqs is not None and floor_levels is not None:
-                floor_interp = np.interp(dense_freqs, floor_freqs, floor_levels)
-                self.noise_fill = self.ax.fill_between(
-                    dense_freqs,
-                    floor_interp,
-                    smooth_levels,
-                    where=smooth_levels > floor_interp,
-                    color="#00d9ff",
-                    alpha=0.14,
-                    interpolate=True,
-                    linewidth=0,
-                )
-        else:
-            if self.threshold_smooth_plot is not None:
-                self.threshold_smooth_plot.set_data([], [])
 
         if floor_freqs is not None and floor_levels is not None:
             if self.noise_floor_plot is None:
@@ -752,15 +720,6 @@ class WaveformDisplay(ctk.CTkFrame):
         )
         # Keep analyzer_img as a flag that the analyzer is initialized
         self.analyzer_img = True
-
-        plot_freqs = np.clip(self.threshold_freqs, 20, nyquist)
-        (self.threshold_plot,) = self.ax.plot(
-            plot_freqs,
-            self.threshold_levels,
-            color="#00d9ff",
-            linewidth=0.0,
-            marker=None,
-        )
 
         self._refresh_threshold_artists()
 
