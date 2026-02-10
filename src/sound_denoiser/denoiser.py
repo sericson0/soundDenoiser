@@ -2,10 +2,10 @@
 Core audio denoising module using multiple techniques for hiss removal.
 
 Implements:
-- noisereduce library for stationary noise reduction
+- Spectral gating with learned noise profiles
 - Spectral subtraction for broadband noise
-- Multi-band adaptive noise reduction
 - Wiener filtering for optimal noise estimation
+- Shellac/78rpm optimized reduction
 - High-frequency focused processing where hiss typically lives
 - Noise profile learning for targeted removal
 - Perceptual weighting to preserve audio quality
@@ -20,7 +20,6 @@ from typing import Tuple, Optional, List
 from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum
-import noisereduce as nr
 
 # Metadata handling
 try:
@@ -38,10 +37,10 @@ class DenoiseMethod(Enum):
     """Available denoising methods."""
     SPECTRAL_SUBTRACTION = "spectral"    # Classic spectral subtraction (good for shellac/vinyl)
     WIENER = "wiener"                    # Wiener filtering (good for broadband noise)
-    MULTIBAND = "multiband"              # Multi-band adaptive reduction
     COMBINED = "combined"                # Combine multiple methods
     SHELLAC = "shellac"                  # Optimized for 78rpm shellac records (hiss + groove)
-    NOISEREDUCE = "noisereduce"          # noisereduce library (may not work well on old recordings)
+    SPECTRAL_GATING = "gating"           # Pure spectral gating using learned noise profile
+    ADAPTIVE_BLEND = "adaptive"          # Intelligent blend of subtraction and gating
 
 
 @dataclass
@@ -67,7 +66,7 @@ class AudioDenoiser:
     Multi-technique denoiser for removing hiss from audio recordings.
 
     Features:
-    - Multiple denoising algorithms (noisereduce, spectral subtraction, Wiener, multiband)
+    - Multiple denoising algorithms (spectral gating, spectral subtraction, Wiener, shellac)
     - Spectral gating with learned noise profiles
     - High-frequency emphasis for hiss targeting (2kHz-20kHz)
     - Transient preservation
@@ -79,9 +78,6 @@ class AudioDenoiser:
     N_FFT = 2048
     HOP_LENGTH = 512
 
-    # Frequency bands for multi-band processing (Hz)
-    BAND_EDGES = [0, 300, 1000, 3000, 8000, 20000]
-
     # Shellac-specific frequency bands (Hz) - optimized for 78rpm records
     SHELLAC_BANDS = [0, 100, 300, 800, 2000, 4000, 8000, 16000]
 
@@ -92,14 +88,14 @@ class AudioDenoiser:
         noise_reduction_strength: float = 0.85,
         transient_protection: float = 0.3,
         high_freq_emphasis: float = 1.5,
-        smoothing_factor: float = 0.2,
         method: DenoiseMethod = DenoiseMethod.SPECTRAL_SUBTRACTION,
         # New fine-tuning parameters
         hiss_start_freq: float = 3000.0,
         hiss_peak_freq: float = 8000.0,
         spectral_floor: float = 0.05,
-        low_cut_freq: float = 0.0,
         noise_threshold: float = 1.2,
+        artifact_control: float = 0.5,
+        adaptive_blend: bool = True,
     ):
         """
         Initialize the denoiser with parameters.
@@ -110,30 +106,35 @@ class AudioDenoiser:
             noise_reduction_strength: Overall strength of noise reduction (0-1, default: 0.85)
             transient_protection: How much to protect transients (0-1, default: 0.3)
             high_freq_emphasis: Extra reduction for high frequencies where hiss lives (default: 1.5)
-            smoothing_factor: Temporal smoothing for noise estimate (0-1, default: 0.2)
             method: Denoising method to use (default: SPECTRAL_SUBTRACTION)
             hiss_start_freq: Frequency where hiss reduction begins (Hz, default: 2000)
             hiss_peak_freq: Frequency where hiss reduction is maximum (Hz, default: 6000)
             spectral_floor: Minimum signal to retain, prevents artifacts (0-1, default: 0.05)
-            low_cut_freq: High-pass filter frequency for rumble removal (Hz, 0=off, default: 0)
             noise_threshold: Multiplier for noise estimate boundary (0.5-3.0, default: 1.0)
                 Higher values = more aggressive (treats more as noise)
                 Lower values = more conservative (preserves more signal)
+            artifact_control: Balance between subtraction and gating (0-1, default: 0.5)
+                0 = pure spectral subtraction (may cause musical noise/chirpy artifacts)
+                1 = pure spectral gating (may cause noise bursts/pumping)
+                0.5 = balanced blend of both approaches
+            adaptive_blend: When True, varies the blend based on signal characteristics (default: True)
+                Uses more gating at low frequencies and during transients,
+                more subtraction at high frequencies and during sustained sections
         """
         self.max_db_reduction = max_db_reduction
         self.blend_original = blend_original
         self.noise_reduction_strength = noise_reduction_strength
         self.transient_protection = transient_protection
         self.high_freq_emphasis = high_freq_emphasis
-        self.smoothing_factor = smoothing_factor
         self.method = method
 
         # Fine-tuning parameters
         self.hiss_start_freq = hiss_start_freq
         self.hiss_peak_freq = hiss_peak_freq
         self.spectral_floor = spectral_floor
-        self.low_cut_freq = low_cut_freq
         self.noise_threshold = noise_threshold
+        self.artifact_control = artifact_control
+        self.adaptive_blend = adaptive_blend
 
         # Internal state
         self._audio: Optional[np.ndarray] = None
@@ -441,35 +442,6 @@ class AudioDenoiser:
 
         return librosa.istft(stft_reduced, hop_length=self.HOP_LENGTH, length=len(audio))
 
-    def _apply_low_cut_filter(self, audio: np.ndarray, sr: int) -> np.ndarray:
-        """
-        Apply a high-pass filter to remove low-frequency rumble.
-
-        Args:
-            audio: Input audio
-            sr: Sample rate
-
-        Returns:
-            Filtered audio with low frequencies removed
-        """
-        if self.low_cut_freq <= 0:
-            return audio
-
-        # Design a Butterworth high-pass filter
-        nyquist = sr / 2
-        normalized_cutoff = min(self.low_cut_freq / nyquist, 0.99)
-
-        if normalized_cutoff <= 0:
-            return audio
-
-        # 4th order Butterworth for smooth rolloff
-        b, a = signal.butter(4, normalized_cutoff, btype='high')
-
-        # Apply filter with zero-phase filtering (no phase distortion)
-        filtered = signal.filtfilt(b, a, audio)
-
-        return filtered
-
     def _detect_transients(self, audio: np.ndarray, sr: int) -> np.ndarray:
         """Detect transients for protection."""
         onset_env = librosa.onset.onset_strength(y=audio, sr=sr)
@@ -492,6 +464,157 @@ class AudioDenoiser:
         noise_estimate = uniform_filter1d(noise_estimate, size=5)
 
         return noise_estimate
+
+    def _spectral_gating(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Pure spectral gating using the learned noise profile.
+
+        This method requires a learned noise profile. It applies a soft gate
+        that attenuates frequency bins where the signal is below or near the
+        learned noise floor. More aggressive than spectral subtraction but
+        very effective when you have a good noise sample.
+        """
+        # Compute STFT
+        stft = librosa.stft(audio, n_fft=self.N_FFT, hop_length=self.HOP_LENGTH)
+        stft_mag = np.abs(stft)
+        stft_phase = np.angle(stft)
+
+        # Get noise estimate - prefer learned profile
+        if self._use_learned_profile and self._noise_profile is not None:
+            noise_estimate = self._noise_profile.spectral_mean
+            noise_std = self._noise_profile.spectral_std
+        else:
+            # Fall back to automatic estimation if no profile learned
+            noise_estimate = self._estimate_noise_spectrum(stft_mag)
+            noise_std = noise_estimate * 0.5  # Approximate std
+
+        # Apply noise threshold multiplier
+        gate_threshold = noise_estimate * self.noise_threshold
+
+        # Expand to match STFT shape
+        gate_threshold_2d = gate_threshold[:, np.newaxis]
+        noise_std_2d = noise_std[:, np.newaxis] if noise_std is not None else gate_threshold_2d * 0.3
+
+        # Soft gating: compute gain based on how far above threshold the signal is
+        # Gain = 1 when signal >> threshold, Gain -> reduction_amount when signal <= threshold
+        margin = stft_mag - gate_threshold_2d
+
+        # Sigmoid-like soft gate centered around the threshold
+        # Use noise_std to control the transition width
+        transition_width = np.maximum(noise_std_2d * 2, 1e-10)
+        gate_gain = 1.0 / (1.0 + np.exp(-margin / transition_width * 4))
+
+        # Apply reduction strength - controls how much attenuation below threshold
+        min_gain = 1.0 - self.noise_reduction_strength
+        min_gain = max(min_gain, self.spectral_floor)
+        gate_gain = min_gain + gate_gain * (1.0 - min_gain)
+
+        # Smooth gain temporally to reduce musical noise
+        gate_gain = median_filter(gate_gain, size=(1, 3))
+
+        # Apply gate
+        stft_gated = stft_mag * gate_gain * np.exp(1j * stft_phase)
+
+        return librosa.istft(stft_gated, hop_length=self.HOP_LENGTH, length=len(audio))
+
+    def _adaptive_blend_denoise(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Adaptive blend of spectral subtraction and gating.
+
+        Intelligently combines both approaches based on:
+        - Frequency: More gating at low frequencies (musical noise more audible),
+                     more subtraction at high frequencies (noise pumping more audible)
+        - Time/SNR: More gating during transients and low-SNR regions,
+                    more subtraction during sustained high-SNR sections
+
+        The artifact_control parameter sets the base blend ratio,
+        and adaptive_blend enables frequency/time-based variation.
+        """
+        # Compute STFT once for efficiency
+        stft = librosa.stft(audio, n_fft=self.N_FFT, hop_length=self.HOP_LENGTH)
+        stft_mag = np.abs(stft)
+        stft_phase = np.angle(stft)
+
+        # Get noise estimate
+        if self._use_learned_profile and self._noise_profile is not None:
+            noise_estimate = self._noise_profile.spectral_mean
+            noise_std = self._noise_profile.spectral_std
+        else:
+            noise_estimate = self._estimate_noise_spectrum(stft_mag)
+            noise_std = noise_estimate * 0.5
+
+        # Apply noise threshold
+        noise_estimate_scaled = noise_estimate * self.noise_threshold
+
+        # === SPECTRAL SUBTRACTION GAIN ===
+        alpha = 1.0 + self.noise_reduction_strength * 2.0
+        beta = self.spectral_floor + (1 - self.noise_reduction_strength) * 0.05
+
+        noise_2d = noise_estimate_scaled[:, np.newaxis]
+        subtracted = stft_mag ** 2 - alpha * (noise_2d ** 2)
+        spectral_floor_val = beta * (noise_2d ** 2)
+        subtracted = np.maximum(subtracted, spectral_floor_val)
+        subtraction_mag = np.sqrt(subtracted)
+
+        # === SPECTRAL GATING GAIN ===
+        gate_threshold = noise_estimate_scaled[:, np.newaxis]
+        noise_std_2d = noise_std[:, np.newaxis] if noise_std is not None else gate_threshold * 0.3
+
+        margin = stft_mag - gate_threshold
+        transition_width = np.maximum(noise_std_2d * 2, 1e-10)
+        gate_gain = 1.0 / (1.0 + np.exp(-margin / transition_width * 4))
+
+        min_gain = max(1.0 - self.noise_reduction_strength, self.spectral_floor)
+        gate_gain = min_gain + gate_gain * (1.0 - min_gain)
+        gate_gain = median_filter(gate_gain, size=(1, 3))
+        gating_mag = stft_mag * gate_gain
+
+        # === COMPUTE BLEND WEIGHTS ===
+        # Base blend from artifact_control (0 = subtraction, 1 = gating)
+        base_gating_weight = self.artifact_control
+
+        if self.adaptive_blend:
+            # Frequency-based weighting:
+            # Low frequencies -> more gating (musical noise more audible there)
+            # High frequencies -> more subtraction (pumping more audible there)
+            freqs = librosa.fft_frequencies(sr=self._sr, n_fft=self.N_FFT)
+            freq_weights = np.clip((freqs - 500) / 4000, 0, 1)  # 0 at <500Hz, 1 at >4500Hz
+            freq_gating_bias = 0.3 * (1 - freq_weights)  # More gating at low freq
+            freq_gating_bias = freq_gating_bias[:, np.newaxis]
+
+            # SNR-based weighting:
+            # Low SNR -> more gating (subtraction artifacts worse at low SNR)
+            # High SNR -> more subtraction (gating pumping more audible)
+            snr = stft_mag / (noise_2d + 1e-10)
+            snr_normalized = np.clip((snr - 1) / 5, 0, 1)  # 0 at SNR<=1, 1 at SNR>=6
+            snr_gating_bias = 0.2 * (1 - snr_normalized)  # More gating at low SNR
+
+            # Transient detection for time-based weighting
+            # During transients, prefer gating (better transient preservation)
+            frame_energy = np.mean(stft_mag ** 2, axis=0)
+            energy_diff = np.diff(frame_energy, prepend=frame_energy[0])
+            transient_mask = np.clip(energy_diff / (np.mean(frame_energy) + 1e-10), 0, 1)
+            transient_mask = uniform_filter1d(transient_mask, size=3)
+            transient_gating_bias = 0.2 * transient_mask  # More gating at transients
+
+            # Combine all biases
+            gating_weight = base_gating_weight + freq_gating_bias + snr_gating_bias + transient_gating_bias
+            gating_weight = np.clip(gating_weight, 0, 1)
+        else:
+            # Simple fixed blend
+            gating_weight = base_gating_weight
+
+        # === BLEND THE TWO METHODS ===
+        subtraction_weight = 1.0 - gating_weight
+        blended_mag = subtraction_weight * subtraction_mag + gating_weight * gating_mag
+
+        # Smooth the result to reduce any remaining artifacts
+        blended_mag = median_filter(blended_mag, size=(1, 3))
+
+        # Reconstruct with original phase
+        stft_clean = blended_mag * np.exp(1j * stft_phase)
+
+        return librosa.istft(stft_clean, hop_length=self.HOP_LENGTH, length=len(audio))
 
     def _spectral_subtraction(self, audio: np.ndarray) -> np.ndarray:
         """
@@ -582,74 +705,12 @@ class AudioDenoiser:
 
         return librosa.istft(stft_clean, hop_length=self.HOP_LENGTH, length=len(audio))
 
-    def _multiband_reduction(self, audio: np.ndarray) -> np.ndarray:
-        """
-        Multi-band adaptive noise reduction.
-
-        Splits the audio into frequency bands and applies different
-        reduction levels based on the noise characteristics in each band.
-        """
-        # Compute STFT
-        stft = librosa.stft(audio, n_fft=self.N_FFT, hop_length=self.HOP_LENGTH)
-        stft_mag = np.abs(stft)
-        stft_phase = np.angle(stft)
-
-        # Get frequency bins
-        freqs = librosa.fft_frequencies(sr=self._sr, n_fft=self.N_FFT)
-
-        # Get noise estimate per band
-        if self._use_learned_profile and self._noise_profile is not None:
-            noise_estimate = self._noise_profile.spectral_mean
-        else:
-            noise_estimate = self._estimate_noise_spectrum(stft_mag)
-
-        # Apply noise threshold - multiplies the noise estimate to define the boundary
-        noise_estimate = noise_estimate * self.noise_threshold
-
-        # Create gain matrix
-        gain = np.ones_like(stft_mag)
-
-        # Process each band
-        for i in range(len(self.BAND_EDGES) - 1):
-            low_freq = self.BAND_EDGES[i]
-            high_freq = self.BAND_EDGES[i + 1]
-
-            # Find frequency bin indices for this band
-            band_mask = (freqs >= low_freq) & (freqs < high_freq)
-
-            if not np.any(band_mask):
-                continue
-
-            # Estimate noise level in this band
-            band_noise = np.mean(noise_estimate[band_mask])
-
-            # Higher reduction for higher frequency bands (where hiss lives)
-            freq_factor = 1.0 + (i / (len(self.BAND_EDGES) - 1)) * (self.high_freq_emphasis - 1.0)
-
-            # Calculate band-specific reduction
-            for j, is_in_band in enumerate(band_mask):
-                if is_in_band:
-                    # Calculate SNR for each frame
-                    snr = stft_mag[j, :] / (band_noise + 1e-10)
-
-                    # Adaptive gain based on SNR
-                    band_gain = np.clip(1 - (freq_factor * self.noise_reduction_strength) / (snr + 1), 0.1, 1.0)
-                    gain[j, :] = band_gain
-
-        # Smooth gain temporally
-        gain = uniform_filter1d(gain, size=5, axis=1)
-
-        # Apply gain
-        stft_clean = stft_mag * gain * np.exp(1j * stft_phase)
-
-        return librosa.istft(stft_clean, hop_length=self.HOP_LENGTH, length=len(audio))
-
     def _combined_reduction(self, audio: np.ndarray) -> np.ndarray:
         """
         Combined approach using multiple methods.
 
         Applies spectral subtraction first, then Wiener filtering,
-        and finally multi-band processing for optimal results.
+        and finally high-frequency reduction for optimal results.
         """
         # Stage 1: Gentle spectral subtraction
         temp_strength = self.noise_reduction_strength
@@ -755,28 +816,9 @@ class AudioDenoiser:
         """Process a single audio channel with the selected denoising method."""
 
         # Apply the selected denoising method
-        if self.method == DenoiseMethod.NOISEREDUCE:
-            # Use noisereduce library (very effective for stationary noise like hiss)
-            if self._use_learned_profile and self._noise_profile is not None:
-                denoised = nr.reduce_noise(
-                    y=audio_channel,
-                    sr=self._sr,
-                    y_noise=self._noise_profile.noise_clip,
-                    prop_decrease=self.noise_reduction_strength,
-                    stationary=True,
-                    n_fft=self.N_FFT,
-                    hop_length=self.HOP_LENGTH,
-                )
-            else:
-                denoised = nr.reduce_noise(
-                    y=audio_channel,
-                    sr=self._sr,
-                    prop_decrease=self.noise_reduction_strength,
-                    stationary=True,
-                    n_fft=self.N_FFT,
-                    hop_length=self.HOP_LENGTH,
-                )
-            # Additional high-frequency reduction
+        if self.method == DenoiseMethod.SPECTRAL_GATING:
+            # Pure spectral gating using learned noise profile
+            denoised = self._spectral_gating(audio_channel)
             if self.high_freq_emphasis > 1.0:
                 denoised = self._apply_high_frequency_reduction(denoised, self._sr)
 
@@ -790,14 +832,16 @@ class AudioDenoiser:
             if self.high_freq_emphasis > 1.0:
                 denoised = self._apply_high_frequency_reduction(denoised, self._sr)
 
-        elif self.method == DenoiseMethod.MULTIBAND:
-            denoised = self._multiband_reduction(audio_channel)
-
         elif self.method == DenoiseMethod.COMBINED:
             denoised = self._combined_reduction(audio_channel)
 
         elif self.method == DenoiseMethod.SHELLAC:
             denoised = self._shellac_reduction(audio_channel)
+
+        elif self.method == DenoiseMethod.ADAPTIVE_BLEND:
+            denoised = self._adaptive_blend_denoise(audio_channel)
+            if self.high_freq_emphasis > 1.0:
+                denoised = self._apply_high_frequency_reduction(denoised, self._sr)
 
         else:
             # Default to spectral subtraction (better for old recordings)
@@ -826,10 +870,6 @@ class AudioDenoiser:
         # Blend in original signal
         if self.blend_original > 0:
             denoised = denoised * (1 - self.blend_original) + audio_channel * self.blend_original
-
-        # Apply low-cut filter for rumble removal (if enabled)
-        if self.low_cut_freq > 0:
-            denoised = self._apply_low_cut_filter(denoised, self._sr)
 
         return denoised
 
@@ -1122,13 +1162,13 @@ class AudioDenoiser:
         noise_reduction_strength: Optional[float] = None,
         transient_protection: Optional[float] = None,
         high_freq_emphasis: Optional[float] = None,
-        smoothing_factor: Optional[float] = None,
         method: Optional[DenoiseMethod] = None,
         hiss_start_freq: Optional[float] = None,
         hiss_peak_freq: Optional[float] = None,
         spectral_floor: Optional[float] = None,
-        low_cut_freq: Optional[float] = None,
         noise_threshold: Optional[float] = None,
+        artifact_control: Optional[float] = None,
+        adaptive_blend: Optional[bool] = None,
     ):
         """Update denoiser parameters."""
         if max_db_reduction is not None:
@@ -1141,8 +1181,6 @@ class AudioDenoiser:
             self.transient_protection = transient_protection
         if high_freq_emphasis is not None:
             self.high_freq_emphasis = high_freq_emphasis
-        if smoothing_factor is not None:
-            self.smoothing_factor = smoothing_factor
         if method is not None:
             self.method = method
         if hiss_start_freq is not None:
@@ -1151,10 +1189,12 @@ class AudioDenoiser:
             self.hiss_peak_freq = hiss_peak_freq
         if spectral_floor is not None:
             self.spectral_floor = spectral_floor
-        if low_cut_freq is not None:
-            self.low_cut_freq = low_cut_freq
         if noise_threshold is not None:
             self.noise_threshold = noise_threshold
+        if artifact_control is not None:
+            self.artifact_control = artifact_control
+        if adaptive_blend is not None:
+            self.adaptive_blend = adaptive_blend
 
     def set_method(self, method: DenoiseMethod):
         """Set the denoising method."""

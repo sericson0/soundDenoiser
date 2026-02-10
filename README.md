@@ -141,7 +141,6 @@ denoiser.clear_noise_profile()
 | `noise_reduction_strength` | 75% | Overall strength of the noise reduction algorithm |
 | `transient_protection` | 40% | How much to protect transients (drums, attacks) from reduction |
 | `high_freq_rolloff` | 60% | Apply more aggressive reduction at high frequencies where hiss lives |
-| `smoothing_factor` | 15% | Temporal smoothing to reduce musical noise artifacts |
 
 ## Algorithm
 

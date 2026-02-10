@@ -13,7 +13,6 @@ dependencies = [
     "matplotlib>=3.7.0",
     "sounddevice>=0.4.6",
     "pydub>=0.25.0",
-    "noisereduce>=3.0.0",
     "windnd>=1.0.7",
     "mutagen>=1.47.0",
 ]
