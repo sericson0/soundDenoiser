@@ -1,4 +1,4 @@
-﻿"""
+"""
 Modern GUI for the Sound Denoiser application.
 
 Provides an intuitive interface for loading audio, adjusting
@@ -682,16 +682,16 @@ class SoundDenoiserApp(ctk.CTk):
             messagebox.showerror("Error", f"Failed to learn noise profile:\n{str(e)}")
 
     def _learn_noise_profile_auto(self):
-        """Auto-detect quiet region and learn noise profile."""
+        """Auto-detect noise regions at beginning/end of file and learn noise profile."""
         if self.denoiser.get_original() is None:
             return
 
-        self._set_status("Auto-detecting quiet region...")
+        self._set_status("Auto-detecting noise regions at beginning/end of file...")
 
         def auto_learn_thread():
             try:
-                profile, region = self.denoiser.auto_learn_noise_profile(min_duration=0.5)
-                self.processing_queue.put(("noise_profile", profile, region))
+                profile, regions = self.denoiser.auto_learn_noise_profile(min_duration=0.5)
+                self.processing_queue.put(("noise_profile_multi", profile, regions))
             except Exception as e:
                 self.processing_queue.put(("error", str(e)))
 
@@ -1140,6 +1140,10 @@ class SoundDenoiserApp(ctk.CTk):
                     _, profile, region = msg
                     self._on_noise_profile_learned(profile, region)
 
+                elif msg[0] == "noise_profile_multi":
+                    _, profile, regions = msg
+                    self._on_noise_profile_auto_learned(profile, regions)
+
                 elif msg[0] == "error":
                     _, error = msg
                     messagebox.showerror("Error", f"An error occurred:\n{error}")
@@ -1253,7 +1257,7 @@ class SoundDenoiserApp(ctk.CTk):
         self._set_status(f"Processing complete {profile_status} - Preview and adjust as needed")
 
     def _on_noise_profile_learned(self, profile: NoiseProfile, region: Tuple[float, float]):
-        """Handle noise profile learned from auto-detect."""
+        """Handle noise profile learned from single-region auto-detect (legacy)."""
         self.selected_noise_region = region
         self.waveform_original.set_noise_region(*region)
         # Add detected region to selections list/display
@@ -1263,6 +1267,42 @@ class SoundDenoiserApp(ctk.CTk):
         self.noise_profile_panel.enable_learn_button(True)
         self._update_noise_floor_trace(profile)
         self._set_status(f"Auto-detected noise region: {region[0]:.2f}s - {region[1]:.2f}s")
+
+        # Auto-reprocess
+        if self.denoiser.get_original() is not None:
+            self._process_audio()
+
+    def _on_noise_profile_auto_learned(self, profile: NoiseProfile, regions: List[Tuple[float, float]]):
+        """Handle noise profile learned from auto-detect (beginning/end scan)."""
+        # Clear any previous selections
+        self.noise_profile_panel.clear_selections()
+        self.waveform_original.clear_selection()
+
+        # Add each detected region
+        for region in regions:
+            self.noise_profile_panel.add_selection(*region)
+            self.waveform_original.add_selection_rect(*region)
+
+        # Use the first region as the reference for display
+        if regions:
+            self.selected_noise_region = regions[0]
+            self.waveform_original.set_noise_region(*regions[0])
+
+        self.noise_profile_panel.update_status(profile, regions[0] if regions else (0, 0))
+        self.noise_profile_panel.enable_learn_button(True)
+        self._update_noise_floor_trace(profile)
+
+        # Build a descriptive status message
+        parts = []
+        for i, (s, e) in enumerate(regions):
+            duration = self.denoiser._audio.shape[1] / self.denoiser._sr if self.denoiser._audio is not None else 0
+            if s < duration * 0.3:
+                label = "beginning"
+            else:
+                label = "end"
+            parts.append(f"{label} ({s:.2f}s-{e:.2f}s)")
+        status = f"Auto-detected {len(regions)} noise region(s): " + ", ".join(parts)
+        self._set_status(status)
 
         # Auto-reprocess
         if self.denoiser.get_original() is not None:

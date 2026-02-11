@@ -271,121 +271,163 @@ class AudioDenoiser:
         self._use_learned_profile = True
         return self._noise_profile
 
-    def auto_detect_noise_region(self, min_duration: float = 0.5) -> Tuple[float, float]:
+    def _score_region(self, audio_window: np.ndarray) -> Optional[Tuple[float, float, float]]:
         """
-        Automatically detect a region with noise but without music or silence.
-
-        Uses spectral flatness to distinguish between:
-        - Noise (high spectral flatness, moderate energy)
-        - Music (low spectral flatness, varying energy)
-        - Silence (very low energy)
-
-        This is particularly effective for finding hiss/groove noise sections
-        in old shellac recordings.
+        Score an audio window for how likely it is to be pure noise (not music, not silence).
+        
+        Returns:
+            Tuple of (score, rms, flatness) or None if the region should be skipped.
+        """
+        rms = np.sqrt(np.mean(audio_window ** 2))
+        peak = np.max(np.abs(audio_window))
+        
+        # Skip digital silence or near-silence
+        if peak < 0.002 or rms < 0.0005:
+            return None
+        
+        # Compute spectral flatness (noise is spectrally flat, music is not)
+        stft = librosa.stft(audio_window, n_fft=1024, hop_length=256)
+        mag = np.abs(stft)
+        
+        # Geometric mean / arithmetic mean = spectral flatness
+        # Higher values indicate more noise-like signal
+        geometric_mean = np.exp(np.mean(np.log(mag + 1e-10), axis=0))
+        arithmetic_mean = np.mean(mag, axis=0)
+        flatness = np.mean(geometric_mean / (arithmetic_mean + 1e-10))
+        
+        # Check for low spectral variation over time (noise is consistent)
+        spectral_var = np.var(np.mean(mag, axis=0))
+        
+        # Score: high flatness + low variation + moderate energy = noise
+        score = flatness * 100 - spectral_var * 1000 - rms * 10
+        
+        # Penalize very low or high energy
+        if rms < 0.005 or rms > 0.1:
+            score -= 50
+        
+        return (score, rms, flatness)
+    
+    def _scan_region_for_noise(
+        self, audio: np.ndarray, scan_start: int, scan_end: int,
+        window_samples: int, hop_samples: int, min_score: float = -20.0
+    ) -> Optional[Tuple[int, int, float]]:
+        """
+        Scan a portion of audio for the best noise-only window.
+        
+        Args:
+            audio: Audio array (1D)
+            scan_start: Start sample of scan region
+            scan_end: End sample of scan region
+            window_samples: Size of each candidate window
+            hop_samples: Hop between candidate windows
+            min_score: Minimum acceptable score to be considered noise
+            
+        Returns:
+            (start_sample, end_sample, score) of best noise region, or None.
+        """
+        best = None  # (score, start, end)
+        
+        range_end = min(scan_end - window_samples, len(audio) - window_samples)
+        if range_end <= scan_start:
+            return None
+        
+        for start in range(scan_start, range_end, hop_samples):
+            end = start + window_samples
+            window = audio[start:end]
+            
+            result = self._score_region(window)
+            if result is None:
+                continue
+            
+            score, rms, flatness = result
+            
+            if score < min_score:
+                continue
+            
+            if best is None or score > best[0]:
+                best = (score, start, end)
+        
+        if best is None:
+            return None
+        return (best[1], best[2], best[0])
+    
+    def auto_detect_noise_regions(self, min_duration: float = 0.5) -> List[Tuple[float, float]]:
+        """
+        Automatically detect noise regions at the beginning and end of the file.
+        
+        Targets the lead-in groove hiss at the start and the run-out groove
+        hiss at the end - these are the most reliable noise-only areas on
+        old shellac/vinyl recordings.
+        
+        Returns:
+            List of (start_time, end_time) tuples for detected noise regions.
+            May be empty if no suitable regions found.
         """
         if self._audio is None or self._sr is None:
             raise ValueError("No audio loaded.")
-
+        
         audio = self._audio[0]
+        total_samples = len(audio)
+        duration = total_samples / self._sr
+        
         window_samples = int(min_duration * self._sr)
         hop_samples = window_samples // 4
-
-        candidates = []
-
-        for start in range(0, len(audio) - window_samples, hop_samples):
-            end = start + window_samples
-            window = audio[start:end]
-
-            # Skip if too quiet (silence)
-            rms = np.sqrt(np.mean(window ** 2))
-            peak = np.max(np.abs(window))
-
-            if peak < 0.002:  # Too quiet - likely silence
-                continue
-
-            if rms < 0.0005:  # Very low RMS - likely digital silence
-                continue
-
-            # Compute spectral flatness (noise is spectrally flat, music is not)
-            stft = librosa.stft(window, n_fft=1024, hop_length=256)
-            mag = np.abs(stft)
-
-            # Geometric mean / arithmetic mean = spectral flatness
-            # Higher values indicate more noise-like signal
-            geometric_mean = np.exp(np.mean(np.log(mag + 1e-10), axis=0))
-            arithmetic_mean = np.mean(mag, axis=0)
-            flatness = np.mean(geometric_mean / (arithmetic_mean + 1e-10))
-
-            # Check for low spectral variation (noise is consistent)
-            spectral_var = np.var(np.mean(mag, axis=0))
-
-            # Good noise regions have:
-            # - High spectral flatness (noise-like)
-            # - Low spectral variation over time (consistent)
-            # - Moderate energy (not silence)
-
-            # Score combining these factors
-            # Higher score = more likely to be pure noise
-            score = flatness * 100 - spectral_var * 1000 - rms * 10
-
-            # Penalize very low or high energy
-            if rms < 0.005 or rms > 0.1:
-                score -= 50
-
-            candidates.append((score, start, end, rms, flatness))
-
-        if not candidates:
-            # Fallback: use quietest region that's not silence
-            return self._fallback_noise_detection(min_duration)
-
-        # Sort by score (highest first)
-        candidates.sort(key=lambda x: x[0], reverse=True)
-
-        # Return the best candidate
-        _, start_sample, end_sample, _, _ = candidates[0]
-        return (start_sample / self._sr, end_sample / self._sr)
-
-    def _fallback_noise_detection(self, min_duration: float) -> Tuple[float, float]:
-        """Fallback noise detection using simple RMS-based approach."""
-        audio = self._audio[0]
-        window_samples = int(min_duration * self._sr)
-        hop_samples = window_samples // 4
-
-        rms_values = []
-        positions = []
-
-        for start in range(0, len(audio) - window_samples, hop_samples):
-            end = start + window_samples
-            window = audio[start:end]
-            rms = np.sqrt(np.mean(window ** 2))
-            peak = np.max(np.abs(window))
-
-            # Skip silence
-            if peak < 0.001:
-                continue
-
-            rms_values.append(rms)
-            positions.append(start)
-
-        if not rms_values:
-            # Absolute fallback - use the beginning
-            return (0.0, min_duration)
-
-        rms_values = np.array(rms_values)
-        positions = np.array(positions)
-
-        # Find the quietest non-silent region
-        sorted_indices = np.argsort(rms_values)
-        idx = sorted_indices[0]
-        start_sample = positions[idx]
-
-        return (start_sample / self._sr, (start_sample + window_samples) / self._sr)
-
-    def auto_learn_noise_profile(self, min_duration: float = 0.5) -> Tuple[NoiseProfile, Tuple[float, float]]:
-        """Auto-detect quiet region and learn noise profile."""
-        start_time, end_time = self.auto_detect_noise_region(min_duration)
-        profile = self.learn_noise_profile(start_time, end_time)
-        return profile, (start_time, end_time)
+        
+        # Define how much of the beginning/end to scan
+        # Scan first and last 15% of the file (or at least 5 seconds)
+        scan_length = max(int(5.0 * self._sr), int(total_samples * 0.15))
+        scan_length = min(scan_length, total_samples // 2)  # Don't overlap
+        
+        # Score threshold: regions below this are likely not clean noise
+        min_score = -20.0
+        
+        regions = []
+        
+        # ── Scan the BEGINNING of the file (lead-in groove) ──
+        beginning_result = self._scan_region_for_noise(
+            audio, 0, scan_length, window_samples, hop_samples, min_score
+        )
+        if beginning_result:
+            start_s, end_s, score = beginning_result
+            regions.append((start_s / self._sr, end_s / self._sr))
+        
+        # ── Scan the END of the file (run-out groove) ──
+        end_scan_start = total_samples - scan_length
+        ending_result = self._scan_region_for_noise(
+            audio, end_scan_start, total_samples, window_samples, hop_samples, min_score
+        )
+        if ending_result:
+            start_s, end_s, score = ending_result
+            regions.append((start_s / self._sr, end_s / self._sr))
+        
+        return regions
+    
+    def auto_learn_noise_profile(self, min_duration: float = 0.5) -> Tuple[NoiseProfile, List[Tuple[float, float]]]:
+        """
+        Auto-detect noise regions at beginning/end of file and learn profile.
+        
+        Searches the lead-in and run-out areas for clean noise samples,
+        uses both if available, and raises an error if neither is usable.
+        
+        Returns:
+            Tuple of (NoiseProfile, list_of_regions)
+            
+        Raises:
+            ValueError: If no suitable noise regions could be found.
+        """
+        regions = self.auto_detect_noise_regions(min_duration)
+        
+        if not regions:
+            raise ValueError(
+                "Could not find a sufficient noise-only sample.\n\n"
+                "The beginning and end of the recording do not contain "
+                "clean noise (hiss/groove noise without music).\n\n"
+                "Please use 'Make Selection' to manually select a region "
+                "that contains only noise."
+            )
+        
+        profile = self.learn_noise_profile_from_regions(regions)
+        return profile, regions
 
     def get_noise_profile(self) -> Optional[NoiseProfile]:
         return self._noise_profile
