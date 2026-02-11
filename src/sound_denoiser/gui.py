@@ -424,18 +424,6 @@ class SoundDenoiserApp(ctk.CTk):
         )
         self.method_desc_label.pack(anchor="w", pady=(3, 0))
 
-        # Max dB Reduction
-        self.max_db_slider = ParameterSlider(
-            params_inner,
-            label="Max dB Reduction",
-            from_=1.0,
-            to=30.0,
-            default=12.0,
-            unit=" dB",
-            command=self._on_parameter_change
-        )
-        self.max_db_slider.pack(fill="x", pady=(0, 12))
-
         # Blend Original
         self.blend_slider = ParameterSlider(
             params_inner,
@@ -877,7 +865,6 @@ class SoundDenoiserApp(ctk.CTk):
 
         # Update parameters
         self.denoiser.update_parameters(
-            max_db_reduction=self.max_db_slider.get(),
             blend_original=self.blend_slider.get() / 100.0,
             noise_reduction_strength=self.strength_slider.get() / 100.0,
             transient_protection=self.transient_slider.get() / 100.0,
@@ -912,27 +899,11 @@ class SoundDenoiserApp(ctk.CTk):
         noise_thresh = self.noise_threshold_slider.get() if hasattr(self, "noise_threshold_slider") else 1.0
         hiss_start = self.hiss_start_slider.get() if hasattr(self, "hiss_start_slider") else 2000.0
         hiss_peak = self.hiss_peak_slider.get() if hasattr(self, "hiss_peak_slider") else 6000.0
-        hf_emphasis = self.hf_emphasis_slider.get() if hasattr(self, "hf_emphasis_slider") else 1.0
-
         # Baseline slope: gently rising then falling in highs
         base_levels = np.linspace(-72, -50, len(freqs))
 
         # Global lift/drop from noise threshold (UI now lifts the line when threshold increases)
         levels = base_levels + (noise_thresh - 1.0) * 6.0
-
-        # Hiss band emphasis: dip around hiss peak scaled by hf_emphasis
-        band_mask = (freqs >= max(200.0, hiss_start * 0.6)) & (freqs <= hiss_peak * 1.4)
-        band_depth = (hf_emphasis - 1.0) * 8.0
-        levels[band_mask] -= band_depth
-
-        # Smooth edges near hiss peak
-        if hiss_peak > hiss_start:
-            span = hiss_peak - hiss_start
-            taper_start = hiss_start + 0.3 * span
-            taper_end = hiss_peak + 0.3 * span
-            taper_mask = (freqs >= taper_start) & (freqs <= taper_end)
-            taper_ratio = np.clip((freqs[taper_mask] - taper_start) / (taper_end - taper_start), 0, 1)
-            levels[taper_mask] -= band_depth * (1 - taper_ratio)
 
         # Clamp to sensible bounds
         levels = np.clip(levels, -110.0, 10.0)
@@ -957,10 +928,6 @@ class SoundDenoiserApp(ctk.CTk):
         dim_color = "#666666"
         active_color = "#cccccc"
 
-        # HF slider is less relevant for Shellac (auto-tuned)
-        hf_relevant = method_name not in ["Shellac/78rpm (Hiss+Groove)"]
-        self.hf_emphasis_slider.label.configure(text_color=active_color if hf_relevant else dim_color)
-
         # Hiss frequency sliders - relevant for Spectral, Wiener, Combined, Spectral Gating
         hiss_freq_relevant = method_name in ["Spectral Subtraction", "Wiener Filter", "Combined (All Methods)", "Spectral Gating (Learned Profile)"]
         self.hiss_start_slider.label.configure(text_color=active_color if hiss_freq_relevant else dim_color)
@@ -982,11 +949,9 @@ class SoundDenoiserApp(ctk.CTk):
 
     def _reset_parameters(self):
         """Reset parameters to defaults."""
-        self.max_db_slider.set(12.0)
         self.blend_slider.set(5.0)
         self.strength_slider.set(85.0)
         self.transient_slider.set(30.0)
-        self.hf_emphasis_slider.set(1.5)
         # Fine-tuning defaults
         self.hiss_start_slider.set(2000.0)
         self.hiss_peak_slider.set(6000.0)

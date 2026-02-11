@@ -82,7 +82,6 @@ class AudioDenoiser:
 
     def __init__(
         self,
-        max_db_reduction: float = 8.0,
         blend_original: float = 0.08,
         noise_reduction_strength: float = 0.85,
         transient_protection: float = 0.3,
@@ -96,7 +95,6 @@ class AudioDenoiser:
         Initialize the denoiser with parameters.
 
         Args:
-            max_db_reduction: Maximum dB of noise reduction (default: 12.0)
             blend_original: Amount of original signal to blend back (0-1, default: 0.05)
             noise_reduction_strength: Overall strength of noise reduction (0-1, default: 0.85)
             transient_protection: How much to protect transients (0-1, default: 0.3)
@@ -113,7 +111,6 @@ class AudioDenoiser:
                 Uses more gating at low frequencies and during transients,
                 more subtraction during sustained sections
         """
-        self.max_db_reduction = max_db_reduction
         self.blend_original = blend_original
         self.noise_reduction_strength = noise_reduction_strength
         self.transient_protection = transient_protection
@@ -826,13 +823,6 @@ class AudioDenoiser:
         else:
             denoised = self._spectral_subtraction(audio_channel)
 
-        # Apply maximum dB reduction limit (prevents over-processing)
-        max_reduction_linear = 10 ** (-self.max_db_reduction / 20)
-        diff = audio_channel - denoised
-        max_allowed_diff = np.abs(audio_channel) * (1 - max_reduction_linear)
-        diff_limited = np.clip(diff, -max_allowed_diff, max_allowed_diff)
-        denoised = audio_channel - diff_limited
-
         # Transient protection - blend back original at transients
         if self.transient_protection > 0:
             transient_mask = self._detect_transients(audio_channel, self._sr)
@@ -1134,7 +1124,6 @@ class AudioDenoiser:
 
     def update_parameters(
         self,
-        max_db_reduction: Optional[float] = None,
         blend_original: Optional[float] = None,
         noise_reduction_strength: Optional[float] = None,
         transient_protection: Optional[float] = None,
@@ -1147,8 +1136,6 @@ class AudioDenoiser:
         adaptive_blend: Optional[bool] = None,
     ):
         """Update denoiser parameters."""
-        if max_db_reduction is not None:
-            self.max_db_reduction = max_db_reduction
         if blend_original is not None:
             self.blend_original = blend_original
         if noise_reduction_strength is not None:
