@@ -40,6 +40,7 @@ class AudioPlayer:
         self._lock = threading.Lock()
         self._progress_callback: Optional[Callable[[float], None]] = None
         self._completion_callback: Optional[Callable[[], None]] = None
+        self._loop: bool = False
         
     def load(self, audio: np.ndarray, sample_rate: int):
         """
@@ -101,24 +102,34 @@ class AudioPlayer:
                 return
             
             # Calculate chunk to play
-            start = self._position
-            end = min(start + frames, len(self._audio))
-            chunk_size = end - start
+            remaining = frames
+            out_offset = 0
             
-            if chunk_size <= 0:
-                outdata.fill(0)
-                self._state = PlaybackState.STOPPED
-                if self._completion_callback:
-                    # Schedule callback to run outside audio thread
-                    threading.Thread(target=self._completion_callback).start()
-                return
-            
-            # Fill output buffer
-            outdata[:chunk_size] = self._audio[start:end]
-            if chunk_size < frames:
-                outdata[chunk_size:].fill(0)
-            
-            self._position = end
+            while remaining > 0:
+                start = self._position
+                end = min(start + remaining, len(self._audio))
+                chunk_size = end - start
+                
+                if chunk_size <= 0:
+                    if self._loop:
+                        # Loop back to beginning
+                        self._position = 0
+                        continue
+                    else:
+                        outdata[out_offset:].fill(0)
+                        self._state = PlaybackState.STOPPED
+                        if self._completion_callback:
+                            threading.Thread(target=self._completion_callback).start()
+                        return
+                
+                outdata[out_offset:out_offset + chunk_size] = self._audio[start:end]
+                self._position = end
+                out_offset += chunk_size
+                remaining -= chunk_size
+                
+                # If we reached the end and looping, wrap around
+                if self._position >= len(self._audio) and self._loop:
+                    self._position = 0
             
             # Report progress
             if self._progress_callback and len(self._audio) > 0:
@@ -157,11 +168,16 @@ class AudioPlayer:
             if self._state == PlaybackState.PLAYING:
                 self._state = PlaybackState.PAUSED
     
+    def set_loop(self, loop: bool):
+        """Enable or disable loop playback."""
+        self._loop = loop
+
     def stop(self):
         """Stop playback and reset position."""
         with self._lock:
             self._state = PlaybackState.STOPPED
             self._position = 0
+            self._loop = False
         
         if self._stream is not None:
             self._stream.stop()
