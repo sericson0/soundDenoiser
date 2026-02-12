@@ -2,13 +2,12 @@
 Core audio denoising module using multiple techniques for hiss removal.
 
 Implements:
-- Spectral gating with learned noise profiles
-- Spectral subtraction for broadband noise
-- Adaptive blend of subtraction and gating
-- Shellac/78rpm optimized reduction
-- High-frequency focused processing where hiss typically lives
+- Adaptive blend of spectral subtraction and gating
+- Adaptive 2D gain smoothing (time + frequency) for musical noise suppression
+- Multiresolution STFT processing for better transient handling
+- High-frequency synthesis for reconstruction of signal detail buried in noise
 - Noise profile learning for targeted removal
-- Perceptual weighting to preserve audio quality
+- Transient protection and original signal blending
 """
 
 import numpy as np
@@ -454,39 +453,16 @@ class AudioDenoiser:
 
         return noise_estimate
 
-    def _adaptive_blend_denoise(self, audio: np.ndarray) -> np.ndarray:
+    def _compute_gain_matrix(
+        self, stft_mag: np.ndarray, noise_estimate: np.ndarray,
+        noise_std: np.ndarray, min_gain: float, strength: float
+    ) -> np.ndarray:
         """
-        Adaptive blend of spectral subtraction and gating.
+        Compute the blended subtraction/gating gain matrix for a single STFT resolution.
 
-        Intelligently combines both approaches based on:
-        - Frequency: More gating at low frequencies (musical noise more audible),
-                     more subtraction at high frequencies (noise pumping more audible)
-        - Time/SNR: More gating during transients and low-SNR regions,
-                    more subtraction during sustained high-SNR sections
-
-        The artifact_control parameter sets the base blend ratio,
-        and adaptive_blend enables frequency/time-based variation.
+        Returns a gain matrix (same shape as stft_mag) in [min_gain, 1.0].
         """
-        # Compute STFT once for efficiency
-        stft = librosa.stft(audio, n_fft=self.N_FFT, hop_length=self.HOP_LENGTH)
-        stft_mag = np.abs(stft)
-        stft_phase = np.angle(stft)
-
-        # Get noise estimate
-        if self._use_learned_profile and self._noise_profile is not None:
-            noise_estimate = self._noise_profile.spectral_mean
-            noise_std = self._noise_profile.spectral_std
-        else:
-            noise_estimate = self._estimate_noise_spectrum(stft_mag)
-            noise_std = noise_estimate * 0.5
-
-        # Apply noise threshold
         noise_estimate_scaled = noise_estimate * self.noise_threshold
-
-        # === DERIVE STRENGTH FROM dB REDUCTION ===
-        # Convert dB to linear minimum gain and strength equivalent
-        min_gain = 10 ** (-self.reduction_db / 20)
-        strength = 1.0 - min_gain  # 0 at 0dB, ~0.75 at 12dB, ~0.9 at 20dB, ~0.99 at 40dB
 
         # === SPECTRAL SUBTRACTION GAIN ===
         alpha = 1.0 + strength * 2.0
@@ -508,59 +484,268 @@ class AudioDenoiser:
 
         gate_min_gain = max(min_gain, self.spectral_floor)
         gate_gain = gate_min_gain + gate_gain * (1.0 - gate_min_gain)
-        gate_gain = median_filter(gate_gain, size=(1, 3))
         gating_mag = stft_mag * gate_gain
 
         # === COMPUTE BLEND WEIGHTS ===
-        # Base blend from artifact_control (0 = subtraction, 1 = gating)
         base_gating_weight = self.artifact_control
 
         if self.adaptive_blend:
-            # Frequency-based weighting:
-            # Low frequencies -> more gating (musical noise more audible there)
-            # High frequencies -> more subtraction (pumping more audible there)
-            freqs = librosa.fft_frequencies(sr=self._sr, n_fft=self.N_FFT)
-            freq_weights = np.clip((freqs - 500) / 4000, 0, 1)  # 0 at <500Hz, 1 at >4500Hz
-            freq_gating_bias = 0.3 * (1 - freq_weights)  # More gating at low freq
+            # Derive n_fft from stft shape: freq bins = n_fft/2 + 1
+            n_fft_actual = (stft_mag.shape[0] - 1) * 2
+            freqs = librosa.fft_frequencies(sr=self._sr, n_fft=n_fft_actual)
+            freq_weights = np.clip((freqs - 500) / 4000, 0, 1)
+            freq_gating_bias = 0.3 * (1 - freq_weights)
             freq_gating_bias = freq_gating_bias[:, np.newaxis]
 
-            # SNR-based weighting:
-            # Low SNR -> more gating (subtraction artifacts worse at low SNR)
-            # High SNR -> more subtraction (gating pumping more audible)
             snr = stft_mag / (noise_2d + 1e-10)
-            snr_normalized = np.clip((snr - 1) / 5, 0, 1)  # 0 at SNR<=1, 1 at SNR>=6
-            snr_gating_bias = 0.2 * (1 - snr_normalized)  # More gating at low SNR
+            snr_normalized = np.clip((snr - 1) / 5, 0, 1)
+            snr_gating_bias = 0.2 * (1 - snr_normalized)
 
-            # Transient detection for time-based weighting
-            # During transients, prefer gating (better transient preservation)
             frame_energy = np.mean(stft_mag ** 2, axis=0)
             energy_diff = np.diff(frame_energy, prepend=frame_energy[0])
             transient_mask = np.clip(energy_diff / (np.mean(frame_energy) + 1e-10), 0, 1)
             transient_mask = uniform_filter1d(transient_mask, size=3)
-            transient_gating_bias = 0.2 * transient_mask  # More gating at transients
+            transient_gating_bias = 0.2 * transient_mask
 
-            # Combine all biases
             gating_weight = base_gating_weight + freq_gating_bias + snr_gating_bias + transient_gating_bias
             gating_weight = np.clip(gating_weight, 0, 1)
         else:
-            # Simple fixed blend
             gating_weight = base_gating_weight
 
-        # === BLEND THE TWO METHODS ===
+        # === BLEND ===
         subtraction_weight = 1.0 - gating_weight
         blended_mag = subtraction_weight * subtraction_mag + gating_weight * gating_mag
 
-        # Smooth the result to reduce any remaining artifacts
-        blended_mag = median_filter(blended_mag, size=(1, 3))
+        # Convert to gain
+        gain = blended_mag / (stft_mag + 1e-10)
+        gain = np.clip(gain, min_gain, 1.0)
 
-        # Reconstruct with original phase
-        stft_clean = blended_mag * np.exp(1j * stft_phase)
+        return gain
 
-        return librosa.istft(stft_clean, hop_length=self.HOP_LENGTH, length=len(audio))
+    def _adaptive_2d_smooth(self, gain: np.ndarray, stft_mag: np.ndarray,
+                            noise_2d: np.ndarray) -> np.ndarray:
+        """
+        Adaptive 2D gain smoothing (RX Algorithm B equivalent).
+
+        Smooths the gain curve in both time and frequency, with the amount of
+        smoothing adapted to the local SNR. Low-SNR regions (mostly noise) get
+        more smoothing to suppress musical noise artifacts. High-SNR regions
+        (mostly signal) get less smoothing to preserve detail.
+        """
+        # Compute local SNR for each time-frequency bin
+        snr = stft_mag / (noise_2d + 1e-10)
+
+        # Adaptive smoothing width: more smoothing in low-SNR regions
+        # SNR < 2 -> heavy smoothing, SNR > 8 -> minimal smoothing
+        smooth_factor = np.clip(1.0 - (snr - 2) / 6, 0.1, 1.0)
+
+        # Frequency smoothing (along axis 0) - adaptive kernel
+        gain_freq_smooth = uniform_filter1d(gain, size=5, axis=0)
+        # Time smoothing (along axis 1) - adaptive kernel
+        gain_time_smooth = uniform_filter1d(gain, size=5, axis=1)
+        # Combined 2D smooth
+        gain_2d_smooth = (gain_freq_smooth + gain_time_smooth) / 2.0
+
+        # Blend between original gain and smoothed gain based on local SNR
+        # Low SNR -> use smoothed gain (suppresses musical noise)
+        # High SNR -> use original gain (preserves signal detail)
+        gain_out = gain * (1.0 - smooth_factor) + gain_2d_smooth * smooth_factor
+
+        return np.clip(gain_out, np.min(gain), 1.0)
+
+    def _multiresolution_denoise(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Multiresolution denoising (RX Algorithm C equivalent).
+
+        Uses two STFT resolutions:
+        - Long window (4096): good frequency resolution for tonal/sustained content
+        - Short window (1024): good time resolution for transients
+
+        The two are blended based on transient detection, so transients stay
+        sharp while sustained noise is removed with fine frequency precision.
+        """
+        # Get noise estimates
+        if self._use_learned_profile and self._noise_profile is not None:
+            noise_estimate = self._noise_profile.spectral_mean
+            noise_std = self._noise_profile.spectral_std
+        else:
+            stft_temp = librosa.stft(audio, n_fft=self.N_FFT, hop_length=self.HOP_LENGTH)
+            noise_estimate = self._estimate_noise_spectrum(np.abs(stft_temp))
+            noise_std = noise_estimate * 0.5
+
+        min_gain = 10 ** (-self.reduction_db / 20)
+        strength = 1.0 - min_gain
+
+        # === LONG WINDOW (fine frequency resolution, coarse time) ===
+        n_fft_long = 4096
+        hop_long = 1024
+        stft_long = librosa.stft(audio, n_fft=n_fft_long, hop_length=hop_long)
+        stft_long_mag = np.abs(stft_long)
+        stft_long_phase = np.angle(stft_long)
+
+        # Resample noise estimate to match long FFT bins
+        noise_est_long = np.interp(
+            librosa.fft_frequencies(sr=self._sr, n_fft=n_fft_long),
+            librosa.fft_frequencies(sr=self._sr, n_fft=self.N_FFT),
+            noise_estimate
+        )
+        noise_std_long = np.interp(
+            librosa.fft_frequencies(sr=self._sr, n_fft=n_fft_long),
+            librosa.fft_frequencies(sr=self._sr, n_fft=self.N_FFT),
+            noise_std
+        )
+
+        gain_long = self._compute_gain_matrix(
+            stft_long_mag, noise_est_long, noise_std_long, min_gain, strength
+        )
+        # Apply adaptive 2D smoothing to long-window gain
+        noise_2d_long = (noise_est_long * self.noise_threshold)[:, np.newaxis]
+        gain_long = self._adaptive_2d_smooth(gain_long, stft_long_mag, noise_2d_long)
+
+        denoised_long = librosa.istft(
+            stft_long_mag * gain_long * np.exp(1j * stft_long_phase),
+            hop_length=hop_long, length=len(audio)
+        )
+
+        # === SHORT WINDOW (fine time resolution, coarse frequency) ===
+        n_fft_short = 1024
+        hop_short = 256
+        stft_short = librosa.stft(audio, n_fft=n_fft_short, hop_length=hop_short)
+        stft_short_mag = np.abs(stft_short)
+        stft_short_phase = np.angle(stft_short)
+
+        # Resample noise estimate to match short FFT bins
+        noise_est_short = np.interp(
+            librosa.fft_frequencies(sr=self._sr, n_fft=n_fft_short),
+            librosa.fft_frequencies(sr=self._sr, n_fft=self.N_FFT),
+            noise_estimate
+        )
+        noise_std_short = np.interp(
+            librosa.fft_frequencies(sr=self._sr, n_fft=n_fft_short),
+            librosa.fft_frequencies(sr=self._sr, n_fft=self.N_FFT),
+            noise_std
+        )
+
+        gain_short = self._compute_gain_matrix(
+            stft_short_mag, noise_est_short, noise_std_short, min_gain, strength
+        )
+        # Light smoothing for short window (preserve transients)
+        gain_short = median_filter(gain_short, size=(1, 3))
+
+        denoised_short = librosa.istft(
+            stft_short_mag * gain_short * np.exp(1j * stft_short_phase),
+            hop_length=hop_short, length=len(audio)
+        )
+
+        # === BLEND BASED ON TRANSIENT DETECTION ===
+        # Use onset strength to detect transients
+        onset_env = librosa.onset.onset_strength(y=audio, sr=self._sr,
+                                                  hop_length=hop_short)
+        onset_env = onset_env / (np.max(onset_env) + 1e-8)
+
+        # Upsample transient mask to sample level
+        transient_weight = np.interp(
+            np.linspace(0, 1, len(audio)),
+            np.linspace(0, 1, len(onset_env)),
+            onset_env
+        )
+        # Smooth transition
+        transient_weight = uniform_filter1d(transient_weight, size=max(1, int(self._sr * 0.01)))
+        transient_weight = np.clip(transient_weight * 3, 0, 1)
+
+        # During transients, use short-window result; otherwise use long-window
+        denoised = denoised_long * (1 - transient_weight) + denoised_short * transient_weight
+
+        return denoised
+
+    def _hf_synthesis(self, denoised: np.ndarray, original: np.ndarray) -> np.ndarray:
+        """
+        High-frequency synthesis (RX Algorithm D equivalent).
+
+        Reconstructs high-frequency signal detail that may have been buried
+        in noise and removed during denoising. Uses spectral envelope matching
+        to synthesize plausible high-frequency content from the denoised mid-band.
+
+        This helps avoid the "dull" or "muffled" quality that aggressive denoising
+        can produce in the upper frequencies.
+        """
+        stft_orig = librosa.stft(original, n_fft=self.N_FFT, hop_length=self.HOP_LENGTH)
+        stft_den = librosa.stft(denoised, n_fft=self.N_FFT, hop_length=self.HOP_LENGTH)
+        orig_mag = np.abs(stft_orig)
+        den_mag = np.abs(stft_den)
+        den_phase = np.angle(stft_den)
+
+        freqs = librosa.fft_frequencies(sr=self._sr, n_fft=self.N_FFT)
+
+        # Get noise estimate for determining what was removed
+        if self._use_learned_profile and self._noise_profile is not None:
+            noise_estimate = self._noise_profile.spectral_mean
+        else:
+            noise_estimate = self._estimate_noise_spectrum(orig_mag)
+        noise_2d = (noise_estimate * self.noise_threshold)[:, np.newaxis]
+
+        # Define HF region (above 4kHz, scaled to sample rate)
+        hf_start = 4000.0
+        hf_mask = freqs >= hf_start
+
+        if not np.any(hf_mask):
+            return denoised
+
+        # For each HF bin, estimate how much signal was lost vs noise removed
+        # If original was significantly above noise floor, some signal was likely lost
+        orig_snr = orig_mag / (noise_2d + 1e-10)
+        den_snr = den_mag / (noise_2d + 1e-10)
+
+        # Signal loss estimate: where original had moderate SNR (1.5-5x noise)
+        # but denoised is near the floor, there was likely buried signal
+        signal_loss = np.clip((orig_snr - 1.5) / 3.5, 0, 1) * np.clip(1.0 - den_snr / 2, 0, 1)
+
+        # Only apply in HF region
+        hf_signal_loss = np.zeros_like(signal_loss)
+        hf_signal_loss[hf_mask, :] = signal_loss[hf_mask, :]
+
+        # Taper in gradually from hf_start
+        taper = np.zeros(len(freqs))
+        taper[hf_mask] = np.clip((freqs[hf_mask] - hf_start) / 2000, 0, 1)
+        hf_signal_loss *= taper[:, np.newaxis]
+
+        # Synthesize: add back a fraction of the removed energy shaped by the
+        # spectral envelope of nearby mid-frequency content
+        # Use the ratio of denoised to original as a guide
+        removed = orig_mag - den_mag
+        removed = np.maximum(removed, 0)
+
+        # Only add back a conservative fraction to avoid reintroducing noise
+        # Scale by reduction_db: lighter reduction = less synthesis needed
+        synthesis_strength = np.clip(self.reduction_db / 40, 0, 0.5) * 0.4
+        synthesis = removed * hf_signal_loss * synthesis_strength
+
+        # Smooth the synthesis to avoid introducing new artifacts
+        synthesis = uniform_filter1d(synthesis, size=3, axis=0)
+        synthesis = uniform_filter1d(synthesis, size=5, axis=1)
+
+        # Add synthesized HF content
+        result_mag = den_mag + synthesis
+        stft_result = result_mag * np.exp(1j * den_phase)
+
+        return librosa.istft(stft_result, hop_length=self.HOP_LENGTH, length=len(denoised))
 
     def _process_channel(self, audio_channel: np.ndarray) -> np.ndarray:
-        """Process a single audio channel with adaptive blend denoising."""
-        denoised = self._adaptive_blend_denoise(audio_channel)
+        """
+        Process a single audio channel.
+
+        Pipeline:
+        1. Multiresolution denoising (blends long-window for frequency precision
+           and short-window for transient preservation, with adaptive 2D smoothing)
+        2. High-frequency synthesis (reconstructs HF detail buried in noise)
+        3. Transient protection (blends back original at detected onsets)
+        4. Original signal blending (dry/wet mix)
+        """
+        # Core denoising with multiresolution + adaptive 2D smoothing
+        denoised = self._multiresolution_denoise(audio_channel)
+
+        # Reconstruct high-frequency detail
+        denoised = self._hf_synthesis(denoised, audio_channel)
 
         # Transient protection - blend back original at transients
         if self.transient_protection > 0:
