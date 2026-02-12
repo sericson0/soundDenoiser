@@ -35,8 +35,6 @@ except ImportError:
 
 class DenoiseMethod(Enum):
     """Available denoising methods."""
-    SPECTRAL_SUBTRACTION = "spectral"    # Classic spectral subtraction (good general purpose)
-    SPECTRAL_GATING = "gating"           # Pure spectral gating using learned noise profile
     ADAPTIVE_BLEND = "adaptive"          # Intelligent blend of subtraction and gating
 
 
@@ -79,7 +77,7 @@ class AudioDenoiser:
         blend_original: float = 0.08,
         noise_reduction_strength: float = 0.85,
         transient_protection: float = 0.3,
-        method: DenoiseMethod = DenoiseMethod.SPECTRAL_SUBTRACTION,
+        method: DenoiseMethod = DenoiseMethod.ADAPTIVE_BLEND,
         spectral_floor: float = 0.05,
         noise_threshold: float = 1.2,
         artifact_control: float = 0.5,
@@ -92,7 +90,7 @@ class AudioDenoiser:
             blend_original: Amount of original signal to blend back (0-1, default: 0.05)
             noise_reduction_strength: Overall strength of noise reduction (0-1, default: 0.85)
             transient_protection: How much to protect transients (0-1, default: 0.3)
-            method: Denoising method to use (default: SPECTRAL_SUBTRACTION)
+            method: Denoising method to use (default: ADAPTIVE_BLEND)
             spectral_floor: Minimum signal to retain, prevents artifacts (0-1, default: 0.05)
             noise_threshold: Multiplier for noise estimate boundary (0.5-3.0, default: 1.0)
                 Higher values = more aggressive (treats more as noise)
@@ -455,58 +453,6 @@ class AudioDenoiser:
 
         return noise_estimate
 
-    def _spectral_gating(self, audio: np.ndarray) -> np.ndarray:
-        """
-        Pure spectral gating using the learned noise profile.
-
-        This method requires a learned noise profile. It applies a soft gate
-        that attenuates frequency bins where the signal is below or near the
-        learned noise floor. More aggressive than spectral subtraction but
-        very effective when you have a good noise sample.
-        """
-        # Compute STFT
-        stft = librosa.stft(audio, n_fft=self.N_FFT, hop_length=self.HOP_LENGTH)
-        stft_mag = np.abs(stft)
-        stft_phase = np.angle(stft)
-
-        # Get noise estimate - prefer learned profile
-        if self._use_learned_profile and self._noise_profile is not None:
-            noise_estimate = self._noise_profile.spectral_mean
-            noise_std = self._noise_profile.spectral_std
-        else:
-            # Fall back to automatic estimation if no profile learned
-            noise_estimate = self._estimate_noise_spectrum(stft_mag)
-            noise_std = noise_estimate * 0.5  # Approximate std
-
-        # Apply noise threshold multiplier
-        gate_threshold = noise_estimate * self.noise_threshold
-
-        # Expand to match STFT shape
-        gate_threshold_2d = gate_threshold[:, np.newaxis]
-        noise_std_2d = noise_std[:, np.newaxis] if noise_std is not None else gate_threshold_2d * 0.3
-
-        # Soft gating: compute gain based on how far above threshold the signal is
-        # Gain = 1 when signal >> threshold, Gain -> reduction_amount when signal <= threshold
-        margin = stft_mag - gate_threshold_2d
-
-        # Sigmoid-like soft gate centered around the threshold
-        # Use noise_std to control the transition width
-        transition_width = np.maximum(noise_std_2d * 2, 1e-10)
-        gate_gain = 1.0 / (1.0 + np.exp(-margin / transition_width * 4))
-
-        # Apply reduction strength - controls how much attenuation below threshold
-        min_gain = 1.0 - self.noise_reduction_strength
-        min_gain = max(min_gain, self.spectral_floor)
-        gate_gain = min_gain + gate_gain * (1.0 - min_gain)
-
-        # Smooth gain temporally to reduce musical noise
-        gate_gain = median_filter(gate_gain, size=(1, 3))
-
-        # Apply gate
-        stft_gated = stft_mag * gate_gain * np.exp(1j * stft_phase)
-
-        return librosa.istft(stft_gated, hop_length=self.HOP_LENGTH, length=len(audio))
-
     def _adaptive_blend_denoise(self, audio: np.ndarray) -> np.ndarray:
         """
         Adaptive blend of spectral subtraction and gating.
@@ -606,64 +552,9 @@ class AudioDenoiser:
 
         return librosa.istft(stft_clean, hop_length=self.HOP_LENGTH, length=len(audio))
 
-    def _spectral_subtraction(self, audio: np.ndarray) -> np.ndarray:
-        """
-        Classic spectral subtraction for noise removal.
-
-        Subtracts estimated noise spectrum from the signal spectrum.
-        Uses over-subtraction factor and spectral floor to reduce musical noise.
-        """
-        # Compute STFT
-        stft = librosa.stft(audio, n_fft=self.N_FFT, hop_length=self.HOP_LENGTH)
-        stft_mag = np.abs(stft)
-        stft_phase = np.angle(stft)
-
-        # Get noise estimate
-        if self._use_learned_profile and self._noise_profile is not None:
-            noise_estimate = self._noise_profile.spectral_mean
-        else:
-            noise_estimate = self._estimate_noise_spectrum(stft_mag)
-
-        # Apply noise threshold - multiplies the noise estimate to define the boundary
-        # Higher threshold = more aggressive (treats more as noise)
-        # Lower threshold = more conservative (preserves more signal)
-        noise_estimate = noise_estimate * self.noise_threshold
-
-        # Over-subtraction factor (reduces musical noise)
-        alpha = 1.0 + self.noise_reduction_strength * 2.0
-
-        # Spectral floor (prevents negative values and musical noise artifacts)
-        # Uses the configurable spectral_floor parameter
-        beta = self.spectral_floor + (1 - self.noise_reduction_strength) * 0.05
-
-        # Perform spectral subtraction
-        noise_estimate_2d = noise_estimate[:, np.newaxis]
-        subtracted = stft_mag ** 2 - alpha * (noise_estimate_2d ** 2)
-
-        # Apply spectral floor
-        spectral_floor = beta * (noise_estimate_2d ** 2)
-        subtracted = np.maximum(subtracted, spectral_floor)
-
-        # Take square root to get magnitude
-        subtracted_mag = np.sqrt(subtracted)
-
-        # Reconstruct with original phase
-        stft_clean = subtracted_mag * np.exp(1j * stft_phase)
-
-        return librosa.istft(stft_clean, hop_length=self.HOP_LENGTH, length=len(audio))
-
     def _process_channel(self, audio_channel: np.ndarray) -> np.ndarray:
-        """Process a single audio channel with the selected denoising method."""
-
-        # Apply the selected denoising method
-        if self.method == DenoiseMethod.SPECTRAL_GATING:
-            denoised = self._spectral_gating(audio_channel)
-        elif self.method == DenoiseMethod.SPECTRAL_SUBTRACTION:
-            denoised = self._spectral_subtraction(audio_channel)
-        elif self.method == DenoiseMethod.ADAPTIVE_BLEND:
-            denoised = self._adaptive_blend_denoise(audio_channel)
-        else:
-            denoised = self._spectral_subtraction(audio_channel)
+        """Process a single audio channel with adaptive blend denoising."""
+        denoised = self._adaptive_blend_denoise(audio_channel)
 
         # Transient protection - blend back original at transients
         if self.transient_protection > 0:

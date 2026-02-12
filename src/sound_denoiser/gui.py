@@ -365,55 +365,8 @@ class SoundDenoiserApp(ctk.CTk):
         params_inner = ctk.CTkFrame(params_frame, fg_color="transparent")
         params_inner.pack(fill="x", padx=10, pady=(0, 10))
 
-        # Denoising Method Selector
-        method_frame = ctk.CTkFrame(params_inner, fg_color="transparent")
-        method_frame.pack(fill="x", pady=(0, 12))
-
-        method_label = ctk.CTkLabel(
-            method_frame,
-            text="Denoising Method",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            text_color="#cccccc"
-        )
-        method_label.pack(anchor="w")
-
-        # Method names for display
-        self._method_names = {
-            "Spectral Subtraction": DenoiseMethod.SPECTRAL_SUBTRACTION,
-            "Spectral Gating (Learned Profile)": DenoiseMethod.SPECTRAL_GATING,
-            "Adaptive Blend (Subtraction+Gating)": DenoiseMethod.ADAPTIVE_BLEND,
-        }
-
-        self.method_dropdown = ctk.CTkOptionMenu(
-            method_frame,
-            values=list(self._method_names.keys()),
-            command=self._on_method_change,
-            fg_color="#252535",
-            button_color="#6c3483",
-            button_hover_color="#8e44ad",
-            dropdown_fg_color="#1a1a2e",
-            dropdown_hover_color="#252535",
-            font=ctk.CTkFont(size=11),
-            width=200
-        )
-        self.method_dropdown.set("Spectral Subtraction")
-        self.method_dropdown.pack(anchor="w", pady=(5, 0))
-
-        # Method description - shows which parameters are most effective
-        self._method_descriptions = {
-            "Spectral Subtraction": "Best for: General hiss. Key params: Strength, Noise Threshold, HF Reduction",
-            "Spectral Gating (Learned Profile)": "Best with learned profile. Soft gate based on noise floor",
-            "Adaptive Blend (Subtraction+Gating)": "Blends both methods. Use Artifact Control to balance",
-        }
-
-        self.method_desc_label = ctk.CTkLabel(
-            method_frame,
-            text=self._method_descriptions["Spectral Subtraction"],
-            font=ctk.CTkFont(size=10),
-            text_color="#888888",
-            wraplength=190
-        )
-        self.method_desc_label.pack(anchor="w", pady=(3, 0))
+        # Set the denoising method to Adaptive Blend
+        self.denoiser.set_method(DenoiseMethod.ADAPTIVE_BLEND)
 
         # Blend Original
         self.blend_slider = ParameterSlider(
@@ -878,32 +831,6 @@ class SoundDenoiserApp(ctk.CTk):
             self.waveform_original.set_noise_threshold_multiplier(noise_thresh)
             self.waveform_processed.set_noise_threshold_multiplier(noise_thresh)
 
-    def _on_method_change(self, method_name: str):
-        """Handle denoising method change."""
-        method = self._method_names.get(method_name, DenoiseMethod.SPECTRAL_SUBTRACTION)
-        self.denoiser.set_method(method)
-
-        # Update method description
-        desc = self._method_descriptions.get(method_name, "")
-        self.method_desc_label.configure(text=desc)
-
-        # Define which sliders are relevant for each method
-        dim_color = "#666666"
-        active_color = "#cccccc"
-
-        # Spectral floor - relevant for Spectral and Spectral Gating
-        floor_relevant = method_name in ["Spectral Subtraction", "Spectral Gating (Learned Profile)"]
-        self.spectral_floor_slider.label.configure(text_color=active_color if floor_relevant else dim_color)
-
-        # Noise threshold - relevant for all spectral methods
-        threshold_relevant = True
-        self.noise_threshold_slider.label.configure(text_color=active_color if threshold_relevant else dim_color)
-
-        self._set_status(f"Method changed to: {method_name}")
-        # Highlight process button to indicate reprocessing needed
-        if self.denoiser.get_original() is not None and not self.is_processing:
-            self.process_btn.configure(fg_color="#884499")
-
     def _reset_parameters(self):
         """Reset parameters to defaults."""
         self.blend_slider.set(5.0)
@@ -914,9 +841,6 @@ class SoundDenoiserApp(ctk.CTk):
         self.noise_threshold_slider.set(1.0)
         self.artifact_control_slider.set(50.0)
         self.adaptive_blend_var.set(True)
-        # Method default
-        self.method_dropdown.set("Spectral Subtraction")
-        self.denoiser.set_method(DenoiseMethod.SPECTRAL_SUBTRACTION)
 
     def _get_player(self, which: str) -> AudioPlayer:
         """Return the player for the requested view."""
