@@ -892,6 +892,36 @@ class WaveformDisplay(ctk.CTkFrame):
         self._selected_region = None
         self.canvas.draw_idle()
 
+    def hide_selection_rects(self):
+        """Hide all selection rectangles (set alpha to 0)."""
+        if hasattr(self, "_selection_rects"):
+            for rect in self._selection_rects:
+                try:
+                    rect.set_alpha(0)
+                except Exception:
+                    pass
+        if self.selection_rect:
+            try:
+                self.selection_rect.set_alpha(0)
+            except Exception:
+                pass
+        self.canvas.draw_idle()
+
+    def show_selection_rects(self):
+        """Show all selection rectangles (restore alpha to 0.3)."""
+        if hasattr(self, "_selection_rects"):
+            for rect in self._selection_rects:
+                try:
+                    rect.set_alpha(0.3)
+                except Exception:
+                    pass
+        if self.selection_rect:
+            try:
+                self.selection_rect.set_alpha(0.3)
+            except Exception:
+                pass
+        self.canvas.draw_idle()
+
     def set_noise_region(self, start: float, end: float):
         """Set and display a noise region."""
         self._selected_region = (start, end)

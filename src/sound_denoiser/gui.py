@@ -52,6 +52,7 @@ class SoundDenoiserApp(ctk.CTk):
         self.denoiser = AudioDenoiser()
         self.player_original = AudioPlayer()
         self.player_processed = AudioPlayer()
+        self.player_noise_preview = AudioPlayer()
         self.current_player: Optional[AudioPlayer] = None
         self.active_waveform_view = "original"  # "original" or "processed"
         self.noise_selection_enabled = False
@@ -341,6 +342,8 @@ class SoundDenoiserApp(ctk.CTk):
             on_toggle_use=self._toggle_use_profile,
             on_toggle_selection=self._toggle_noise_selection,
             on_remove_selection=self._on_remove_noise_selection,
+            on_play_selection=self._on_play_selection,
+            on_edit_selection=self._on_edit_selection,
         )
         self.noise_profile_panel.pack(fill="x", padx=5, pady=(5, 10))
 
@@ -663,8 +666,12 @@ class SoundDenoiserApp(ctk.CTk):
             self._set_active_waveform_view("original", preserve_position=True, preserve_play_state=True)
             self.waveform_original.set_view_mode("waveform")
             self.waveform_original.enable_selection(True)
+            # Show selection rectangles when entering selection mode
+            self.waveform_original.show_selection_rects()
         else:
             self.waveform_original.enable_selection(False)
+            # Hide selection rectangles when leaving selection mode
+            self.waveform_original.hide_selection_rects()
 
         # Reflect state in panel
         self.noise_profile_panel.set_selection_enabled(enable)
@@ -684,6 +691,52 @@ class SoundDenoiserApp(ctk.CTk):
             self.waveform_original.add_selection_rect(start, end)
         count = len(selections)
         self._set_status(f"Removed selection. {count} region(s) remaining.")
+
+    def _on_play_selection(self, play: bool):
+        """Handle play/stop selection button. Loops all selected noise regions."""
+        if play:
+            selections = self.noise_profile_panel.get_selections()
+            if not selections or self.denoiser._audio is None:
+                self.noise_profile_panel.set_playing_selection(False)
+                return
+
+            # Extract audio for all selected regions and concatenate
+            sr = self.denoiser._sr
+            audio = self.denoiser._audio  # shape (channels, samples)
+            chunks = []
+            for start_t, end_t in selections:
+                s = int(start_t * sr)
+                e = int(end_t * sr)
+                s = max(0, min(s, audio.shape[1]))
+                e = max(0, min(e, audio.shape[1]))
+                if e > s:
+                    chunks.append(audio[:, s:e])
+
+            if not chunks:
+                self.noise_profile_panel.set_playing_selection(False)
+                return
+
+            concat = np.concatenate(chunks, axis=1)
+            self.player_noise_preview.stop()
+            self.player_noise_preview.load(concat, sr)
+            self.player_noise_preview.set_loop(True)
+            self.player_noise_preview.play()
+            self._set_status("Playing noise selection (looped)...")
+        else:
+            self.player_noise_preview.stop()
+            self._set_status("Stopped noise preview.")
+
+    def _on_edit_selection(self, index: int, new_start: float, new_end: float):
+        """Handle editing of a noise selection's start/end time."""
+        selections = self.noise_profile_panel.get_selections()
+        if 0 <= index < len(selections):
+            self.noise_profile_panel._selections[index] = (new_start, new_end)
+            self.noise_profile_panel._update_selections_display()
+            # Redraw waveform selections
+            self.waveform_original.clear_selection()
+            for start, end in self.noise_profile_panel.get_selections():
+                self.waveform_original.add_selection_rect(start, end)
+            self._set_status(f"Updated selection {index + 1}.")
 
     def _load_audio(self):
         """Open file dialog to load audio file."""
@@ -936,6 +989,11 @@ class SoundDenoiserApp(ctk.CTk):
 
         if other_player.is_playing():
             other_player.pause()
+
+        # Stop noise preview if it's playing
+        if self.player_noise_preview.is_playing():
+            self.player_noise_preview.stop()
+            self.noise_profile_panel.set_playing_selection(False)
 
         if player.is_playing():
             player.pause()

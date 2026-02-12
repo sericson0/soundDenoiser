@@ -169,6 +169,8 @@ class NoiseProfilePanel(ctk.CTkFrame):
         on_toggle_use,
         on_toggle_selection=None,
         on_remove_selection=None,
+        on_play_selection=None,
+        on_edit_selection=None,
         **kwargs,
     ):
         super().__init__(master, fg_color="#151525", corner_radius=10, **kwargs)
@@ -179,9 +181,12 @@ class NoiseProfilePanel(ctk.CTkFrame):
         self.on_toggle_use = on_toggle_use
         self.on_toggle_selection = on_toggle_selection
         self.on_remove_selection = on_remove_selection
+        self.on_play_selection = on_play_selection
+        self.on_edit_selection = on_edit_selection
         self._selection_enabled = False
         self._selections: List[Tuple[float, float]] = []
         self._selection_widgets = []
+        self._is_playing_selection = False
 
         self._setup_ui()
 
@@ -227,6 +232,20 @@ class NoiseProfilePanel(ctk.CTkFrame):
             text_color="#555555",
         )
         self.no_selections_label.pack(pady=5)
+
+        # Play Selection button (loops all selected noise regions)
+        self.play_selection_btn = ctk.CTkButton(
+            self.selections_frame,
+            text="Play Selection",
+            command=self._on_play_selection,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color="#2a4a6a",
+            hover_color="#3a5a7a",
+            height=26,
+            corner_radius=6,
+            state="disabled",
+        )
+        self.play_selection_btn.pack(fill="x", padx=10, pady=(0, 8))
 
         sep2 = ctk.CTkFrame(self, height=1, fg_color="#333333")
         sep2.pack(fill="x", padx=10, pady=5)
@@ -345,13 +364,68 @@ class NoiseProfilePanel(ctk.CTkFrame):
                 row.pack(fill="x", pady=1)
                 self._selection_widgets.append(row)
 
-                label = ctk.CTkLabel(
+                # Row number label
+                num_label = ctk.CTkLabel(
                     row,
-                    text=f"{i + 1}. {start:.2f}s - {end:.2f}s ({duration:.2f}s)",
+                    text=f"{i + 1}.",
                     font=ctk.CTkFont(size=10),
                     text_color="#aaaaaa",
+                    width=18,
                 )
-                label.pack(side="left", padx=(5, 0))
+                num_label.pack(side="left", padx=(2, 0))
+
+                # Editable start time entry
+                start_var = ctk.StringVar(value=f"{start:.2f}")
+                start_entry = ctk.CTkEntry(
+                    row,
+                    textvariable=start_var,
+                    font=ctk.CTkFont(size=10),
+                    width=55,
+                    height=20,
+                    fg_color="#1a2a3a",
+                    text_color="#cccccc",
+                    border_color="#444444",
+                    border_width=1,
+                    corner_radius=3,
+                )
+                start_entry.pack(side="left", padx=(2, 0))
+
+                dash_label = ctk.CTkLabel(
+                    row, text="-", font=ctk.CTkFont(size=10), text_color="#888888", width=10,
+                )
+                dash_label.pack(side="left", padx=1)
+
+                # Editable end time entry
+                end_var = ctk.StringVar(value=f"{end:.2f}")
+                end_entry = ctk.CTkEntry(
+                    row,
+                    textvariable=end_var,
+                    font=ctk.CTkFont(size=10),
+                    width=55,
+                    height=20,
+                    fg_color="#1a2a3a",
+                    text_color="#cccccc",
+                    border_color="#444444",
+                    border_width=1,
+                    corner_radius=3,
+                )
+                end_entry.pack(side="left", padx=(0, 2))
+
+                # Bind both entries to the same callback (both vars now exist)
+                start_entry.bind("<Return>", lambda e, idx=i, sv=start_var, ev=end_var: self._on_entry_edit(idx, sv, ev))
+                start_entry.bind("<FocusOut>", lambda e, idx=i, sv=start_var, ev=end_var: self._on_entry_edit(idx, sv, ev))
+                end_entry.bind("<Return>", lambda e, idx=i, sv=start_var, ev=end_var: self._on_entry_edit(idx, sv, ev))
+                end_entry.bind("<FocusOut>", lambda e, idx=i, sv=start_var, ev=end_var: self._on_entry_edit(idx, sv, ev))
+
+                # Duration label
+                dur_label = ctk.CTkLabel(
+                    row,
+                    text=f"({duration:.2f}s)",
+                    font=ctk.CTkFont(size=9),
+                    text_color="#666666",
+                    width=45,
+                )
+                dur_label.pack(side="left", padx=(2, 0))
 
                 del_btn = ctk.CTkButton(
                     row,
@@ -364,16 +438,65 @@ class NoiseProfilePanel(ctk.CTkFrame):
                     height=20,
                     corner_radius=4,
                 )
-                del_btn.pack(side="right", padx=5)
+                del_btn.pack(side="right", padx=2)
+
+    def _on_entry_edit(self, index: int, start_var: ctk.StringVar, end_var: ctk.StringVar):
+        """Handle when user edits a start or end time entry field."""
+        if index >= len(self._selections):
+            return
+        current_start, current_end = self._selections[index]
+        try:
+            new_start = float(start_var.get())
+        except ValueError:
+            new_start = current_start
+            start_var.set(f"{current_start:.2f}")
+
+        try:
+            new_end = float(end_var.get())
+        except ValueError:
+            new_end = current_end
+            end_var.set(f"{current_end:.2f}")
+
+        # Validate: start < end, both >= 0
+        new_start = max(0.0, new_start)
+        new_end = max(new_start + 0.01, new_end)
+
+        if new_start != current_start or new_end != current_end:
+            self._selections[index] = (new_start, new_end)
+            if self.on_edit_selection:
+                self.on_edit_selection(index, new_start, new_end)
+
+    def _on_play_selection(self):
+        """Handle play/stop selection button click."""
+        if self._is_playing_selection:
+            self._is_playing_selection = False
+            self.play_selection_btn.configure(text="Play Selection", fg_color="#2a4a6a", hover_color="#3a5a7a")
+            if self.on_play_selection:
+                self.on_play_selection(False)
+        else:
+            self._is_playing_selection = True
+            self.play_selection_btn.configure(text="Stop", fg_color="#882222", hover_color="#aa3333")
+            if self.on_play_selection:
+                self.on_play_selection(True)
+
+    def set_playing_selection(self, playing: bool):
+        """Update the play button state externally (e.g., when playback finishes)."""
+        self._is_playing_selection = playing
+        if playing:
+            self.play_selection_btn.configure(text="Stop", fg_color="#882222", hover_color="#aa3333")
+        else:
+            self.play_selection_btn.configure(text="Play Selection", fg_color="#2a4a6a", hover_color="#3a5a7a")
 
     def _update_learn_button(self):
         if len(self._selections) > 0:
             self.learn_btn.configure(state="normal")
             total_duration = sum(end - start for start, end in self._selections)
             self.learn_btn.configure(text=f"Learn from {len(self._selections)} Selection(s)")
+            self.play_selection_btn.configure(state="normal")
         else:
             self.learn_btn.configure(state="disabled")
             self.learn_btn.configure(text="Learn from Selections")
+            self.play_selection_btn.configure(state="disabled")
 
     def _on_clear(self):
         self.clear_selections()

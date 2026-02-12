@@ -260,93 +260,175 @@ class AudioDenoiser:
         self._use_learned_profile = True
         return self._noise_profile
 
-    def _score_region(self, audio_window: np.ndarray) -> Optional[Tuple[float, float, float]]:
-        """
-        Score an audio window for how likely it is to be pure noise (not music, not silence).
-        
-        Returns:
-            Tuple of (score, rms, flatness) or None if the region should be skipped.
-        """
-        rms = np.sqrt(np.mean(audio_window ** 2))
-        peak = np.max(np.abs(audio_window))
-        
-        # Skip digital silence or near-silence
-        if peak < 0.002 or rms < 0.0005:
-            return None
-        
-        # Compute spectral flatness (noise is spectrally flat, music is not)
-        stft = librosa.stft(audio_window, n_fft=1024, hop_length=256)
-        mag = np.abs(stft)
-        
-        # Geometric mean / arithmetic mean = spectral flatness
-        # Higher values indicate more noise-like signal
-        geometric_mean = np.exp(np.mean(np.log(mag + 1e-10), axis=0))
-        arithmetic_mean = np.mean(mag, axis=0)
-        flatness = np.mean(geometric_mean / (arithmetic_mean + 1e-10))
-        
-        # Check for low spectral variation over time (noise is consistent)
-        spectral_var = np.var(np.mean(mag, axis=0))
-        
-        # Score: high flatness + low variation + moderate energy = noise
-        score = flatness * 100 - spectral_var * 1000 - rms * 10
-        
-        # Penalize very low or high energy
-        if rms < 0.005 or rms > 0.1:
-            score -= 50
-        
-        return (score, rms, flatness)
-    
-    def _scan_region_for_noise(
-        self, audio: np.ndarray, scan_start: int, scan_end: int,
-        window_samples: int, hop_samples: int, min_score: float = -20.0
+    def _find_noise_from_edge(
+        self, audio: np.ndarray, step_samples: int,
+        from_start: bool = True, silence_peak: float = 0.002,
+        max_scan_seconds: float = 15.0
     ) -> Optional[Tuple[int, int, float]]:
         """
-        Scan a portion of audio for the best noise-only window.
+        Find a noise region at one edge of the audio by scanning inward.
+        
+        Two-phase approach that handles both stable and fading noise:
+        
+        Phase 1 (initial calibration):
+            Walk inward from the edge, skip silence. Collect the first 3
+            non-silent windows unconditionally — these are at the very edge
+            and are the most reliably noise-only audio.
+            
+        Phase 2 (expanding calibration):
+            Continue walking inward. Accept windows whose RMS is within 5x
+            of the initial floor (handles gradual fade-in/out of hiss).
+            Track the running max RMS as the true noise floor.  Stop
+            expansion when a window exceeds 5x initial floor.
+            
+        Phase 3 (final walk):
+            Use the expanded noise floor. Accept windows < noise_floor * 3.
+            Stop at the first window that exceeds this threshold (music).
         
         Args:
-            audio: Audio array (1D)
-            scan_start: Start sample of scan region
-            scan_end: End sample of scan region
-            window_samples: Size of each candidate window
-            hop_samples: Hop between candidate windows
-            min_score: Minimum acceptable score to be considered noise
-            
+            audio: Audio array (1D, full track)
+            step_samples: Window size in samples (e.g. 0.1s worth)
+            from_start: If True, scan from sample 0 forward.
+                        If False, scan from the end backward.
+            silence_peak: Peak amplitude below which a window is silence
+            max_scan_seconds: Max seconds from the edge to scan.
+        
         Returns:
-            (start_sample, end_sample, score) of best noise region, or None.
+            (start_sample, end_sample, noise_floor_rms) or None.
         """
-        best = None  # (score, start, end)
+        sr = self._sr
+        total = len(audio)
+        max_scan_samples = int(max_scan_seconds * sr)
         
-        range_end = min(scan_end - window_samples, len(audio) - window_samples)
-        if range_end <= scan_start:
+        # Determine the scan zone
+        if from_start:
+            zone_start = 0
+            zone_end = min(total, max_scan_samples)
+        else:
+            zone_start = max(0, total - max_scan_samples)
+            zone_end = total
+        
+        zone = audio[zone_start:zone_end]
+        n = len(zone)
+        if n < step_samples:
             return None
         
-        for start in range(scan_start, range_end, hop_samples):
-            end = start + window_samples
-            window = audio[start:end]
-            
-            result = self._score_region(window)
-            if result is None:
-                continue
-            
-            score, rms, flatness = result
-            
-            if score < min_score:
-                continue
-            
-            if best is None or score > best[0]:
-                best = (score, start, end)
-        
-        if best is None:
+        # ── Compute RMS and peak for every window in the zone ──
+        window_starts = list(range(0, n - step_samples + 1, step_samples))
+        if not window_starts:
             return None
-        return (best[1], best[2], best[0])
+        
+        rms_arr = np.empty(len(window_starts))
+        peak_arr = np.empty(len(window_starts))
+        for i, ws in enumerate(window_starts):
+            chunk = zone[ws:ws + step_samples]
+            rms_arr[i] = np.sqrt(np.mean(chunk ** 2))
+            peak_arr[i] = np.max(np.abs(chunk))
+        
+        is_silence = (peak_arr < silence_peak) | (rms_arr < 0.0002)
+        
+        # ── Walk inward from the edge ──
+        if from_start:
+            indices = list(range(len(window_starts)))
+        else:
+            indices = list(range(len(window_starts) - 1, -1, -1))
+        
+        # Phase 1: skip silence, collect first 3 non-silent as calibration
+        calibration_count = 3
+        calibration_rms = []
+        noise_accepted = []  # list of window indices accepted as noise
+        phase1_done = False
+        walk_start_idx = 0  # where to resume after phase 1
+        
+        for pos, i in enumerate(indices):
+            if is_silence[i]:
+                if not calibration_rms:
+                    continue  # Still in leading silence
+                else:
+                    # Silence gap after some noise — tolerate short gaps
+                    noise_accepted.append(i)
+                    continue
+            
+            calibration_rms.append(rms_arr[i])
+            noise_accepted.append(i)
+            
+            if len(calibration_rms) >= calibration_count:
+                walk_start_idx = pos + 1
+                phase1_done = True
+                break
+        
+        if not phase1_done or not calibration_rms:
+            return None
+        
+        initial_floor = max(calibration_rms)
+        if initial_floor < 1e-6:
+            return None
+        
+        # Phase 2: expand calibration — accept windows < initial_floor * 5
+        expansion_limit = initial_floor * 5.0
+        noise_floor = initial_floor  # running max of accepted noise RMS
+        
+        for pos in range(walk_start_idx, len(indices)):
+            i = indices[pos]
+            
+            if is_silence[i]:
+                # Tolerate isolated silence windows within noise
+                noise_accepted.append(i)
+                continue
+            
+            if rms_arr[i] <= expansion_limit:
+                noise_accepted.append(i)
+                if rms_arr[i] > noise_floor:
+                    noise_floor = rms_arr[i]
+            else:
+                # Exceeded expansion limit — switch to phase 3
+                walk_start_idx = pos
+                break
+        else:
+            # All windows accepted (rare — short file with only noise)
+            walk_start_idx = len(indices)
+        
+        # Phase 3: final walk with tighter threshold
+        final_threshold = noise_floor * 3.0
+        
+        for pos in range(walk_start_idx, len(indices)):
+            i = indices[pos]
+            
+            if is_silence[i]:
+                noise_accepted.append(i)
+                continue
+            
+            if rms_arr[i] <= final_threshold:
+                noise_accepted.append(i)
+            else:
+                break  # Hit music — stop
+        
+        # Trim trailing silence from accepted windows
+        while noise_accepted:
+            if is_silence[noise_accepted[-1]]:
+                noise_accepted.pop()
+            else:
+                break
+        
+        if not noise_accepted:
+            return None
+        
+        # Convert to sample positions
+        first_idx = min(noise_accepted)
+        last_idx = max(noise_accepted)
+        region_start = zone_start + window_starts[first_idx]
+        region_end = zone_start + window_starts[last_idx] + step_samples
+        region_end = min(region_end, total)
+        
+        return (region_start, region_end, noise_floor)
     
     def auto_detect_noise_regions(self, min_duration: float = 0.5) -> List[Tuple[float, float]]:
         """
-        Automatically detect noise regions at the beginning and end of the file.
+        Automatically detect noise regions at the very start and very end
+        of the file only.
         
-        Targets the lead-in groove hiss at the start and the run-out groove
-        hiss at the end - these are the most reliable noise-only areas on
-        old shellac/vinyl recordings.
+        Scans inward from each edge: skips silence, collects noise, stops
+        the moment music begins.  Never looks into the middle of the track.
         
         Returns:
             List of (start_time, end_time) tuples for detected noise regions.
@@ -356,38 +438,29 @@ class AudioDenoiser:
             raise ValueError("No audio loaded.")
         
         audio = self._audio[0]
-        total_samples = len(audio)
-        duration = total_samples / self._sr
-        
-        window_samples = int(min_duration * self._sr)
-        hop_samples = window_samples // 4
-        
-        # Define how much of the beginning/end to scan
-        # Scan first and last 15% of the file (or at least 5 seconds)
-        scan_length = max(int(5.0 * self._sr), int(total_samples * 0.15))
-        scan_length = min(scan_length, total_samples // 2)  # Don't overlap
-        
-        # Score threshold: regions below this are likely not clean noise
-        min_score = -20.0
+        step_samples = int(0.1 * self._sr)  # 0.1s analysis windows
         
         regions = []
         
-        # ── Scan the BEGINNING of the file (lead-in groove) ──
-        beginning_result = self._scan_region_for_noise(
-            audio, 0, scan_length, window_samples, hop_samples, min_score
+        # ── Scan from the START of the file (lead-in groove) ──
+        start_result = self._find_noise_from_edge(
+            audio, step_samples, from_start=True
         )
-        if beginning_result:
-            start_s, end_s, score = beginning_result
-            regions.append((start_s / self._sr, end_s / self._sr))
+        if start_result:
+            s, e, _ = start_result
+            dur = (e - s) / self._sr
+            if dur >= min_duration:
+                regions.append((s / self._sr, e / self._sr))
         
-        # ── Scan the END of the file (run-out groove) ──
-        end_scan_start = total_samples - scan_length
-        ending_result = self._scan_region_for_noise(
-            audio, end_scan_start, total_samples, window_samples, hop_samples, min_score
+        # ── Scan from the END of the file (run-out groove) ──
+        end_result = self._find_noise_from_edge(
+            audio, step_samples, from_start=False
         )
-        if ending_result:
-            start_s, end_s, score = ending_result
-            regions.append((start_s / self._sr, end_s / self._sr))
+        if end_result:
+            s, e, _ = end_result
+            dur = (e - s) / self._sr
+            if dur >= min_duration:
+                regions.append((s / self._sr, e / self._sr))
         
         return regions
     
