@@ -7,9 +7,7 @@ Includes noise profile learning similar to iZotope RX.
 Multiple denoising methods are available:
 - spectral gating (best with learned noise profile)
 - spectral subtraction
-- Wiener filtering
-- shellac/78rpm optimized reduction
-- combined approach
+- adaptive blend of subtraction and gating
 """
 
 __version__ = "0.1.0"

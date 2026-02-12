@@ -1,4 +1,4 @@
-﻿"""
+"""
 Modern GUI for the Sound Denoiser application.
 
 Provides an intuitive interface for loading audio, adjusting
@@ -65,7 +65,6 @@ class SoundDenoiserApp(ctk.CTk):
         self.selected_noise_region: Optional[Tuple[float, float]] = None
         self.config_path = Path.home() / ".sound_denoiser_config.json"
         self.config = self._load_config()
-        self.threshold_curve: List[Tuple[float, float]] = []
 
         # Build UI
         self._create_ui()
@@ -238,7 +237,6 @@ class SoundDenoiserApp(ctk.CTk):
             waveform_frame,
             on_region_select=self._on_noise_region_selected,
             on_seek=lambda pos: self._on_seek("original", pos),
-            on_threshold_change=self._on_threshold_curve_change,
         )
         self.waveform_original.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
         self.waveform_original.plot_waveform(None, 44100, f"{self.track_title} (Original)", "#ff9f43")
@@ -246,7 +244,6 @@ class SoundDenoiserApp(ctk.CTk):
         self.waveform_processed = WaveformDisplay(
             waveform_frame,
             on_seek=lambda pos: self._on_seek("processed", pos),
-            on_threshold_change=self._on_threshold_curve_change,
         )
         self.waveform_processed.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
         self.waveform_processed.plot_waveform(None, 44100, f"{self.track_title} (Denoised)", "#00d9ff")
@@ -368,73 +365,8 @@ class SoundDenoiserApp(ctk.CTk):
         params_inner = ctk.CTkFrame(params_frame, fg_color="transparent")
         params_inner.pack(fill="x", padx=10, pady=(0, 10))
 
-        # Denoising Method Selector
-        method_frame = ctk.CTkFrame(params_inner, fg_color="transparent")
-        method_frame.pack(fill="x", pady=(0, 12))
-
-        method_label = ctk.CTkLabel(
-            method_frame,
-            text="Denoising Method",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            text_color="#cccccc"
-        )
-        method_label.pack(anchor="w")
-
-        # Method names for display
-        self._method_names = {
-            "Spectral Subtraction": DenoiseMethod.SPECTRAL_SUBTRACTION,
-            "Wiener Filter": DenoiseMethod.WIENER,
-            "Combined (All Methods)": DenoiseMethod.COMBINED,
-            "Shellac/78rpm (Hiss+Groove)": DenoiseMethod.SHELLAC,
-            "Spectral Gating (Learned Profile)": DenoiseMethod.SPECTRAL_GATING,
-            "Adaptive Blend (Subtraction+Gating)": DenoiseMethod.ADAPTIVE_BLEND,
-        }
-
-        self.method_dropdown = ctk.CTkOptionMenu(
-            method_frame,
-            values=list(self._method_names.keys()),
-            command=self._on_method_change,
-            fg_color="#252535",
-            button_color="#6c3483",
-            button_hover_color="#8e44ad",
-            dropdown_fg_color="#1a1a2e",
-            dropdown_hover_color="#252535",
-            font=ctk.CTkFont(size=11),
-            width=200
-        )
-        self.method_dropdown.set("Spectral Subtraction")
-        self.method_dropdown.pack(anchor="w", pady=(5, 0))
-
-        # Method description - shows which parameters are most effective
-        self._method_descriptions = {
-            "Spectral Subtraction": "Best for: General hiss. Key params: Strength, Noise Threshold, HF Reduction",
-            "Wiener Filter": "Best for: Broadband noise. Key params: Strength, Noise Threshold",
-            "Combined (All Methods)": "Best for: Heavy noise. Uses Spectral + Wiener + Threshold",
-            "Shellac/78rpm (Hiss+Groove)": "Best for: Old 78s. Key params: Strength, Noise Threshold",
-            "Spectral Gating (Learned Profile)": "Best with learned profile. Soft gate based on noise floor",
-            "Adaptive Blend (Subtraction+Gating)": "Blends both methods. Use Artifact Control to balance",
-        }
-
-        self.method_desc_label = ctk.CTkLabel(
-            method_frame,
-            text=self._method_descriptions["Spectral Subtraction"],
-            font=ctk.CTkFont(size=10),
-            text_color="#888888",
-            wraplength=190
-        )
-        self.method_desc_label.pack(anchor="w", pady=(3, 0))
-
-        # Max dB Reduction
-        self.max_db_slider = ParameterSlider(
-            params_inner,
-            label="Max dB Reduction",
-            from_=1.0,
-            to=30.0,
-            default=12.0,
-            unit=" dB",
-            command=self._on_parameter_change
-        )
-        self.max_db_slider.pack(fill="x", pady=(0, 12))
+        # Set the denoising method to Adaptive Blend
+        self.denoiser.set_method(DenoiseMethod.ADAPTIVE_BLEND)
 
         # Blend Original
         self.blend_slider = ParameterSlider(
@@ -642,12 +574,6 @@ class SoundDenoiserApp(ctk.CTk):
         self.noise_profile_panel.add_selection(start, end)
         count = len(self.noise_profile_panel.get_selections())
         self._set_status(f"Added noise region: {start:.2f}s - {end:.2f}s (Total: {count} selection(s))")
-        self._update_threshold_from_params()
-
-    def _on_threshold_curve_change(self, freqs: np.ndarray, levels: np.ndarray):
-        """Persist spectrum threshold curve changes and surface in status."""
-        self.threshold_curve = list(zip(freqs.tolist(), levels.tolist()))
-        self._set_status("Updated threshold curve")
 
     def _learn_noise_profile_manual(self):
         """Learn noise profile from manually selected regions."""
@@ -682,16 +608,16 @@ class SoundDenoiserApp(ctk.CTk):
             messagebox.showerror("Error", f"Failed to learn noise profile:\n{str(e)}")
 
     def _learn_noise_profile_auto(self):
-        """Auto-detect quiet region and learn noise profile."""
+        """Auto-detect noise regions at beginning/end of file and learn noise profile."""
         if self.denoiser.get_original() is None:
             return
 
-        self._set_status("Auto-detecting quiet region...")
+        self._set_status("Auto-detecting noise regions at beginning/end of file...")
 
         def auto_learn_thread():
             try:
-                profile, region = self.denoiser.auto_learn_noise_profile(min_duration=0.5)
-                self.processing_queue.put(("noise_profile", profile, region))
+                profile, regions = self.denoiser.auto_learn_noise_profile(min_duration=0.5)
+                self.processing_queue.put(("noise_profile_multi", profile, regions))
             except Exception as e:
                 self.processing_queue.put(("error", str(e)))
 
@@ -809,7 +735,6 @@ class SoundDenoiserApp(ctk.CTk):
         self.stop_btn.configure(state="disabled")
         self.selection_btn.configure(state="disabled", text="Select Noise", fg_color="#1a5276")
         self.process_btn.configure(state="disabled", text="Apply Denoising")
-        self._update_threshold_from_params()
 
         # Load in background thread
         def load_thread():
@@ -877,7 +802,6 @@ class SoundDenoiserApp(ctk.CTk):
 
         # Update parameters
         self.denoiser.update_parameters(
-            max_db_reduction=self.max_db_slider.get(),
             blend_original=self.blend_slider.get() / 100.0,
             noise_reduction_strength=self.strength_slider.get() / 100.0,
             transient_protection=self.transient_slider.get() / 100.0,
@@ -901,102 +825,22 @@ class SoundDenoiserApp(ctk.CTk):
         """Handle parameter change - enable reprocessing hint."""
         if self.denoiser.get_original() is not None and not self.is_processing:
             self.process_btn.configure(fg_color="#884499")
-        self._update_threshold_from_params()
-
-    def _update_threshold_from_params(self):
-        """Recalculate the frequency threshold curve based on current params."""
-        # Base grid of frequencies (more points for finer control)
-        freqs = np.array([30, 60, 90, 140, 200, 300, 450, 650, 900, 1300, 1800, 2500, 3400, 4600, 6000, 8000, 10000, 13000, 16000], dtype=float)
-
-        # Parameter influences
-        noise_thresh = self.noise_threshold_slider.get() if hasattr(self, "noise_threshold_slider") else 1.0
-        hiss_start = self.hiss_start_slider.get() if hasattr(self, "hiss_start_slider") else 2000.0
-        hiss_peak = self.hiss_peak_slider.get() if hasattr(self, "hiss_peak_slider") else 6000.0
-        hf_emphasis = self.hf_emphasis_slider.get() if hasattr(self, "hf_emphasis_slider") else 1.0
-
-        # Baseline slope: gently rising then falling in highs
-        base_levels = np.linspace(-72, -50, len(freqs))
-
-        # Global lift/drop from noise threshold (UI now lifts the line when threshold increases)
-        levels = base_levels + (noise_thresh - 1.0) * 6.0
-
-        # Hiss band emphasis: dip around hiss peak scaled by hf_emphasis
-        band_mask = (freqs >= max(200.0, hiss_start * 0.6)) & (freqs <= hiss_peak * 1.4)
-        band_depth = (hf_emphasis - 1.0) * 8.0
-        levels[band_mask] -= band_depth
-
-        # Smooth edges near hiss peak
-        if hiss_peak > hiss_start:
-            span = hiss_peak - hiss_start
-            taper_start = hiss_start + 0.3 * span
-            taper_end = hiss_peak + 0.3 * span
-            taper_mask = (freqs >= taper_start) & (freqs <= taper_end)
-            taper_ratio = np.clip((freqs[taper_mask] - taper_start) / (taper_end - taper_start), 0, 1)
-            levels[taper_mask] -= band_depth * (1 - taper_ratio)
-
-        # Clamp to sensible bounds
-        levels = np.clip(levels, -110.0, 10.0)
-
-        # Persist and push into displays
-        self.threshold_curve = list(zip(freqs.tolist(), levels.tolist()))
-        self.waveform_original.set_threshold_curve(freqs, levels)
-        self.waveform_processed.set_threshold_curve(freqs, levels)
-        self.waveform_original.set_noise_threshold_multiplier(noise_thresh)
-        self.waveform_processed.set_noise_threshold_multiplier(noise_thresh)
-
-    def _on_method_change(self, method_name: str):
-        """Handle denoising method change."""
-        method = self._method_names.get(method_name, DenoiseMethod.SPECTRAL_SUBTRACTION)
-        self.denoiser.set_method(method)
-
-        # Update method description
-        desc = self._method_descriptions.get(method_name, "")
-        self.method_desc_label.configure(text=desc)
-
-        # Define which sliders are relevant for each method
-        dim_color = "#666666"
-        active_color = "#cccccc"
-
-        # HF slider is less relevant for Shellac (auto-tuned)
-        hf_relevant = method_name not in ["Shellac/78rpm (Hiss+Groove)"]
-        self.hf_emphasis_slider.label.configure(text_color=active_color if hf_relevant else dim_color)
-
-        # Hiss frequency sliders - relevant for Spectral, Wiener, Combined, Spectral Gating
-        hiss_freq_relevant = method_name in ["Spectral Subtraction", "Wiener Filter", "Combined (All Methods)", "Spectral Gating (Learned Profile)"]
-        self.hiss_start_slider.label.configure(text_color=active_color if hiss_freq_relevant else dim_color)
-        self.hiss_peak_slider.label.configure(text_color=active_color if hiss_freq_relevant else dim_color)
-
-        # Spectral floor - relevant for Spectral, Wiener, and Spectral Gating
-        floor_relevant = method_name in ["Spectral Subtraction", "Wiener Filter", "Combined (All Methods)", "Spectral Gating (Learned Profile)"]
-        self.spectral_floor_slider.label.configure(text_color=active_color if floor_relevant else dim_color)
-
-        # Noise threshold - relevant for all spectral methods
-        threshold_relevant = True
-        self.noise_threshold_slider.label.configure(text_color=active_color if threshold_relevant else dim_color)
-
-        self._set_status(f"Method changed to: {method_name}")
-        # Highlight process button to indicate reprocessing needed
-        if self.denoiser.get_original() is not None and not self.is_processing:
-            self.process_btn.configure(fg_color="#884499")
-        self._update_threshold_from_params()
+        # Update the purple noise threshold line on the spectrum view
+        if hasattr(self, "noise_threshold_slider"):
+            noise_thresh = self.noise_threshold_slider.get()
+            self.waveform_original.set_noise_threshold_multiplier(noise_thresh)
+            self.waveform_processed.set_noise_threshold_multiplier(noise_thresh)
 
     def _reset_parameters(self):
         """Reset parameters to defaults."""
-        self.max_db_slider.set(12.0)
         self.blend_slider.set(5.0)
         self.strength_slider.set(85.0)
         self.transient_slider.set(30.0)
-        self.hf_emphasis_slider.set(1.5)
         # Fine-tuning defaults
-        self.hiss_start_slider.set(2000.0)
-        self.hiss_peak_slider.set(6000.0)
         self.spectral_floor_slider.set(5.0)
         self.noise_threshold_slider.set(1.0)
         self.artifact_control_slider.set(50.0)
         self.adaptive_blend_var.set(True)
-        # Method default
-        self.method_dropdown.set("Spectral Subtraction")
-        self.denoiser.set_method(DenoiseMethod.SPECTRAL_SUBTRACTION)
 
     def _get_player(self, which: str) -> AudioPlayer:
         """Return the player for the requested view."""
@@ -1140,6 +984,10 @@ class SoundDenoiserApp(ctk.CTk):
                     _, profile, region = msg
                     self._on_noise_profile_learned(profile, region)
 
+                elif msg[0] == "noise_profile_multi":
+                    _, profile, regions = msg
+                    self._on_noise_profile_auto_learned(profile, regions)
+
                 elif msg[0] == "error":
                     _, error = msg
                     messagebox.showerror("Error", f"An error occurred:\n{error}")
@@ -1253,7 +1101,7 @@ class SoundDenoiserApp(ctk.CTk):
         self._set_status(f"Processing complete {profile_status} - Preview and adjust as needed")
 
     def _on_noise_profile_learned(self, profile: NoiseProfile, region: Tuple[float, float]):
-        """Handle noise profile learned from auto-detect."""
+        """Handle noise profile learned from single-region auto-detect (legacy)."""
         self.selected_noise_region = region
         self.waveform_original.set_noise_region(*region)
         # Add detected region to selections list/display
@@ -1263,6 +1111,42 @@ class SoundDenoiserApp(ctk.CTk):
         self.noise_profile_panel.enable_learn_button(True)
         self._update_noise_floor_trace(profile)
         self._set_status(f"Auto-detected noise region: {region[0]:.2f}s - {region[1]:.2f}s")
+
+        # Auto-reprocess
+        if self.denoiser.get_original() is not None:
+            self._process_audio()
+
+    def _on_noise_profile_auto_learned(self, profile: NoiseProfile, regions: List[Tuple[float, float]]):
+        """Handle noise profile learned from auto-detect (beginning/end scan)."""
+        # Clear any previous selections
+        self.noise_profile_panel.clear_selections()
+        self.waveform_original.clear_selection()
+
+        # Add each detected region
+        for region in regions:
+            self.noise_profile_panel.add_selection(*region)
+            self.waveform_original.add_selection_rect(*region)
+
+        # Use the first region as the reference for display
+        if regions:
+            self.selected_noise_region = regions[0]
+            self.waveform_original.set_noise_region(*regions[0])
+
+        self.noise_profile_panel.update_status(profile, regions[0] if regions else (0, 0))
+        self.noise_profile_panel.enable_learn_button(True)
+        self._update_noise_floor_trace(profile)
+
+        # Build a descriptive status message
+        parts = []
+        for i, (s, e) in enumerate(regions):
+            duration = self.denoiser._audio.shape[1] / self.denoiser._sr if self.denoiser._audio is not None else 0
+            if s < duration * 0.3:
+                label = "beginning"
+            else:
+                label = "end"
+            parts.append(f"{label} ({s:.2f}s-{e:.2f}s)")
+        status = f"Auto-detected {len(regions)} noise region(s): " + ", ".join(parts)
+        self._set_status(status)
 
         # Auto-reprocess
         if self.denoiser.get_original() is not None:

@@ -4,7 +4,7 @@ Core audio denoising module using multiple techniques for hiss removal.
 Implements:
 - Spectral gating with learned noise profiles
 - Spectral subtraction for broadband noise
-- Wiener filtering for optimal noise estimation
+- Adaptive blend of subtraction and gating
 - Shellac/78rpm optimized reduction
 - High-frequency focused processing where hiss typically lives
 - Noise profile learning for targeted removal
@@ -35,11 +35,6 @@ except ImportError:
 
 class DenoiseMethod(Enum):
     """Available denoising methods."""
-    SPECTRAL_SUBTRACTION = "spectral"    # Classic spectral subtraction (good for shellac/vinyl)
-    WIENER = "wiener"                    # Wiener filtering (good for broadband noise)
-    COMBINED = "combined"                # Combine multiple methods
-    SHELLAC = "shellac"                  # Optimized for 78rpm shellac records (hiss + groove)
-    SPECTRAL_GATING = "gating"           # Pure spectral gating using learned noise profile
     ADAPTIVE_BLEND = "adaptive"          # Intelligent blend of subtraction and gating
 
 
@@ -66,7 +61,7 @@ class AudioDenoiser:
     Multi-technique denoiser for removing hiss from audio recordings.
 
     Features:
-    - Multiple denoising algorithms (spectral gating, spectral subtraction, Wiener, shellac)
+    - Multiple denoising algorithms (spectral gating, spectral subtraction, adaptive blend)
     - Spectral gating with learned noise profiles
     - Transient preservation
     - Original signal blending
@@ -77,16 +72,12 @@ class AudioDenoiser:
     N_FFT = 2048
     HOP_LENGTH = 512
 
-    # Shellac-specific frequency bands (Hz) - optimized for 78rpm records
-    SHELLAC_BANDS = [0, 100, 300, 800, 2000, 4000, 8000, 16000]
-
     def __init__(
         self,
-        max_db_reduction: float = 8.0,
         blend_original: float = 0.08,
         noise_reduction_strength: float = 0.85,
         transient_protection: float = 0.3,
-        method: DenoiseMethod = DenoiseMethod.SPECTRAL_SUBTRACTION,
+        method: DenoiseMethod = DenoiseMethod.ADAPTIVE_BLEND,
         spectral_floor: float = 0.05,
         noise_threshold: float = 1.2,
         artifact_control: float = 0.5,
@@ -96,11 +87,10 @@ class AudioDenoiser:
         Initialize the denoiser with parameters.
 
         Args:
-            max_db_reduction: Maximum dB of noise reduction (default: 12.0)
             blend_original: Amount of original signal to blend back (0-1, default: 0.05)
             noise_reduction_strength: Overall strength of noise reduction (0-1, default: 0.85)
             transient_protection: How much to protect transients (0-1, default: 0.3)
-            method: Denoising method to use (default: SPECTRAL_SUBTRACTION)
+            method: Denoising method to use (default: ADAPTIVE_BLEND)
             spectral_floor: Minimum signal to retain, prevents artifacts (0-1, default: 0.05)
             noise_threshold: Multiplier for noise estimate boundary (0.5-3.0, default: 1.0)
                 Higher values = more aggressive (treats more as noise)
@@ -113,7 +103,6 @@ class AudioDenoiser:
                 Uses more gating at low frequencies and during transients,
                 more subtraction during sustained sections
         """
-        self.max_db_reduction = max_db_reduction
         self.blend_original = blend_original
         self.noise_reduction_strength = noise_reduction_strength
         self.transient_protection = transient_protection
@@ -271,121 +260,163 @@ class AudioDenoiser:
         self._use_learned_profile = True
         return self._noise_profile
 
-    def auto_detect_noise_region(self, min_duration: float = 0.5) -> Tuple[float, float]:
+    def _score_region(self, audio_window: np.ndarray) -> Optional[Tuple[float, float, float]]:
         """
-        Automatically detect a region with noise but without music or silence.
-
-        Uses spectral flatness to distinguish between:
-        - Noise (high spectral flatness, moderate energy)
-        - Music (low spectral flatness, varying energy)
-        - Silence (very low energy)
-
-        This is particularly effective for finding hiss/groove noise sections
-        in old shellac recordings.
+        Score an audio window for how likely it is to be pure noise (not music, not silence).
+        
+        Returns:
+            Tuple of (score, rms, flatness) or None if the region should be skipped.
+        """
+        rms = np.sqrt(np.mean(audio_window ** 2))
+        peak = np.max(np.abs(audio_window))
+        
+        # Skip digital silence or near-silence
+        if peak < 0.002 or rms < 0.0005:
+            return None
+        
+        # Compute spectral flatness (noise is spectrally flat, music is not)
+        stft = librosa.stft(audio_window, n_fft=1024, hop_length=256)
+        mag = np.abs(stft)
+        
+        # Geometric mean / arithmetic mean = spectral flatness
+        # Higher values indicate more noise-like signal
+        geometric_mean = np.exp(np.mean(np.log(mag + 1e-10), axis=0))
+        arithmetic_mean = np.mean(mag, axis=0)
+        flatness = np.mean(geometric_mean / (arithmetic_mean + 1e-10))
+        
+        # Check for low spectral variation over time (noise is consistent)
+        spectral_var = np.var(np.mean(mag, axis=0))
+        
+        # Score: high flatness + low variation + moderate energy = noise
+        score = flatness * 100 - spectral_var * 1000 - rms * 10
+        
+        # Penalize very low or high energy
+        if rms < 0.005 or rms > 0.1:
+            score -= 50
+        
+        return (score, rms, flatness)
+    
+    def _scan_region_for_noise(
+        self, audio: np.ndarray, scan_start: int, scan_end: int,
+        window_samples: int, hop_samples: int, min_score: float = -20.0
+    ) -> Optional[Tuple[int, int, float]]:
+        """
+        Scan a portion of audio for the best noise-only window.
+        
+        Args:
+            audio: Audio array (1D)
+            scan_start: Start sample of scan region
+            scan_end: End sample of scan region
+            window_samples: Size of each candidate window
+            hop_samples: Hop between candidate windows
+            min_score: Minimum acceptable score to be considered noise
+            
+        Returns:
+            (start_sample, end_sample, score) of best noise region, or None.
+        """
+        best = None  # (score, start, end)
+        
+        range_end = min(scan_end - window_samples, len(audio) - window_samples)
+        if range_end <= scan_start:
+            return None
+        
+        for start in range(scan_start, range_end, hop_samples):
+            end = start + window_samples
+            window = audio[start:end]
+            
+            result = self._score_region(window)
+            if result is None:
+                continue
+            
+            score, rms, flatness = result
+            
+            if score < min_score:
+                continue
+            
+            if best is None or score > best[0]:
+                best = (score, start, end)
+        
+        if best is None:
+            return None
+        return (best[1], best[2], best[0])
+    
+    def auto_detect_noise_regions(self, min_duration: float = 0.5) -> List[Tuple[float, float]]:
+        """
+        Automatically detect noise regions at the beginning and end of the file.
+        
+        Targets the lead-in groove hiss at the start and the run-out groove
+        hiss at the end - these are the most reliable noise-only areas on
+        old shellac/vinyl recordings.
+        
+        Returns:
+            List of (start_time, end_time) tuples for detected noise regions.
+            May be empty if no suitable regions found.
         """
         if self._audio is None or self._sr is None:
             raise ValueError("No audio loaded.")
-
+        
         audio = self._audio[0]
+        total_samples = len(audio)
+        duration = total_samples / self._sr
+        
         window_samples = int(min_duration * self._sr)
         hop_samples = window_samples // 4
-
-        candidates = []
-
-        for start in range(0, len(audio) - window_samples, hop_samples):
-            end = start + window_samples
-            window = audio[start:end]
-
-            # Skip if too quiet (silence)
-            rms = np.sqrt(np.mean(window ** 2))
-            peak = np.max(np.abs(window))
-
-            if peak < 0.002:  # Too quiet - likely silence
-                continue
-
-            if rms < 0.0005:  # Very low RMS - likely digital silence
-                continue
-
-            # Compute spectral flatness (noise is spectrally flat, music is not)
-            stft = librosa.stft(window, n_fft=1024, hop_length=256)
-            mag = np.abs(stft)
-
-            # Geometric mean / arithmetic mean = spectral flatness
-            # Higher values indicate more noise-like signal
-            geometric_mean = np.exp(np.mean(np.log(mag + 1e-10), axis=0))
-            arithmetic_mean = np.mean(mag, axis=0)
-            flatness = np.mean(geometric_mean / (arithmetic_mean + 1e-10))
-
-            # Check for low spectral variation (noise is consistent)
-            spectral_var = np.var(np.mean(mag, axis=0))
-
-            # Good noise regions have:
-            # - High spectral flatness (noise-like)
-            # - Low spectral variation over time (consistent)
-            # - Moderate energy (not silence)
-
-            # Score combining these factors
-            # Higher score = more likely to be pure noise
-            score = flatness * 100 - spectral_var * 1000 - rms * 10
-
-            # Penalize very low or high energy
-            if rms < 0.005 or rms > 0.1:
-                score -= 50
-
-            candidates.append((score, start, end, rms, flatness))
-
-        if not candidates:
-            # Fallback: use quietest region that's not silence
-            return self._fallback_noise_detection(min_duration)
-
-        # Sort by score (highest first)
-        candidates.sort(key=lambda x: x[0], reverse=True)
-
-        # Return the best candidate
-        _, start_sample, end_sample, _, _ = candidates[0]
-        return (start_sample / self._sr, end_sample / self._sr)
-
-    def _fallback_noise_detection(self, min_duration: float) -> Tuple[float, float]:
-        """Fallback noise detection using simple RMS-based approach."""
-        audio = self._audio[0]
-        window_samples = int(min_duration * self._sr)
-        hop_samples = window_samples // 4
-
-        rms_values = []
-        positions = []
-
-        for start in range(0, len(audio) - window_samples, hop_samples):
-            end = start + window_samples
-            window = audio[start:end]
-            rms = np.sqrt(np.mean(window ** 2))
-            peak = np.max(np.abs(window))
-
-            # Skip silence
-            if peak < 0.001:
-                continue
-
-            rms_values.append(rms)
-            positions.append(start)
-
-        if not rms_values:
-            # Absolute fallback - use the beginning
-            return (0.0, min_duration)
-
-        rms_values = np.array(rms_values)
-        positions = np.array(positions)
-
-        # Find the quietest non-silent region
-        sorted_indices = np.argsort(rms_values)
-        idx = sorted_indices[0]
-        start_sample = positions[idx]
-
-        return (start_sample / self._sr, (start_sample + window_samples) / self._sr)
-
-    def auto_learn_noise_profile(self, min_duration: float = 0.5) -> Tuple[NoiseProfile, Tuple[float, float]]:
-        """Auto-detect quiet region and learn noise profile."""
-        start_time, end_time = self.auto_detect_noise_region(min_duration)
-        profile = self.learn_noise_profile(start_time, end_time)
-        return profile, (start_time, end_time)
+        
+        # Define how much of the beginning/end to scan
+        # Scan first and last 15% of the file (or at least 5 seconds)
+        scan_length = max(int(5.0 * self._sr), int(total_samples * 0.15))
+        scan_length = min(scan_length, total_samples // 2)  # Don't overlap
+        
+        # Score threshold: regions below this are likely not clean noise
+        min_score = -20.0
+        
+        regions = []
+        
+        # ── Scan the BEGINNING of the file (lead-in groove) ──
+        beginning_result = self._scan_region_for_noise(
+            audio, 0, scan_length, window_samples, hop_samples, min_score
+        )
+        if beginning_result:
+            start_s, end_s, score = beginning_result
+            regions.append((start_s / self._sr, end_s / self._sr))
+        
+        # ── Scan the END of the file (run-out groove) ──
+        end_scan_start = total_samples - scan_length
+        ending_result = self._scan_region_for_noise(
+            audio, end_scan_start, total_samples, window_samples, hop_samples, min_score
+        )
+        if ending_result:
+            start_s, end_s, score = ending_result
+            regions.append((start_s / self._sr, end_s / self._sr))
+        
+        return regions
+    
+    def auto_learn_noise_profile(self, min_duration: float = 0.5) -> Tuple[NoiseProfile, List[Tuple[float, float]]]:
+        """
+        Auto-detect noise regions at beginning/end of file and learn profile.
+        
+        Searches the lead-in and run-out areas for clean noise samples,
+        uses both if available, and raises an error if neither is usable.
+        
+        Returns:
+            Tuple of (NoiseProfile, list_of_regions)
+            
+        Raises:
+            ValueError: If no suitable noise regions could be found.
+        """
+        regions = self.auto_detect_noise_regions(min_duration)
+        
+        if not regions:
+            raise ValueError(
+                "Could not find a sufficient noise-only sample.\n\n"
+                "The beginning and end of the recording do not contain "
+                "clean noise (hiss/groove noise without music).\n\n"
+                "Please use 'Make Selection' to manually select a region "
+                "that contains only noise."
+            )
+        
+        profile = self.learn_noise_profile_from_regions(regions)
+        return profile, regions
 
     def get_noise_profile(self) -> Optional[NoiseProfile]:
         return self._noise_profile
@@ -421,58 +452,6 @@ class AudioDenoiser:
         noise_estimate = uniform_filter1d(noise_estimate, size=5)
 
         return noise_estimate
-
-    def _spectral_gating(self, audio: np.ndarray) -> np.ndarray:
-        """
-        Pure spectral gating using the learned noise profile.
-
-        This method requires a learned noise profile. It applies a soft gate
-        that attenuates frequency bins where the signal is below or near the
-        learned noise floor. More aggressive than spectral subtraction but
-        very effective when you have a good noise sample.
-        """
-        # Compute STFT
-        stft = librosa.stft(audio, n_fft=self.N_FFT, hop_length=self.HOP_LENGTH)
-        stft_mag = np.abs(stft)
-        stft_phase = np.angle(stft)
-
-        # Get noise estimate - prefer learned profile
-        if self._use_learned_profile and self._noise_profile is not None:
-            noise_estimate = self._noise_profile.spectral_mean
-            noise_std = self._noise_profile.spectral_std
-        else:
-            # Fall back to automatic estimation if no profile learned
-            noise_estimate = self._estimate_noise_spectrum(stft_mag)
-            noise_std = noise_estimate * 0.5  # Approximate std
-
-        # Apply noise threshold multiplier
-        gate_threshold = noise_estimate * self.noise_threshold
-
-        # Expand to match STFT shape
-        gate_threshold_2d = gate_threshold[:, np.newaxis]
-        noise_std_2d = noise_std[:, np.newaxis] if noise_std is not None else gate_threshold_2d * 0.3
-
-        # Soft gating: compute gain based on how far above threshold the signal is
-        # Gain = 1 when signal >> threshold, Gain -> reduction_amount when signal <= threshold
-        margin = stft_mag - gate_threshold_2d
-
-        # Sigmoid-like soft gate centered around the threshold
-        # Use noise_std to control the transition width
-        transition_width = np.maximum(noise_std_2d * 2, 1e-10)
-        gate_gain = 1.0 / (1.0 + np.exp(-margin / transition_width * 4))
-
-        # Apply reduction strength - controls how much attenuation below threshold
-        min_gain = 1.0 - self.noise_reduction_strength
-        min_gain = max(min_gain, self.spectral_floor)
-        gate_gain = min_gain + gate_gain * (1.0 - min_gain)
-
-        # Smooth gain temporally to reduce musical noise
-        gate_gain = median_filter(gate_gain, size=(1, 3))
-
-        # Apply gate
-        stft_gated = stft_mag * gate_gain * np.exp(1j * stft_phase)
-
-        return librosa.istft(stft_gated, hop_length=self.HOP_LENGTH, length=len(audio))
 
     def _adaptive_blend_denoise(self, audio: np.ndarray) -> np.ndarray:
         """
@@ -573,223 +552,9 @@ class AudioDenoiser:
 
         return librosa.istft(stft_clean, hop_length=self.HOP_LENGTH, length=len(audio))
 
-    def _spectral_subtraction(self, audio: np.ndarray) -> np.ndarray:
-        """
-        Classic spectral subtraction for noise removal.
-
-        Subtracts estimated noise spectrum from the signal spectrum.
-        Uses over-subtraction factor and spectral floor to reduce musical noise.
-        """
-        # Compute STFT
-        stft = librosa.stft(audio, n_fft=self.N_FFT, hop_length=self.HOP_LENGTH)
-        stft_mag = np.abs(stft)
-        stft_phase = np.angle(stft)
-
-        # Get noise estimate
-        if self._use_learned_profile and self._noise_profile is not None:
-            noise_estimate = self._noise_profile.spectral_mean
-        else:
-            noise_estimate = self._estimate_noise_spectrum(stft_mag)
-
-        # Apply noise threshold - multiplies the noise estimate to define the boundary
-        # Higher threshold = more aggressive (treats more as noise)
-        # Lower threshold = more conservative (preserves more signal)
-        noise_estimate = noise_estimate * self.noise_threshold
-
-        # Over-subtraction factor (reduces musical noise)
-        alpha = 1.0 + self.noise_reduction_strength * 2.0
-
-        # Spectral floor (prevents negative values and musical noise artifacts)
-        # Uses the configurable spectral_floor parameter
-        beta = self.spectral_floor + (1 - self.noise_reduction_strength) * 0.05
-
-        # Perform spectral subtraction
-        noise_estimate_2d = noise_estimate[:, np.newaxis]
-        subtracted = stft_mag ** 2 - alpha * (noise_estimate_2d ** 2)
-
-        # Apply spectral floor
-        spectral_floor = beta * (noise_estimate_2d ** 2)
-        subtracted = np.maximum(subtracted, spectral_floor)
-
-        # Take square root to get magnitude
-        subtracted_mag = np.sqrt(subtracted)
-
-        # Reconstruct with original phase
-        stft_clean = subtracted_mag * np.exp(1j * stft_phase)
-
-        return librosa.istft(stft_clean, hop_length=self.HOP_LENGTH, length=len(audio))
-
-    def _wiener_filter(self, audio: np.ndarray) -> np.ndarray:
-        """
-        Wiener filtering for optimal noise reduction.
-
-        Estimates the optimal filter that minimizes mean square error
-        between the clean signal and the filtered noisy signal.
-        """
-        # Compute STFT
-        stft = librosa.stft(audio, n_fft=self.N_FFT, hop_length=self.HOP_LENGTH)
-        stft_mag = np.abs(stft)
-        stft_phase = np.angle(stft)
-
-        # Get noise estimate
-        if self._use_learned_profile and self._noise_profile is not None:
-            noise_estimate = self._noise_profile.spectral_mean
-        else:
-            noise_estimate = self._estimate_noise_spectrum(stft_mag)
-
-        # Apply noise threshold - multiplies the noise estimate to define the boundary
-        noise_estimate = noise_estimate * self.noise_threshold
-        noise_power = noise_estimate ** 2
-
-        # Signal power estimate
-        signal_power = stft_mag ** 2
-
-        # Wiener filter gain (with regularization)
-        noise_power_2d = noise_power[:, np.newaxis]
-        snr_prior = np.maximum(signal_power - noise_power_2d, 0) / (noise_power_2d + 1e-10)
-
-        # Apply strength parameter
-        snr_prior = snr_prior * self.noise_reduction_strength
-
-        # Wiener gain
-        wiener_gain = snr_prior / (snr_prior + 1)
-
-        # Smooth gain to reduce musical noise
-        wiener_gain = median_filter(wiener_gain, size=(3, 3))
-
-        # Apply gain
-        stft_clean = stft_mag * wiener_gain * np.exp(1j * stft_phase)
-
-        return librosa.istft(stft_clean, hop_length=self.HOP_LENGTH, length=len(audio))
-
-    def _combined_reduction(self, audio: np.ndarray) -> np.ndarray:
-        """
-        Combined approach using multiple methods.
-
-        Applies spectral subtraction first, then Wiener filtering,
-        and finally high-frequency reduction for optimal results.
-        """
-        # Stage 1: Gentle spectral subtraction
-        temp_strength = self.noise_reduction_strength
-        self.noise_reduction_strength = temp_strength * 0.5
-        denoised = self._spectral_subtraction(audio)
-
-        # Stage 2: Wiener filtering
-        self.noise_reduction_strength = temp_strength * 0.7
-        denoised = self._wiener_filter(denoised)
-
-        # Restore strength
-        self.noise_reduction_strength = temp_strength
-
-        # Stage 3: Final high-frequency cleanup (removed)
-
-        return denoised
-    def _shellac_reduction(self, audio: np.ndarray) -> np.ndarray:
-        """
-        Specialized denoising for shellac 78rpm records.
-
-        Addresses the specific noise characteristics of shellac recordings:
-        - Groove noise (low-frequency rumble from worn grooves)
-        - Surface hiss (broadband high-frequency noise)
-        - Crackle (impulsive noise - addressed separately)
-
-        Uses a multi-stage approach:
-        1. Low-frequency rumble reduction (below 80Hz)
-        2. Broadband surface noise reduction with frequency-dependent strength
-        3. High-frequency hiss targeting (2kHz-12kHz)
-        """
-        # Compute STFT with good frequency resolution for low-freq work
-        stft = librosa.stft(audio, n_fft=self.N_FFT, hop_length=self.HOP_LENGTH)
-        stft_mag = np.abs(stft)
-        stft_phase = np.angle(stft)
-
-        # Get frequency bins
-        freqs = librosa.fft_frequencies(sr=self._sr, n_fft=self.N_FFT)
-
-        # Get noise estimate
-        if self._use_learned_profile and self._noise_profile is not None:
-            noise_estimate = self._noise_profile.spectral_mean
-        else:
-            noise_estimate = self._estimate_noise_spectrum(stft_mag)
-
-        # Apply noise threshold - multiplies the noise estimate to define the boundary
-        noise_estimate = noise_estimate * self.noise_threshold
-
-        # Create frequency-dependent gain matrix
-        gain = np.ones_like(stft_mag)
-
-        # Define shellac-specific reduction strengths per frequency band
-        # (low_freq, high_freq, reduction_multiplier)
-        shellac_bands = [
-            (0, 60, 1.8),       # Sub-bass rumble - strong reduction
-            (60, 150, 1.4),    # Bass rumble - moderate reduction
-            (150, 500, 0.8),   # Low-mids - gentle (preserve warmth)
-            (500, 2000, 0.9),  # Mids - gentle (preserve vocals)
-            (2000, 4000, 1.3), # Upper-mids - moderate hiss
-            (4000, 8000, 1.6), # High - strong hiss reduction
-            (8000, 16000, 2.0), # Very high - aggressive hiss reduction
-        ]
-
-        for low_freq, high_freq, reduction_mult in shellac_bands:
-            band_mask = (freqs >= low_freq) & (freqs < high_freq)
-
-            if not np.any(band_mask):
-                continue
-
-            # Calculate band-specific gains
-            for j, (is_in_band, freq) in enumerate(zip(band_mask, freqs)):
-                if is_in_band:
-                    band_noise_level = noise_estimate[j]
-
-                    # Calculate SNR
-                    snr = stft_mag[j, :] / (band_noise_level + 1e-10)
-
-                    # Strength adjusted by band multiplier and user setting
-                    effective_strength = self.noise_reduction_strength * reduction_mult
-
-                    # Adaptive gain - more reduction for lower SNR
-                    band_gain = np.clip(1 - effective_strength / (snr + 1), 0.05, 1.0)
-                    gain[j, :] = band_gain
-
-        # Smooth gain to reduce musical noise artifacts
-        gain = median_filter(gain, size=(3, 5))
-        gain = uniform_filter1d(gain, size=3, axis=1)
-
-        # Apply gain
-        stft_clean = stft_mag * gain * np.exp(1j * stft_phase)
-
-        # Inverse STFT
-        denoised = librosa.istft(stft_clean, hop_length=self.HOP_LENGTH, length=len(audio))
-
-        # (Removed high-frequency shelf for hiss control)
-
-        return denoised
-
     def _process_channel(self, audio_channel: np.ndarray) -> np.ndarray:
-        """Process a single audio channel with the selected denoising method."""
-
-        # Apply the selected denoising method
-        if self.method == DenoiseMethod.SPECTRAL_GATING:
-            denoised = self._spectral_gating(audio_channel)
-        elif self.method == DenoiseMethod.SPECTRAL_SUBTRACTION:
-            denoised = self._spectral_subtraction(audio_channel)
-        elif self.method == DenoiseMethod.WIENER:
-            denoised = self._wiener_filter(audio_channel)
-        elif self.method == DenoiseMethod.COMBINED:
-            denoised = self._combined_reduction(audio_channel)
-        elif self.method == DenoiseMethod.SHELLAC:
-            denoised = self._shellac_reduction(audio_channel)
-        elif self.method == DenoiseMethod.ADAPTIVE_BLEND:
-            denoised = self._adaptive_blend_denoise(audio_channel)
-        else:
-            denoised = self._spectral_subtraction(audio_channel)
-
-        # Apply maximum dB reduction limit (prevents over-processing)
-        max_reduction_linear = 10 ** (-self.max_db_reduction / 20)
-        diff = audio_channel - denoised
-        max_allowed_diff = np.abs(audio_channel) * (1 - max_reduction_linear)
-        diff_limited = np.clip(diff, -max_allowed_diff, max_allowed_diff)
-        denoised = audio_channel - diff_limited
+        """Process a single audio channel with adaptive blend denoising."""
+        denoised = self._adaptive_blend_denoise(audio_channel)
 
         # Transient protection - blend back original at transients
         if self.transient_protection > 0:
@@ -1092,7 +857,6 @@ class AudioDenoiser:
 
     def update_parameters(
         self,
-        max_db_reduction: Optional[float] = None,
         blend_original: Optional[float] = None,
         noise_reduction_strength: Optional[float] = None,
         transient_protection: Optional[float] = None,
@@ -1105,8 +869,6 @@ class AudioDenoiser:
         adaptive_blend: Optional[bool] = None,
     ):
         """Update denoiser parameters."""
-        if max_db_reduction is not None:
-            self.max_db_reduction = max_db_reduction
         if blend_original is not None:
             self.blend_original = blend_original
         if noise_reduction_strength is not None:
