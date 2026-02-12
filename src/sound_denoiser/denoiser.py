@@ -35,10 +35,8 @@ except ImportError:
 
 class DenoiseMethod(Enum):
     """Available denoising methods."""
-    SPECTRAL_SUBTRACTION = "spectral"    # Classic spectral subtraction (good for shellac/vinyl)
+    SPECTRAL_SUBTRACTION = "spectral"    # Classic spectral subtraction (good general purpose)
     WIENER = "wiener"                    # Wiener filtering (good for broadband noise)
-    COMBINED = "combined"                # Combine multiple methods
-    SHELLAC = "shellac"                  # Optimized for 78rpm shellac records (hiss + groove)
     SPECTRAL_GATING = "gating"           # Pure spectral gating using learned noise profile
     ADAPTIVE_BLEND = "adaptive"          # Intelligent blend of subtraction and gating
 
@@ -66,7 +64,7 @@ class AudioDenoiser:
     Multi-technique denoiser for removing hiss from audio recordings.
 
     Features:
-    - Multiple denoising algorithms (spectral gating, spectral subtraction, Wiener, shellac)
+    - Multiple denoising algorithms (spectral gating, spectral subtraction, Wiener, adaptive blend)
     - Spectral gating with learned noise profiles
     - Transient preservation
     - Original signal blending
@@ -76,9 +74,6 @@ class AudioDenoiser:
     # STFT parameters
     N_FFT = 2048
     HOP_LENGTH = 512
-
-    # Shellac-specific frequency bands (Hz) - optimized for 78rpm records
-    SHELLAC_BANDS = [0, 100, 300, 800, 2000, 4000, 8000, 16000]
 
     def __init__(
         self,
@@ -701,109 +696,6 @@ class AudioDenoiser:
 
         return librosa.istft(stft_clean, hop_length=self.HOP_LENGTH, length=len(audio))
 
-    def _combined_reduction(self, audio: np.ndarray) -> np.ndarray:
-        """
-        Combined approach using multiple methods.
-
-        Applies spectral subtraction first, then Wiener filtering,
-        and finally high-frequency reduction for optimal results.
-        """
-        # Stage 1: Gentle spectral subtraction
-        temp_strength = self.noise_reduction_strength
-        self.noise_reduction_strength = temp_strength * 0.5
-        denoised = self._spectral_subtraction(audio)
-
-        # Stage 2: Wiener filtering
-        self.noise_reduction_strength = temp_strength * 0.7
-        denoised = self._wiener_filter(denoised)
-
-        # Restore strength
-        self.noise_reduction_strength = temp_strength
-
-        # Stage 3: Final high-frequency cleanup (removed)
-
-        return denoised
-    def _shellac_reduction(self, audio: np.ndarray) -> np.ndarray:
-        """
-        Specialized denoising for shellac 78rpm records.
-
-        Addresses the specific noise characteristics of shellac recordings:
-        - Groove noise (low-frequency rumble from worn grooves)
-        - Surface hiss (broadband high-frequency noise)
-        - Crackle (impulsive noise - addressed separately)
-
-        Uses a multi-stage approach:
-        1. Low-frequency rumble reduction (below 80Hz)
-        2. Broadband surface noise reduction with frequency-dependent strength
-        3. High-frequency hiss targeting (2kHz-12kHz)
-        """
-        # Compute STFT with good frequency resolution for low-freq work
-        stft = librosa.stft(audio, n_fft=self.N_FFT, hop_length=self.HOP_LENGTH)
-        stft_mag = np.abs(stft)
-        stft_phase = np.angle(stft)
-
-        # Get frequency bins
-        freqs = librosa.fft_frequencies(sr=self._sr, n_fft=self.N_FFT)
-
-        # Get noise estimate
-        if self._use_learned_profile and self._noise_profile is not None:
-            noise_estimate = self._noise_profile.spectral_mean
-        else:
-            noise_estimate = self._estimate_noise_spectrum(stft_mag)
-
-        # Apply noise threshold - multiplies the noise estimate to define the boundary
-        noise_estimate = noise_estimate * self.noise_threshold
-
-        # Create frequency-dependent gain matrix
-        gain = np.ones_like(stft_mag)
-
-        # Define shellac-specific reduction strengths per frequency band
-        # (low_freq, high_freq, reduction_multiplier)
-        shellac_bands = [
-            (0, 60, 1.8),       # Sub-bass rumble - strong reduction
-            (60, 150, 1.4),    # Bass rumble - moderate reduction
-            (150, 500, 0.8),   # Low-mids - gentle (preserve warmth)
-            (500, 2000, 0.9),  # Mids - gentle (preserve vocals)
-            (2000, 4000, 1.3), # Upper-mids - moderate hiss
-            (4000, 8000, 1.6), # High - strong hiss reduction
-            (8000, 16000, 2.0), # Very high - aggressive hiss reduction
-        ]
-
-        for low_freq, high_freq, reduction_mult in shellac_bands:
-            band_mask = (freqs >= low_freq) & (freqs < high_freq)
-
-            if not np.any(band_mask):
-                continue
-
-            # Calculate band-specific gains
-            for j, (is_in_band, freq) in enumerate(zip(band_mask, freqs)):
-                if is_in_band:
-                    band_noise_level = noise_estimate[j]
-
-                    # Calculate SNR
-                    snr = stft_mag[j, :] / (band_noise_level + 1e-10)
-
-                    # Strength adjusted by band multiplier and user setting
-                    effective_strength = self.noise_reduction_strength * reduction_mult
-
-                    # Adaptive gain - more reduction for lower SNR
-                    band_gain = np.clip(1 - effective_strength / (snr + 1), 0.05, 1.0)
-                    gain[j, :] = band_gain
-
-        # Smooth gain to reduce musical noise artifacts
-        gain = median_filter(gain, size=(3, 5))
-        gain = uniform_filter1d(gain, size=3, axis=1)
-
-        # Apply gain
-        stft_clean = stft_mag * gain * np.exp(1j * stft_phase)
-
-        # Inverse STFT
-        denoised = librosa.istft(stft_clean, hop_length=self.HOP_LENGTH, length=len(audio))
-
-        # (Removed high-frequency shelf for hiss control)
-
-        return denoised
-
     def _process_channel(self, audio_channel: np.ndarray) -> np.ndarray:
         """Process a single audio channel with the selected denoising method."""
 
@@ -814,10 +706,6 @@ class AudioDenoiser:
             denoised = self._spectral_subtraction(audio_channel)
         elif self.method == DenoiseMethod.WIENER:
             denoised = self._wiener_filter(audio_channel)
-        elif self.method == DenoiseMethod.COMBINED:
-            denoised = self._combined_reduction(audio_channel)
-        elif self.method == DenoiseMethod.SHELLAC:
-            denoised = self._shellac_reduction(audio_channel)
         elif self.method == DenoiseMethod.ADAPTIVE_BLEND:
             denoised = self._adaptive_blend_denoise(audio_channel)
         else:
