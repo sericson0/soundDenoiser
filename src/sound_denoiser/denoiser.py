@@ -73,13 +73,13 @@ class AudioDenoiser:
 
     def __init__(
         self,
-        blend_original: float = 0.08,
-        reduction_db: float = 12.0,
+        blend_original: float = 0.05,
+        reduction_db: float = 18.0,
         transient_protection: float = 0.3,
         method: DenoiseMethod = DenoiseMethod.ADAPTIVE_BLEND,
         spectral_floor: float = 0.05,
-        noise_threshold: float = 1.2,
-        artifact_control: float = 0.5,
+        noise_threshold: float = 1.5,
+        artifact_control: float = 0.7,
         adaptive_blend: bool = True,
     ):
         """
@@ -87,15 +87,15 @@ class AudioDenoiser:
 
         Args:
             blend_original: Amount of original signal to blend back (0-1, default: 0.05)
-            reduction_db: Maximum noise reduction in decibels (0-40, default: 12.0)
+            reduction_db: Maximum noise reduction in decibels (0-40, default: 18.0)
                 6 dB = noise halved, 12 dB = noise quartered, 20 dB = noise at 10%
             transient_protection: How much to protect transients (0-1, default: 0.3)
             method: Denoising method to use (default: ADAPTIVE_BLEND)
             spectral_floor: Minimum signal to retain, prevents artifacts (0-1, default: 0.05)
-            noise_threshold: Multiplier for noise estimate boundary (0.5-3.0, default: 1.0)
+            noise_threshold: Multiplier for noise estimate boundary (0.5-3.0, default: 1.5)
                 Higher values = more aggressive (treats more as noise)
                 Lower values = more conservative (preserves more signal)
-            artifact_control: Balance between subtraction and gating (0-1, default: 0.5)
+            artifact_control: Balance between subtraction and gating (0-1, default: 0.7)
                 0 = pure spectral subtraction (may cause musical noise/chirpy artifacts)
                 1 = pure spectral gating (may cause noise bursts/pumping)
                 0.5 = balanced blend of both approaches
