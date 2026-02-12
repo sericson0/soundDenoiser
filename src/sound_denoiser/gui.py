@@ -27,12 +27,12 @@ try:
     from .denoiser import AudioDenoiser, NoiseProfile, DenoiseMethod
     from .audio_player import AudioPlayer, PlaybackState
     from .waveform_display import WaveformDisplay
-    from .ui_components import SeekBar, ParameterSlider, NoiseProfilePanel
+    from .ui_components import SeekBar, ParameterSlider, VerticalParameterSlider, NoiseProfilePanel
 except ImportError:
     from denoiser import AudioDenoiser, NoiseProfile, DenoiseMethod
     from audio_player import AudioPlayer, PlaybackState
     from waveform_display import WaveformDisplay
-    from ui_components import SeekBar, ParameterSlider, NoiseProfilePanel
+    from ui_components import SeekBar, ParameterSlider, VerticalParameterSlider, NoiseProfilePanel
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -206,6 +206,21 @@ class SoundDenoiserApp(ctk.CTk):
         )
         self.save_btn.pack(side="left", padx=5)
 
+        self.output_format = ctk.CTkOptionMenu(
+            file_frame,
+            values=["FLAC", "WAV", "OGG"],
+            font=ctk.CTkFont(size=12),
+            fg_color="#2d5a27",
+            button_color="#2d5a27",
+            button_hover_color="#3d7a37",
+            dropdown_fg_color="#1a1a2e",
+            dropdown_hover_color="#333333",
+            width=80,
+            height=36,
+        )
+        self.output_format.set("FLAC")
+        self.output_format.pack(side="left", padx=5)
+
     def _create_main_content(self):
         """Create main content area."""
         main_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -294,31 +309,7 @@ class SoundDenoiserApp(ctk.CTk):
         )
         self.view_toggle_btn.pack(side="left", padx=6)
 
-        self.selection_btn = ctk.CTkButton(
-            controls,
-            text="Make Selection",
-            width=130,
-            height=32,
-            command=self._toggle_selection_button,
-            fg_color="#1a5276",
-            hover_color="#2471a3",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            state="disabled"
-        )
-        self.selection_btn.pack(side="left", padx=6)
-
-        self.process_btn = ctk.CTkButton(
-            controls,
-            text="✨ Apply Denoising",
-            command=self._process_audio,
-            font=ctk.CTkFont(size=12, weight="bold"),
-            fg_color="#6c3483",
-            hover_color="#8e44ad",
-            height=32,
-            corner_radius=8,
-            state="disabled"
-        )
-        self.process_btn.pack(side="left", padx=6)
+        # (Apply Denoising button is placed in the parameter panel below the sliders)
 
     def _create_parameter_panel(self, parent):
         """Create parameter controls panel."""
@@ -345,35 +336,103 @@ class SoundDenoiserApp(ctk.CTk):
             on_play_selection=self._on_play_selection,
             on_edit_selection=self._on_edit_selection,
         )
-        self.noise_profile_panel.pack(fill="x", padx=5, pady=(5, 10))
-
-        # Parameters Section
-        params_frame = ctk.CTkFrame(scroll_frame, fg_color="#151525", corner_radius=10)
-        params_frame.pack(fill="x", padx=5, pady=(0, 10))
-
-        # Title
-        params_title = ctk.CTkLabel(
-            params_frame,
-            text="🎛️ Denoising Parameters",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            text_color="#ffffff"
-        )
-        params_title.pack(pady=(10, 5), padx=10, anchor="w")
-
-        # Separator
-        sep = ctk.CTkFrame(params_frame, height=1, fg_color="#333333")
-        sep.pack(fill="x", padx=10, pady=(0, 10))
-
-        # Parameters
-        params_inner = ctk.CTkFrame(params_frame, fg_color="transparent")
-        params_inner.pack(fill="x", padx=10, pady=(0, 10))
+        self.noise_profile_panel.pack(fill="x", padx=4, pady=(4, 6))
 
         # Set the denoising method to Adaptive Blend
         self.denoiser.set_method(DenoiseMethod.ADAPTIVE_BLEND)
 
+        # ═══════════════════════════════════════════════════════
+        # Main Parameters — Reduction dB + Noise Threshold (vertical sliders)
+        # ═══════════════════════════════════════════════════════
+        params_frame = ctk.CTkFrame(scroll_frame, fg_color="#151525", corner_radius=8)
+        params_frame.pack(fill="x", padx=4, pady=(0, 6))
+
+        # Horizontal row for the two vertical sliders
+        main_sliders_row = ctk.CTkFrame(params_frame, fg_color="transparent")
+        main_sliders_row.pack(padx=8, pady=(6, 4))
+
+        self.noise_threshold_slider = VerticalParameterSlider(
+            main_sliders_row,
+            label="Noise Threshold",
+            from_=0.5,
+            to=3.0,
+            default=1.5,
+            unit="x",
+            command=self._on_parameter_change,
+            slider_height=120,
+        )
+        self.noise_threshold_slider.pack(side="left", padx=(8, 15))
+
+        self.reduction_db_slider = VerticalParameterSlider(
+            main_sliders_row,
+            label="Reduction",
+            from_=0.0,
+            to=40.0,
+            default=18.0,
+            unit=" dB",
+            command=self._on_parameter_change,
+            slider_height=120,
+        )
+        self.reduction_db_slider.pack(side="left", padx=(15, 8))
+
+        # Apply Denoising button below the sliders
+        self.process_btn = ctk.CTkButton(
+            params_frame,
+            text="✨ Apply Denoising",
+            command=self._process_audio,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#6c3483",
+            hover_color="#8e44ad",
+            height=32,
+            corner_radius=8,
+            state="disabled"
+        )
+        self.process_btn.pack(fill="x", padx=10, pady=(0, 8))
+
+        # ═══════════════════════════════════════════════════════
+        # Fine-Tuning — Collapsible section with remaining params
+        # ═══════════════════════════════════════════════════════
+        fine_tune_frame = ctk.CTkFrame(scroll_frame, fg_color="#151525", corner_radius=8)
+        fine_tune_frame.pack(fill="x", padx=4, pady=(0, 4))
+
+        # Clickable header to expand/collapse, with reset button on the right
+        self._fine_tune_expanded = False
+        fine_tune_header = ctk.CTkFrame(fine_tune_frame, fg_color="transparent")
+        fine_tune_header.pack(fill="x", padx=6, pady=(4, 2))
+
+        self.fine_tune_toggle_btn = ctk.CTkButton(
+            fine_tune_header,
+            text="▶ Fine-Tuning",
+            command=self._toggle_fine_tuning,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="transparent",
+            hover_color="#222233",
+            text_color="#bb8fce",
+            anchor="w",
+            height=24,
+        )
+        self.fine_tune_toggle_btn.pack(side="left", fill="x", expand=True)
+
+        self.reset_btn = ctk.CTkButton(
+            fine_tune_header,
+            text="↺ Reset",
+            command=self._reset_parameters,
+            font=ctk.CTkFont(size=10),
+            fg_color="#555555",
+            hover_color="#777777",
+            width=60,
+            height=24,
+            corner_radius=5,
+        )
+        self.reset_btn.pack(side="right", padx=(4, 0))
+
+        # Collapsible content container
+        self.fine_tune_inner = ctk.CTkFrame(fine_tune_frame, fg_color="transparent")
+        # Starts collapsed — do NOT pack yet
+
         # Blend Original
         self.blend_slider = ParameterSlider(
-            params_inner,
+            self.fine_tune_inner,
             label="Blend Original Signal",
             from_=0.0,
             to=50.0,
@@ -381,23 +440,11 @@ class SoundDenoiserApp(ctk.CTk):
             unit="%",
             command=self._on_parameter_change
         )
-        self.blend_slider.pack(fill="x", pady=(0, 12))
-
-        # Noise Reduction (dB)
-        self.reduction_db_slider = ParameterSlider(
-            params_inner,
-            label="Reduction",
-            from_=0.0,
-            to=40.0,
-            default=12.0,
-            unit=" dB",
-            command=self._on_parameter_change
-        )
-        self.reduction_db_slider.pack(fill="x", pady=(0, 12))
+        self.blend_slider.pack(fill="x", padx=8, pady=(4, 4))
 
         # Transient Protection
         self.transient_slider = ParameterSlider(
-            params_inner,
+            self.fine_tune_inner,
             label="Transient Protection",
             from_=0.0,
             to=100.0,
@@ -405,31 +452,11 @@ class SoundDenoiserApp(ctk.CTk):
             unit="%",
             command=self._on_parameter_change
         )
-        self.transient_slider.pack(fill="x", pady=(0, 12))
-
-
-        # Fine-Tuning Section
-        fine_tune_frame = ctk.CTkFrame(scroll_frame, fg_color="#151525", corner_radius=10)
-        fine_tune_frame.pack(fill="x", padx=5, pady=(0, 10))
-
-        fine_tune_header = ctk.CTkFrame(fine_tune_frame, fg_color="transparent")
-        fine_tune_header.pack(fill="x", padx=10, pady=(10, 5))
-
-        fine_tune_label = ctk.CTkLabel(
-            fine_tune_header,
-            text="Fine-Tuning",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            text_color="#bb8fce"
-        )
-        fine_tune_label.pack(side="left")
-
-        fine_tune_inner = ctk.CTkFrame(fine_tune_frame, fg_color="transparent")
-        fine_tune_inner.pack(fill="x", padx=10, pady=(0, 10))
-
+        self.transient_slider.pack(fill="x", padx=8, pady=(0, 4))
 
         # Spectral Floor (artifact prevention)
         self.spectral_floor_slider = ParameterSlider(
-            fine_tune_inner,
+            self.fine_tune_inner,
             label="Spectral Floor",
             from_=0.0,
             to=20.0,
@@ -437,117 +464,43 @@ class SoundDenoiserApp(ctk.CTk):
             unit="%",
             command=self._on_parameter_change
         )
-        self.spectral_floor_slider.pack(fill="x", pady=(0, 12))
-
-        # Noise Threshold (noise/signal boundary)
-        self.noise_threshold_slider = ParameterSlider(
-            fine_tune_inner,
-            label="Noise Threshold",
-            from_=0.5,
-            to=3.0,
-            default=1.0,
-            unit="x",
-            command=self._on_parameter_change
-        )
-        self.noise_threshold_slider.pack(fill="x", pady=(0, 12))
+        self.spectral_floor_slider.pack(fill="x", padx=8, pady=(0, 4))
 
         # Artifact Control (subtraction vs gating balance)
         self.artifact_control_slider = ParameterSlider(
-            fine_tune_inner,
+            self.fine_tune_inner,
             label="Artifact Control",
             from_=0.0,
             to=100.0,
-            default=50.0,
+            default=70.0,
             unit="%",
             command=self._on_parameter_change
         )
-        self.artifact_control_slider.pack(fill="x", pady=(0, 8))
+        self.artifact_control_slider.pack(fill="x", padx=8, pady=(0, 2))
 
-        # Artifact control description
         artifact_desc = ctk.CTkLabel(
-            fine_tune_inner,
-            text="0%=Subtraction (chirpy) ↔ 100%=Gating (pumping)",
-            font=ctk.CTkFont(size=9),
+            self.fine_tune_inner,
+            text="0%=Subtraction ↔ 100%=Gating",
+            font=ctk.CTkFont(size=8),
             text_color="#666666"
         )
-        artifact_desc.pack(anchor="w", pady=(0, 8))
+        artifact_desc.pack(anchor="w", padx=8, pady=(0, 4))
 
         # Adaptive Blend checkbox
         self.adaptive_blend_var = ctk.BooleanVar(value=True)
         self.adaptive_blend_checkbox = ctk.CTkCheckBox(
-            fine_tune_inner,
-            text="Adaptive (varies by frequency/transients)",
+            self.fine_tune_inner,
+            text="Adaptive (freq/transient-aware)",
             variable=self.adaptive_blend_var,
             command=self._on_parameter_change,
-            font=ctk.CTkFont(size=11),
+            font=ctk.CTkFont(size=10),
             fg_color="#6c3483",
             hover_color="#8e44ad",
             text_color="#cccccc"
         )
-        self.adaptive_blend_checkbox.pack(anchor="w", pady=(0, 5))
+        self.adaptive_blend_checkbox.pack(anchor="w", padx=8, pady=(0, 6))
 
-        # Buttons Section (reset only; Apply Denoising moved to transport row)
-        buttons_frame = ctk.CTkFrame(scroll_frame, fg_color="#151525", corner_radius=10)
-        buttons_frame.pack(fill="x", padx=5, pady=(0, 10))
-
-        buttons_inner = ctk.CTkFrame(buttons_frame, fg_color="transparent")
-        buttons_inner.pack(fill="x", padx=10, pady=10)
-
-        # Reset button
-        self.reset_btn = ctk.CTkButton(
-            buttons_inner,
-            text="↺ Reset to Defaults",
-            command=self._reset_parameters,
-            font=ctk.CTkFont(size=12),
-            fg_color="#555555",
-            hover_color="#777777",
-            height=35,
-            corner_radius=8
-        )
-        self.reset_btn.pack(fill="x", pady=(0, 10))
-
-        # Output Format Section
-        format_frame = ctk.CTkFrame(buttons_inner, fg_color="transparent")
-        format_frame.pack(fill="x", pady=(5, 0))
-
-        format_label = ctk.CTkLabel(
-            format_frame,
-            text="Output Format:",
-            font=ctk.CTkFont(size=12),
-            text_color="#cccccc"
-        )
-        format_label.pack(side="left")
-
-        self.output_format = ctk.CTkOptionMenu(
-            format_frame,
-            values=["FLAC", "WAV", "OGG"],
-            font=ctk.CTkFont(size=12),
-            fg_color="#2d5a27",
-            button_color="#2d5a27",
-            button_hover_color="#3d7a37",
-            dropdown_fg_color="#1a1a2e",
-            dropdown_hover_color="#333333",
-            width=100
-        )
-        self.output_format.set("FLAC")
-        self.output_format.pack(side="right")
-
-        # Info box
-        info_frame = ctk.CTkFrame(scroll_frame, fg_color="#1a2a3a", corner_radius=8)
-        info_frame.pack(fill="x", padx=5, pady=(0, 10))
-
-        info_text = ctk.CTkLabel(
-            info_frame,
-            text="💡 Tips:\n"
-                 "• Use Auto Detect to find quiet sections\n"
-                 "• Or click & drag on waveform for manual selection\n"
-                 "• Learning a noise profile improves results\n"
-                 "• Lower dB reduction = gentler denoising",
-            font=ctk.CTkFont(size=11),
-            text_color="#aaaaaa",
-            justify="left"
-        )
-        info_text.pack(padx=10, pady=10, anchor="w")
+        # (Reset button is now in the Fine-Tuning header row)
 
     def _create_status_bar(self):
         """Create status bar."""
@@ -786,7 +739,8 @@ class SoundDenoiserApp(ctk.CTk):
         self.view_toggle_btn.configure(state="disabled")
         self.play_btn.configure(state="disabled", text="▶")
         self.stop_btn.configure(state="disabled")
-        self.selection_btn.configure(state="disabled", text="Select Noise", fg_color="#1a5276")
+        self.noise_profile_panel.make_selection_btn.configure(state="disabled")
+        self.noise_profile_panel.set_selection_enabled(False)
         self.process_btn.configure(state="disabled", text="Apply Denoising")
 
         # Load in background thread
@@ -874,6 +828,17 @@ class SoundDenoiserApp(ctk.CTk):
 
         threading.Thread(target=process_thread, daemon=True).start()
 
+    def _toggle_fine_tuning(self):
+        """Toggle visibility of the fine-tuning section."""
+        if self._fine_tune_expanded:
+            self.fine_tune_inner.pack_forget()
+            self.fine_tune_toggle_btn.configure(text="▶ Fine-Tuning")
+            self._fine_tune_expanded = False
+        else:
+            self.fine_tune_inner.pack(fill="x", pady=(0, 5))
+            self.fine_tune_toggle_btn.configure(text="▼ Fine-Tuning")
+            self._fine_tune_expanded = True
+
     def _on_parameter_change(self, value):
         """Handle parameter change - enable reprocessing hint."""
         if self.denoiser.get_original() is not None and not self.is_processing:
@@ -886,13 +851,14 @@ class SoundDenoiserApp(ctk.CTk):
 
     def _reset_parameters(self):
         """Reset parameters to defaults."""
-        self.blend_slider.set(5.0)
-        self.reduction_db_slider.set(12.0)
-        self.transient_slider.set(30.0)
+        # Main parameters
+        self.reduction_db_slider.set(18.0)
+        self.noise_threshold_slider.set(1.5)
         # Fine-tuning defaults
+        self.blend_slider.set(5.0)
+        self.transient_slider.set(30.0)
         self.spectral_floor_slider.set(5.0)
-        self.noise_threshold_slider.set(1.0)
-        self.artifact_control_slider.set(50.0)
+        self.artifact_control_slider.set(70.0)
         self.adaptive_blend_var.set(True)
 
     def _get_player(self, which: str) -> AudioPlayer:
@@ -970,16 +936,6 @@ class SoundDenoiserApp(ctk.CTk):
         next_view = "processed" if self.active_waveform_view == "original" else "original"
         # Preserve position and play state for a bypass-like toggle
         self._set_active_waveform_view(next_view, preserve_position=True, preserve_play_state=True)
-
-    def _toggle_selection_button(self):
-        """Handle Make Selection button in the transport row."""
-        enable = not self.noise_selection_enabled
-        # Update button styling/text
-        if enable:
-            self.selection_btn.configure(text="Selection ON", fg_color="#ff6b6b", hover_color="#ff8f8f")
-        else:
-            self.selection_btn.configure(text="Make Selection", fg_color="#1a5276", hover_color="#2471a3")
-        self._toggle_noise_selection(enable)
 
     def _toggle_play(self, which: Optional[str] = None):
         """Toggle play/pause for the active waveform (or a specific one)."""
@@ -1113,7 +1069,6 @@ class SoundDenoiserApp(ctk.CTk):
         self.play_btn.configure(state="normal", text="▶")
         self.stop_btn.configure(state="normal")
         self.view_toggle_btn.configure(state="disabled")
-        self.selection_btn.configure(state="normal")
         self.process_btn.configure(state="normal")
         self.noise_profile_panel.enable_controls(True)
 
