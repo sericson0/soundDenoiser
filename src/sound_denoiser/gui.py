@@ -65,7 +65,6 @@ class SoundDenoiserApp(ctk.CTk):
         self.selected_noise_region: Optional[Tuple[float, float]] = None
         self.config_path = Path.home() / ".sound_denoiser_config.json"
         self.config = self._load_config()
-        self.threshold_curve: List[Tuple[float, float]] = []
 
         # Build UI
         self._create_ui()
@@ -238,7 +237,6 @@ class SoundDenoiserApp(ctk.CTk):
             waveform_frame,
             on_region_select=self._on_noise_region_selected,
             on_seek=lambda pos: self._on_seek("original", pos),
-            on_threshold_change=self._on_threshold_curve_change,
         )
         self.waveform_original.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
         self.waveform_original.plot_waveform(None, 44100, f"{self.track_title} (Original)", "#ff9f43")
@@ -246,7 +244,6 @@ class SoundDenoiserApp(ctk.CTk):
         self.waveform_processed = WaveformDisplay(
             waveform_frame,
             on_seek=lambda pos: self._on_seek("processed", pos),
-            on_threshold_change=self._on_threshold_curve_change,
         )
         self.waveform_processed.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
         self.waveform_processed.plot_waveform(None, 44100, f"{self.track_title} (Denoised)", "#00d9ff")
@@ -630,12 +627,6 @@ class SoundDenoiserApp(ctk.CTk):
         self.noise_profile_panel.add_selection(start, end)
         count = len(self.noise_profile_panel.get_selections())
         self._set_status(f"Added noise region: {start:.2f}s - {end:.2f}s (Total: {count} selection(s))")
-        self._update_threshold_from_params()
-
-    def _on_threshold_curve_change(self, freqs: np.ndarray, levels: np.ndarray):
-        """Persist spectrum threshold curve changes and surface in status."""
-        self.threshold_curve = list(zip(freqs.tolist(), levels.tolist()))
-        self._set_status("Updated threshold curve")
 
     def _learn_noise_profile_manual(self):
         """Learn noise profile from manually selected regions."""
@@ -797,7 +788,6 @@ class SoundDenoiserApp(ctk.CTk):
         self.stop_btn.configure(state="disabled")
         self.selection_btn.configure(state="disabled", text="Select Noise", fg_color="#1a5276")
         self.process_btn.configure(state="disabled", text="Apply Denoising")
-        self._update_threshold_from_params()
 
         # Load in background thread
         def load_thread():
@@ -888,32 +878,11 @@ class SoundDenoiserApp(ctk.CTk):
         """Handle parameter change - enable reprocessing hint."""
         if self.denoiser.get_original() is not None and not self.is_processing:
             self.process_btn.configure(fg_color="#884499")
-        self._update_threshold_from_params()
-
-    def _update_threshold_from_params(self):
-        """Recalculate the frequency threshold curve based on current params."""
-        # Base grid of frequencies (more points for finer control)
-        freqs = np.array([30, 60, 90, 140, 200, 300, 450, 650, 900, 1300, 1800, 2500, 3400, 4600, 6000, 8000, 10000, 13000, 16000], dtype=float)
-
-        # Parameter influences
-        noise_thresh = self.noise_threshold_slider.get() if hasattr(self, "noise_threshold_slider") else 1.0
-        hiss_start = self.hiss_start_slider.get() if hasattr(self, "hiss_start_slider") else 2000.0
-        hiss_peak = self.hiss_peak_slider.get() if hasattr(self, "hiss_peak_slider") else 6000.0
-        # Baseline slope: gently rising then falling in highs
-        base_levels = np.linspace(-72, -50, len(freqs))
-
-        # Global lift/drop from noise threshold (UI now lifts the line when threshold increases)
-        levels = base_levels + (noise_thresh - 1.0) * 6.0
-
-        # Clamp to sensible bounds
-        levels = np.clip(levels, -110.0, 10.0)
-
-        # Persist and push into displays
-        self.threshold_curve = list(zip(freqs.tolist(), levels.tolist()))
-        self.waveform_original.set_threshold_curve(freqs, levels)
-        self.waveform_processed.set_threshold_curve(freqs, levels)
-        self.waveform_original.set_noise_threshold_multiplier(noise_thresh)
-        self.waveform_processed.set_noise_threshold_multiplier(noise_thresh)
+        # Update the purple noise threshold line on the spectrum view
+        if hasattr(self, "noise_threshold_slider"):
+            noise_thresh = self.noise_threshold_slider.get()
+            self.waveform_original.set_noise_threshold_multiplier(noise_thresh)
+            self.waveform_processed.set_noise_threshold_multiplier(noise_thresh)
 
     def _on_method_change(self, method_name: str):
         """Handle denoising method change."""
@@ -945,7 +914,6 @@ class SoundDenoiserApp(ctk.CTk):
         # Highlight process button to indicate reprocessing needed
         if self.denoiser.get_original() is not None and not self.is_processing:
             self.process_btn.configure(fg_color="#884499")
-        self._update_threshold_from_params()
 
     def _reset_parameters(self):
         """Reset parameters to defaults."""
