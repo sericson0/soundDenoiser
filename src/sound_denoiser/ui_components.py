@@ -114,22 +114,22 @@ class ParameterSlider(ctk.CTkFrame):
         self.label = ctk.CTkLabel(
             self,
             text=label,
-            font=ctk.CTkFont(size=12, weight="bold"),
+            font=ctk.CTkFont(size=11, weight="bold"),
             text_color="#cccccc",
         )
         self.label.pack(anchor="w")
 
         slider_frame = ctk.CTkFrame(self, fg_color="transparent")
-        slider_frame.pack(fill="x", pady=(2, 0))
+        slider_frame.pack(fill="x", pady=(1, 0))
 
         self.value_label = ctk.CTkLabel(
             slider_frame,
             text=f"{default:.1f}{unit}",
-            font=ctk.CTkFont(size=11),
+            font=ctk.CTkFont(size=10),
             text_color="#00d9ff",
-            width=60,
+            width=50,
         )
-        self.value_label.pack(side="right", padx=(5, 0))
+        self.value_label.pack(side="right", padx=(4, 0))
 
         self.slider = ctk.CTkSlider(
             slider_frame,
@@ -143,6 +143,74 @@ class ParameterSlider(ctk.CTkFrame):
         )
         self.slider.set(default)
         self.slider.pack(side="left", fill="x", expand=True)
+
+    def _on_change(self, value):
+        self.value_label.configure(text=f"{value:.1f}{self.unit}")
+        if self.command:
+            self.command(value)
+
+    def get(self) -> float:
+        return self.slider.get()
+
+    def set(self, value: float):
+        self.slider.set(value)
+        self.value_label.configure(text=f"{value:.1f}{self.unit}")
+
+
+class VerticalParameterSlider(ctk.CTkFrame):
+    """Vertical parameter slider with label on top, value display, and vertical slider."""
+
+    def __init__(
+        self,
+        master,
+        label: str,
+        from_: float,
+        to: float,
+        default: float,
+        unit: str = "",
+        command=None,
+        slider_height: int = 140,
+        **kwargs,
+    ):
+        super().__init__(master, fg_color="transparent", **kwargs)
+
+        self.unit = unit
+        self.command = command
+
+        # Label at top
+        self.label = ctk.CTkLabel(
+            self,
+            text=label,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color="#cccccc",
+        )
+        self.label.pack(pady=(0, 2))
+
+        # Vertical slider
+        self.slider = ctk.CTkSlider(
+            self,
+            from_=from_,
+            to=to,
+            orientation="vertical",
+            number_of_steps=100,
+            command=self._on_change,
+            progress_color="#00d9ff",
+            button_color="#00d9ff",
+            button_hover_color="#00b8d4",
+            height=slider_height,
+            width=18,
+        )
+        self.slider.set(default)
+        self.slider.pack(pady=(0, 2))
+
+        # Value display below slider
+        self.value_label = ctk.CTkLabel(
+            self,
+            text=f"{default:.1f}{unit}",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#00d9ff",
+        )
+        self.value_label.pack(pady=(0, 0))
 
     def _on_change(self, value):
         self.value_label.configure(text=f"{value:.1f}{self.unit}")
@@ -173,7 +241,7 @@ class NoiseProfilePanel(ctk.CTkFrame):
         on_edit_selection=None,
         **kwargs,
     ):
-        super().__init__(master, fg_color="#151525", corner_radius=10, **kwargs)
+        super().__init__(master, fg_color="#151525", corner_radius=8, **kwargs)
 
         self.on_learn_manual = on_learn_manual
         self.on_learn_auto = on_learn_auto
@@ -191,137 +259,158 @@ class NoiseProfilePanel(ctk.CTkFrame):
         self._setup_ui()
 
     def _setup_ui(self):
-        title = ctk.CTkLabel(
-            self,
-            text="Noise Profile Learning",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            text_color="#ff6b6b",
-        )
-        title.pack(pady=(10, 5), padx=10, anchor="w")
-
-        desc = ctk.CTkLabel(
-            self,
-            text="Select regions with only noise (hiss) for better results",
-            font=ctk.CTkFont(size=10),
-            text_color="#888888",
-            wraplength=200,
-        )
-        desc.pack(padx=10, anchor="w")
-
-        sep = ctk.CTkFrame(self, height=1, fg_color="#333333")
-        sep.pack(fill="x", padx=10, pady=10)
-
-        self.selections_frame = ctk.CTkFrame(self, fg_color="#1a2a3a", corner_radius=6)
-        self.selections_frame.pack(fill="x", padx=10, pady=10)
-
-        self.selections_title = ctk.CTkLabel(
-            self.selections_frame,
-            text="Selected Regions (0):",
-            font=ctk.CTkFont(size=10, weight="bold"),
-            text_color="#aaaaaa",
-        )
-        self.selections_title.pack(pady=(8, 5), padx=10, anchor="w")
-
-        self.selections_list = ctk.CTkFrame(self.selections_frame, fg_color="transparent")
-        self.selections_list.pack(fill="x", padx=5, pady=(0, 8))
-
-        self.no_selections_label = ctk.CTkLabel(
-            self.selections_list,
-            text="No regions selected",
-            font=ctk.CTkFont(size=10),
-            text_color="#555555",
-        )
-        self.no_selections_label.pack(pady=5)
-
-        # Play Selection button (loops all selected noise regions)
-        self.play_selection_btn = ctk.CTkButton(
-            self.selections_frame,
-            text="Play Selection",
-            command=self._on_play_selection,
-            font=ctk.CTkFont(size=10, weight="bold"),
-            fg_color="#2a4a6a",
-            hover_color="#3a5a7a",
-            height=26,
-            corner_radius=6,
-            state="disabled",
-        )
-        self.play_selection_btn.pack(fill="x", padx=10, pady=(0, 8))
-
-        sep2 = ctk.CTkFrame(self, height=1, fg_color="#333333")
-        sep2.pack(fill="x", padx=10, pady=5)
-
-        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
-        btn_frame.pack(fill="x", padx=10, pady=(0, 10))
-
-        self.learn_btn = ctk.CTkButton(
-            btn_frame,
-            text="Learn from Selections",
-            command=self.on_learn_manual,
-            font=ctk.CTkFont(size=11, weight="bold"),
-            fg_color="#2d5a27",
-            hover_color="#3d7a37",
-            height=32,
-            corner_radius=6,
-            state="disabled",
-        )
-        self.learn_btn.pack(fill="x", pady=(0, 5))
+        # ── Top row: Auto Detect + Make Selection + Clear ──
+        top_row = ctk.CTkFrame(self, fg_color="transparent")
+        top_row.pack(fill="x", padx=6, pady=(6, 3))
 
         self.auto_btn = ctk.CTkButton(
-            btn_frame,
-            text="Auto Detect Noise",
+            top_row,
+            text="Auto Detect",
             command=self.on_learn_auto,
-            font=ctk.CTkFont(size=11),
+            font=ctk.CTkFont(size=10, weight="bold"),
             fg_color="#444444",
             hover_color="#555555",
-            height=28,
-            corner_radius=6,
+            height=26,
+            corner_radius=5,
             state="disabled",
         )
-        self.auto_btn.pack(fill="x", pady=(0, 8))
+        self.auto_btn.pack(side="left", fill="x", expand=True, padx=(0, 3))
 
-        self.status_frame = ctk.CTkFrame(self, fg_color="#1a2a3a", corner_radius=6)
-        self.status_frame.pack(fill="x", padx=10, pady=(0, 10))
+        self.make_selection_btn = ctk.CTkButton(
+            top_row,
+            text="Select",
+            command=self._on_toggle_selection,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color="#1a5276",
+            hover_color="#2471a3",
+            height=26,
+            corner_radius=5,
+            state="disabled",
+        )
+        self.make_selection_btn.pack(side="left", fill="x", expand=True, padx=(0, 3))
+
+        self.clear_btn = ctk.CTkButton(
+            top_row,
+            text="Clear",
+            command=self._on_clear,
+            font=ctk.CTkFont(size=9),
+            fg_color="#555555",
+            hover_color="#777777",
+            width=42,
+            height=26,
+            corner_radius=5,
+            state="disabled",
+        )
+        self.clear_btn.pack(side="right")
+
+        # ── Status + Use profile on one row ──
+        profile_row = ctk.CTkFrame(self, fg_color="transparent")
+        profile_row.pack(fill="x", padx=6, pady=(1, 3))
 
         self.status_label = ctk.CTkLabel(
-            self.status_frame,
-            text="No noise profile learned",
-            font=ctk.CTkFont(size=11),
+            profile_row,
+            text="No profile",
+            font=ctk.CTkFont(size=10),
             text_color="#888888",
         )
-        self.status_label.pack(pady=8, padx=10, anchor="w")
+        self.status_label.pack(side="left", padx=(2, 5))
 
         self.use_profile_var = ctk.BooleanVar(value=False)
         self.use_profile_switch = ctk.CTkSwitch(
-            self,
-            text="Use learned profile",
+            profile_row,
+            text="Use",
             variable=self.use_profile_var,
             command=self._on_toggle,
-            font=ctk.CTkFont(size=11),
+            font=ctk.CTkFont(size=10),
             progress_color="#ff6b6b",
             button_color="#ff6b6b",
             button_hover_color="#ff8f8f",
             state="disabled",
+            width=40,
         )
-        self.use_profile_switch.pack(pady=(0, 5), padx=10, anchor="w")
+        self.use_profile_switch.pack(side="right", padx=(0, 2))
 
-        self.clear_btn = ctk.CTkButton(
-            self,
-            text="Clear All",
-            command=self._on_clear,
-            font=ctk.CTkFont(size=10),
-            fg_color="#555555",
-            hover_color="#777777",
-            height=24,
-            corner_radius=6,
+        sep = ctk.CTkFrame(self, height=1, fg_color="#333333")
+        sep.pack(fill="x", padx=6, pady=(1, 3))
+
+        # ── Selected Regions ──
+        self.selections_frame = ctk.CTkFrame(self, fg_color="#1a2a3a", corner_radius=5)
+        self.selections_frame.pack(fill="x", padx=6, pady=(0, 3))
+
+        self.selections_title = ctk.CTkLabel(
+            self.selections_frame,
+            text="Selected Regions (0):",
+            font=ctk.CTkFont(size=9, weight="bold"),
+            text_color="#aaaaaa",
+        )
+        self.selections_title.pack(pady=(4, 2), padx=6, anchor="w")
+
+        self.selections_list = ctk.CTkFrame(self.selections_frame, fg_color="transparent")
+        self.selections_list.pack(fill="x", padx=3, pady=(0, 2))
+
+        self.no_selections_label = ctk.CTkLabel(
+            self.selections_list,
+            text="No regions selected",
+            font=ctk.CTkFont(size=9),
+            text_color="#555555",
+        )
+        self.no_selections_label.pack(pady=2)
+
+        # Play Selection button
+        self.play_selection_btn = ctk.CTkButton(
+            self.selections_frame,
+            text="Play Selection",
+            command=self._on_play_selection,
+            font=ctk.CTkFont(size=9, weight="bold"),
+            fg_color="#2a4a6a",
+            hover_color="#3a5a7a",
+            height=22,
+            corner_radius=5,
             state="disabled",
         )
-        self.clear_btn.pack(fill="x", padx=10, pady=(0, 10))
+        self.play_selection_btn.pack(fill="x", padx=6, pady=(0, 4))
+
+        # ── Learn button ──
+        self.learn_btn = ctk.CTkButton(
+            self,
+            text="Learn from Selections",
+            command=self.on_learn_manual,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color="#2d5a27",
+            hover_color="#3d7a37",
+            height=26,
+            corner_radius=5,
+            state="disabled",
+        )
+        self.learn_btn.pack(fill="x", padx=6, pady=(0, 6))
 
     def _on_toggle(self):
         self.on_toggle_use(self.use_profile_var.get())
 
+    def _on_toggle_selection(self):
+        """Handle Make Selection button click — toggles selection mode."""
+        self._selection_enabled = not self._selection_enabled
+        if self._selection_enabled:
+            self.make_selection_btn.configure(
+                text="Selection ON", fg_color="#ff6b6b", hover_color="#ff8f8f"
+            )
+        else:
+            self.make_selection_btn.configure(
+                text="Select", fg_color="#1a5276", hover_color="#2471a3"
+            )
+        if self.on_toggle_selection:
+            self.on_toggle_selection(self._selection_enabled)
+
     def set_selection_enabled(self, enable: bool):
         self._selection_enabled = enable
+        if enable:
+            self.make_selection_btn.configure(
+                text="Selection ON", fg_color="#ff6b6b", hover_color="#ff8f8f"
+            )
+        else:
+            self.make_selection_btn.configure(
+                text="Select", fg_color="#1a5276", hover_color="#2471a3"
+            )
 
     def add_selection(self, start: float, end: float):
         self._selections.append((start, end))
@@ -506,6 +595,7 @@ class NoiseProfilePanel(ctk.CTkFrame):
     def enable_controls(self, enable: bool = True):
         state = "normal" if enable else "disabled"
         self.auto_btn.configure(state=state)
+        self.make_selection_btn.configure(state=state)
 
     def enable_learn_button(self, enable: bool = True):
         if enable and len(self._selections) > 0:
@@ -515,13 +605,13 @@ class NoiseProfilePanel(ctk.CTkFrame):
 
     def update_status(self, profile: Optional["NoiseProfile"], regions: Optional[List[Tuple[float, float]]] = None):
         if profile is not None:
-            self.status_label.configure(text="Noise profile learned", text_color="#4ade80")
+            self.status_label.configure(text="Profile learned", text_color="#4ade80")
             self.use_profile_switch.configure(state="normal")
             self.use_profile_var.set(True)
             self.clear_btn.configure(state="normal")
             self._on_toggle()
         else:
-            self.status_label.configure(text="No noise profile learned", text_color="#888888")
+            self.status_label.configure(text="No profile", text_color="#888888")
             self.use_profile_switch.configure(state="disabled")
             self.use_profile_var.set(False)
             self.clear_btn.configure(state="disabled")
