@@ -4,7 +4,7 @@ Core audio denoising module using multiple techniques for hiss removal.
 Implements:
 - Spectral gating with learned noise profiles
 - Spectral subtraction for broadband noise
-- Wiener filtering for optimal noise estimation
+- Adaptive blend of subtraction and gating
 - Shellac/78rpm optimized reduction
 - High-frequency focused processing where hiss typically lives
 - Noise profile learning for targeted removal
@@ -36,7 +36,6 @@ except ImportError:
 class DenoiseMethod(Enum):
     """Available denoising methods."""
     SPECTRAL_SUBTRACTION = "spectral"    # Classic spectral subtraction (good general purpose)
-    WIENER = "wiener"                    # Wiener filtering (good for broadband noise)
     SPECTRAL_GATING = "gating"           # Pure spectral gating using learned noise profile
     ADAPTIVE_BLEND = "adaptive"          # Intelligent blend of subtraction and gating
 
@@ -64,7 +63,7 @@ class AudioDenoiser:
     Multi-technique denoiser for removing hiss from audio recordings.
 
     Features:
-    - Multiple denoising algorithms (spectral gating, spectral subtraction, Wiener, adaptive blend)
+    - Multiple denoising algorithms (spectral gating, spectral subtraction, adaptive blend)
     - Spectral gating with learned noise profiles
     - Transient preservation
     - Original signal blending
@@ -653,49 +652,6 @@ class AudioDenoiser:
 
         return librosa.istft(stft_clean, hop_length=self.HOP_LENGTH, length=len(audio))
 
-    def _wiener_filter(self, audio: np.ndarray) -> np.ndarray:
-        """
-        Wiener filtering for optimal noise reduction.
-
-        Estimates the optimal filter that minimizes mean square error
-        between the clean signal and the filtered noisy signal.
-        """
-        # Compute STFT
-        stft = librosa.stft(audio, n_fft=self.N_FFT, hop_length=self.HOP_LENGTH)
-        stft_mag = np.abs(stft)
-        stft_phase = np.angle(stft)
-
-        # Get noise estimate
-        if self._use_learned_profile and self._noise_profile is not None:
-            noise_estimate = self._noise_profile.spectral_mean
-        else:
-            noise_estimate = self._estimate_noise_spectrum(stft_mag)
-
-        # Apply noise threshold - multiplies the noise estimate to define the boundary
-        noise_estimate = noise_estimate * self.noise_threshold
-        noise_power = noise_estimate ** 2
-
-        # Signal power estimate
-        signal_power = stft_mag ** 2
-
-        # Wiener filter gain (with regularization)
-        noise_power_2d = noise_power[:, np.newaxis]
-        snr_prior = np.maximum(signal_power - noise_power_2d, 0) / (noise_power_2d + 1e-10)
-
-        # Apply strength parameter
-        snr_prior = snr_prior * self.noise_reduction_strength
-
-        # Wiener gain
-        wiener_gain = snr_prior / (snr_prior + 1)
-
-        # Smooth gain to reduce musical noise
-        wiener_gain = median_filter(wiener_gain, size=(3, 3))
-
-        # Apply gain
-        stft_clean = stft_mag * wiener_gain * np.exp(1j * stft_phase)
-
-        return librosa.istft(stft_clean, hop_length=self.HOP_LENGTH, length=len(audio))
-
     def _process_channel(self, audio_channel: np.ndarray) -> np.ndarray:
         """Process a single audio channel with the selected denoising method."""
 
@@ -704,8 +660,6 @@ class AudioDenoiser:
             denoised = self._spectral_gating(audio_channel)
         elif self.method == DenoiseMethod.SPECTRAL_SUBTRACTION:
             denoised = self._spectral_subtraction(audio_channel)
-        elif self.method == DenoiseMethod.WIENER:
-            denoised = self._wiener_filter(audio_channel)
         elif self.method == DenoiseMethod.ADAPTIVE_BLEND:
             denoised = self._adaptive_blend_denoise(audio_channel)
         else:

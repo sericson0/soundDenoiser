@@ -380,7 +380,6 @@ class SoundDenoiserApp(ctk.CTk):
         # Method names for display
         self._method_names = {
             "Spectral Subtraction": DenoiseMethod.SPECTRAL_SUBTRACTION,
-            "Wiener Filter": DenoiseMethod.WIENER,
             "Spectral Gating (Learned Profile)": DenoiseMethod.SPECTRAL_GATING,
             "Adaptive Blend (Subtraction+Gating)": DenoiseMethod.ADAPTIVE_BLEND,
         }
@@ -403,7 +402,6 @@ class SoundDenoiserApp(ctk.CTk):
         # Method description - shows which parameters are most effective
         self._method_descriptions = {
             "Spectral Subtraction": "Best for: General hiss. Key params: Strength, Noise Threshold, HF Reduction",
-            "Wiener Filter": "Best for: Broadband noise. Key params: Strength, Noise Threshold",
             "Spectral Gating (Learned Profile)": "Best with learned profile. Soft gate based on noise floor",
             "Adaptive Blend (Subtraction+Gating)": "Blends both methods. Use Artifact Control to balance",
         }
@@ -893,8 +891,8 @@ class SoundDenoiserApp(ctk.CTk):
         dim_color = "#666666"
         active_color = "#cccccc"
 
-        # Spectral floor - relevant for Spectral, Wiener, and Spectral Gating
-        floor_relevant = method_name in ["Spectral Subtraction", "Wiener Filter", "Spectral Gating (Learned Profile)"]
+        # Spectral floor - relevant for Spectral and Spectral Gating
+        floor_relevant = method_name in ["Spectral Subtraction", "Spectral Gating (Learned Profile)"]
         self.spectral_floor_slider.label.configure(text_color=active_color if floor_relevant else dim_color)
 
         # Noise threshold - relevant for all spectral methods
