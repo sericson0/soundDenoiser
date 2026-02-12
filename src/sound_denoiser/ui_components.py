@@ -104,12 +104,15 @@ class ParameterSlider(ctk.CTkFrame):
         default: float,
         unit: str = "",
         command=None,
+        number_of_steps: int = 100,
+        decimal_places: int = 1,
         **kwargs,
     ):
         super().__init__(master, fg_color="transparent", **kwargs)
 
         self.unit = unit
         self.command = command
+        self._decimal_places = decimal_places
 
         self.label = ctk.CTkLabel(
             self,
@@ -124,7 +127,7 @@ class ParameterSlider(ctk.CTkFrame):
 
         self.value_label = ctk.CTkLabel(
             slider_frame,
-            text=f"{default:.1f}{unit}",
+            text=f"{default:.{decimal_places}f}{unit}",
             font=ctk.CTkFont(size=10),
             text_color="#00d9ff",
             width=50,
@@ -135,7 +138,7 @@ class ParameterSlider(ctk.CTkFrame):
             slider_frame,
             from_=from_,
             to=to,
-            number_of_steps=100,
+            number_of_steps=number_of_steps,
             command=self._on_change,
             progress_color="#00d9ff",
             button_color="#00d9ff",
@@ -145,7 +148,8 @@ class ParameterSlider(ctk.CTkFrame):
         self.slider.pack(side="left", fill="x", expand=True)
 
     def _on_change(self, value):
-        self.value_label.configure(text=f"{value:.1f}{self.unit}")
+        dp = self._decimal_places
+        self.value_label.configure(text=f"{value:.{dp}f}{self.unit}")
         if self.command:
             self.command(value)
 
@@ -153,8 +157,9 @@ class ParameterSlider(ctk.CTkFrame):
         return self.slider.get()
 
     def set(self, value: float):
+        dp = self._decimal_places
         self.slider.set(value)
-        self.value_label.configure(text=f"{value:.1f}{self.unit}")
+        self.value_label.configure(text=f"{value:.{dp}f}{self.unit}")
 
 
 class VerticalParameterSlider(ctk.CTkFrame):

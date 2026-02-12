@@ -447,8 +447,8 @@ class SoundDenoiserApp(ctk.CTk):
             self.fine_tune_inner,
             label="Transient Protection",
             from_=0.0,
-            to=100.0,
-            default=30.0,
+            to=50.0,
+            default=15.0,
             unit="%",
             command=self._on_parameter_change
         )
@@ -459,10 +459,12 @@ class SoundDenoiserApp(ctk.CTk):
             self.fine_tune_inner,
             label="Spectral Floor",
             from_=0.0,
-            to=20.0,
-            default=5.0,
+            to=10.0,
+            default=2.5,
             unit="%",
-            command=self._on_parameter_change
+            command=self._on_parameter_change,
+            number_of_steps=100,
+            decimal_places=2,
         )
         self.spectral_floor_slider.pack(fill="x", padx=8, pady=(0, 4))
 
@@ -856,8 +858,8 @@ class SoundDenoiserApp(ctk.CTk):
         self.noise_threshold_slider.set(1.5)
         # Fine-tuning defaults
         self.blend_slider.set(5.0)
-        self.transient_slider.set(30.0)
-        self.spectral_floor_slider.set(5.0)
+        self.transient_slider.set(15.0)
+        self.spectral_floor_slider.set(2.5)
         self.artifact_control_slider.set(70.0)
         self.adaptive_blend_var.set(True)
 
