@@ -75,7 +75,7 @@ class AudioDenoiser:
     def __init__(
         self,
         blend_original: float = 0.08,
-        noise_reduction_strength: float = 0.85,
+        reduction_db: float = 12.0,
         transient_protection: float = 0.3,
         method: DenoiseMethod = DenoiseMethod.ADAPTIVE_BLEND,
         spectral_floor: float = 0.05,
@@ -88,7 +88,8 @@ class AudioDenoiser:
 
         Args:
             blend_original: Amount of original signal to blend back (0-1, default: 0.05)
-            noise_reduction_strength: Overall strength of noise reduction (0-1, default: 0.85)
+            reduction_db: Maximum noise reduction in decibels (0-40, default: 12.0)
+                6 dB = noise halved, 12 dB = noise quartered, 20 dB = noise at 10%
             transient_protection: How much to protect transients (0-1, default: 0.3)
             method: Denoising method to use (default: ADAPTIVE_BLEND)
             spectral_floor: Minimum signal to retain, prevents artifacts (0-1, default: 0.05)
@@ -104,7 +105,7 @@ class AudioDenoiser:
                 more subtraction during sustained sections
         """
         self.blend_original = blend_original
-        self.noise_reduction_strength = noise_reduction_strength
+        self.reduction_db = reduction_db
         self.transient_protection = transient_protection
         self.method = method
 
@@ -482,9 +483,14 @@ class AudioDenoiser:
         # Apply noise threshold
         noise_estimate_scaled = noise_estimate * self.noise_threshold
 
+        # === DERIVE STRENGTH FROM dB REDUCTION ===
+        # Convert dB to linear minimum gain and strength equivalent
+        min_gain = 10 ** (-self.reduction_db / 20)
+        strength = 1.0 - min_gain  # 0 at 0dB, ~0.75 at 12dB, ~0.9 at 20dB, ~0.99 at 40dB
+
         # === SPECTRAL SUBTRACTION GAIN ===
-        alpha = 1.0 + self.noise_reduction_strength * 2.0
-        beta = self.spectral_floor + (1 - self.noise_reduction_strength) * 0.05
+        alpha = 1.0 + strength * 2.0
+        beta = self.spectral_floor + (1 - strength) * 0.05
 
         noise_2d = noise_estimate_scaled[:, np.newaxis]
         subtracted = stft_mag ** 2 - alpha * (noise_2d ** 2)
@@ -500,8 +506,8 @@ class AudioDenoiser:
         transition_width = np.maximum(noise_std_2d * 2, 1e-10)
         gate_gain = 1.0 / (1.0 + np.exp(-margin / transition_width * 4))
 
-        min_gain = max(1.0 - self.noise_reduction_strength, self.spectral_floor)
-        gate_gain = min_gain + gate_gain * (1.0 - min_gain)
+        gate_min_gain = max(min_gain, self.spectral_floor)
+        gate_gain = gate_min_gain + gate_gain * (1.0 - gate_min_gain)
         gate_gain = median_filter(gate_gain, size=(1, 3))
         gating_mag = stft_mag * gate_gain
 
@@ -858,7 +864,7 @@ class AudioDenoiser:
     def update_parameters(
         self,
         blend_original: Optional[float] = None,
-        noise_reduction_strength: Optional[float] = None,
+        reduction_db: Optional[float] = None,
         transient_protection: Optional[float] = None,
         method: Optional[DenoiseMethod] = None,
         hiss_start_freq: Optional[float] = None,
@@ -871,8 +877,8 @@ class AudioDenoiser:
         """Update denoiser parameters."""
         if blend_original is not None:
             self.blend_original = blend_original
-        if noise_reduction_strength is not None:
-            self.noise_reduction_strength = noise_reduction_strength
+        if reduction_db is not None:
+            self.reduction_db = reduction_db
         if transient_protection is not None:
             self.transient_protection = transient_protection
         if method is not None:

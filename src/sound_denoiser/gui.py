@@ -380,17 +380,17 @@ class SoundDenoiserApp(ctk.CTk):
         )
         self.blend_slider.pack(fill="x", pady=(0, 12))
 
-        # Noise Reduction Strength
-        self.strength_slider = ParameterSlider(
+        # Noise Reduction (dB)
+        self.reduction_db_slider = ParameterSlider(
             params_inner,
-            label="Noise Reduction Strength",
+            label="Reduction",
             from_=0.0,
-            to=100.0,
-            default=85.0,
-            unit="%",
+            to=40.0,
+            default=12.0,
+            unit=" dB",
             command=self._on_parameter_change
         )
-        self.strength_slider.pack(fill="x", pady=(0, 12))
+        self.reduction_db_slider.pack(fill="x", pady=(0, 12))
 
         # Transient Protection
         self.transient_slider = ParameterSlider(
@@ -803,7 +803,7 @@ class SoundDenoiserApp(ctk.CTk):
         # Update parameters
         self.denoiser.update_parameters(
             blend_original=self.blend_slider.get() / 100.0,
-            noise_reduction_strength=self.strength_slider.get() / 100.0,
+            reduction_db=self.reduction_db_slider.get(),
             transient_protection=self.transient_slider.get() / 100.0,
             spectral_floor=self.spectral_floor_slider.get() / 100.0,
             noise_threshold=self.noise_threshold_slider.get(),
@@ -834,7 +834,7 @@ class SoundDenoiserApp(ctk.CTk):
     def _reset_parameters(self):
         """Reset parameters to defaults."""
         self.blend_slider.set(5.0)
-        self.strength_slider.set(85.0)
+        self.reduction_db_slider.set(12.0)
         self.transient_slider.set(30.0)
         # Fine-tuning defaults
         self.spectral_floor_slider.set(5.0)
