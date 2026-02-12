@@ -897,11 +897,6 @@ class SoundDenoiserApp(ctk.CTk):
         dim_color = "#666666"
         active_color = "#cccccc"
 
-        # Hiss frequency sliders - relevant for Spectral, Wiener, Combined, Spectral Gating
-        hiss_freq_relevant = method_name in ["Spectral Subtraction", "Wiener Filter", "Combined (All Methods)", "Spectral Gating (Learned Profile)"]
-        self.hiss_start_slider.label.configure(text_color=active_color if hiss_freq_relevant else dim_color)
-        self.hiss_peak_slider.label.configure(text_color=active_color if hiss_freq_relevant else dim_color)
-
         # Spectral floor - relevant for Spectral, Wiener, and Spectral Gating
         floor_relevant = method_name in ["Spectral Subtraction", "Wiener Filter", "Combined (All Methods)", "Spectral Gating (Learned Profile)"]
         self.spectral_floor_slider.label.configure(text_color=active_color if floor_relevant else dim_color)
@@ -921,8 +916,6 @@ class SoundDenoiserApp(ctk.CTk):
         self.strength_slider.set(85.0)
         self.transient_slider.set(30.0)
         # Fine-tuning defaults
-        self.hiss_start_slider.set(2000.0)
-        self.hiss_peak_slider.set(6000.0)
         self.spectral_floor_slider.set(5.0)
         self.noise_threshold_slider.set(1.0)
         self.artifact_control_slider.set(50.0)
