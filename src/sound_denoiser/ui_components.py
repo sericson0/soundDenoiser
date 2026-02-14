@@ -319,6 +319,7 @@ class NoiseProfilePanel(ctk.CTkFrame):
         on_remove_selection=None,
         on_play_selection=None,
         on_edit_selection=None,
+        on_use_default=None,
         **kwargs,
     ):
         super().__init__(master, fg_color="#151525", corner_radius=8, **kwargs)
@@ -331,6 +332,7 @@ class NoiseProfilePanel(ctk.CTkFrame):
         self.on_remove_selection = on_remove_selection
         self.on_play_selection = on_play_selection
         self.on_edit_selection = on_edit_selection
+        self.on_use_default = on_use_default
         self._selection_enabled = False
         self._selections: List[Tuple[float, float]] = []
         self._selection_widgets = []
@@ -339,9 +341,9 @@ class NoiseProfilePanel(ctk.CTkFrame):
         self._setup_ui()
 
     def _setup_ui(self):
-        # ── Top row: Auto Detect + Make Selection + Clear ──
+        # ── Row 1: Auto Detect + Default + Clear ──
         top_row = ctk.CTkFrame(self, fg_color="transparent")
-        top_row.pack(fill="x", padx=6, pady=(6, 3))
+        top_row.pack(fill="x", padx=6, pady=(6, 2))
 
         self.auto_btn = ctk.CTkButton(
             top_row,
@@ -356,18 +358,18 @@ class NoiseProfilePanel(ctk.CTkFrame):
         )
         self.auto_btn.pack(side="left", fill="x", expand=True, padx=(0, 3))
 
-        self.make_selection_btn = ctk.CTkButton(
+        self.default_btn = ctk.CTkButton(
             top_row,
-            text="Select",
-            command=self._on_toggle_selection,
+            text="Default",
+            command=self._on_use_default,
             font=ctk.CTkFont(size=10, weight="bold"),
-            fg_color="#1a5276",
-            hover_color="#2471a3",
+            fg_color="#3a5a3a",
+            hover_color="#4a7a4a",
             height=26,
             corner_radius=5,
             state="disabled",
         )
-        self.make_selection_btn.pack(side="left", fill="x", expand=True, padx=(0, 3))
+        self.default_btn.pack(side="left", fill="x", expand=True, padx=(0, 3))
 
         self.clear_btn = ctk.CTkButton(
             top_row,
@@ -382,6 +384,23 @@ class NoiseProfilePanel(ctk.CTkFrame):
             state="disabled",
         )
         self.clear_btn.pack(side="right")
+
+        # ── Row 2: Select (Make Selection toggle) ──
+        sel_row = ctk.CTkFrame(self, fg_color="transparent")
+        sel_row.pack(fill="x", padx=6, pady=(0, 3))
+
+        self.make_selection_btn = ctk.CTkButton(
+            sel_row,
+            text="Select",
+            command=self._on_toggle_selection,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color="#1a5276",
+            hover_color="#2471a3",
+            height=26,
+            corner_radius=5,
+            state="disabled",
+        )
+        self.make_selection_btn.pack(side="left", fill="x", expand=True)
 
         # ── Status + Use profile on one row ──
         profile_row = ctk.CTkFrame(self, fg_color="transparent")
@@ -667,6 +686,10 @@ class NoiseProfilePanel(ctk.CTkFrame):
             self.learn_btn.configure(text="Learn from Selections")
             self.play_selection_btn.configure(state="disabled")
 
+    def _on_use_default(self):
+        if self.on_use_default:
+            self.on_use_default()
+
     def _on_clear(self):
         self.clear_selections()
         self.on_clear()
@@ -675,6 +698,7 @@ class NoiseProfilePanel(ctk.CTkFrame):
     def enable_controls(self, enable: bool = True):
         state = "normal" if enable else "disabled"
         self.auto_btn.configure(state=state)
+        self.default_btn.configure(state=state)
         self.make_selection_btn.configure(state=state)
 
     def enable_learn_button(self, enable: bool = True):

@@ -14,6 +14,7 @@ import numpy as np
 import librosa
 import soundfile as sf
 from scipy import signal
+from scipy.interpolate import PchipInterpolator
 from scipy.ndimage import median_filter, uniform_filter1d
 from typing import Tuple, Optional, List
 from pathlib import Path
@@ -122,10 +123,119 @@ class AudioDenoiser:
         self._noise_profile: Optional[NoiseProfile] = None
         self._use_learned_profile: bool = False
 
+        # Frequency-dependent threshold adjustments (control points)
+        # Maps frequency (Hz) -> dB offset.  Positive = more aggressive.
+        self._threshold_adjustments: Optional[dict] = None
+
     @property
     def _noise_threshold_mult(self) -> float:
         """Convert noise threshold from dB to linear multiplier."""
         return 10 ** (self.noise_threshold_db / 20)
+
+    # ------------------------------------------------------------------
+    # Frequency-dependent threshold adjustments (control-point curve)
+    # ------------------------------------------------------------------
+
+    def set_threshold_adjustments(self, adjustments: Optional[dict]):
+        """Set frequency-dependent threshold adjustments.
+
+        Args:
+            adjustments: dict mapping frequency (Hz) -> dB offset,
+                         or None to clear.
+                         Positive = more aggressive (higher threshold).
+                         Negative = less aggressive (lower threshold).
+        """
+        if adjustments is None or all(abs(v) < 0.01 for v in adjustments.values()):
+            self._threshold_adjustments = None
+        else:
+            self._threshold_adjustments = dict(adjustments)
+
+    def _get_threshold_curve(self, freqs: np.ndarray) -> np.ndarray:
+        """Interpolate control-point adjustments to a full frequency axis.
+
+        Returns a per-bin **linear multiplier** (1.0 = no change).
+        """
+        if not self._threshold_adjustments:
+            return np.ones(len(freqs))
+
+        ctrl_freqs = sorted(self._threshold_adjustments.keys())
+        ctrl_db = np.array([self._threshold_adjustments[f] for f in ctrl_freqs])
+
+        if len(ctrl_freqs) < 2:
+            return np.ones(len(freqs)) * 10 ** (ctrl_db[0] / 20)
+
+        interp = PchipInterpolator(ctrl_freqs, ctrl_db, extrapolate=True)
+        adjustments_db = interp(np.clip(freqs, ctrl_freqs[0], ctrl_freqs[-1]))
+        adjustments_db = np.clip(adjustments_db, -12, 12)
+
+        return 10 ** (adjustments_db / 20)
+
+    # ------------------------------------------------------------------
+    # Default noise profile generation
+    # ------------------------------------------------------------------
+
+    def generate_default_noise_profile(self) -> NoiseProfile:
+        """Generate a default noise profile with a typical shellac/vinyl shape.
+
+        Estimates the overall noise level from the loaded audio and applies
+        a standard old-recording noise spectral shape (pink noise base with
+        a hiss emphasis in the 4-10 kHz range).  Useful when a clean noise
+        sample is not available.
+        """
+        if self._audio is None or self._sr is None:
+            raise ValueError("No audio loaded. Call load_audio() first.")
+
+        audio = self._audio[0]
+
+        # Compute full-track STFT
+        stft = librosa.stft(audio, n_fft=self.N_FFT, hop_length=self.HOP_LENGTH)
+        stft_mag = np.abs(stft)
+
+        # Base noise floor: 5th percentile per bin (= quiet moments)
+        base_floor = np.percentile(stft_mag, 5, axis=1)
+
+        freqs = librosa.fft_frequencies(sr=self._sr, n_fft=self.N_FFT)
+
+        # --- Template shape ---
+        # 1. Pink-noise base (-3 dB/octave  =>  linear: sqrt(ref/f))
+        ref_freq = 1000.0
+        pink = np.ones(len(freqs))
+        valid = freqs > 0
+        pink[valid] = np.sqrt(ref_freq / freqs[valid])
+        pink[0] = pink[1]  # avoid inf at DC
+
+        # 2. HF hiss emphasis (broad bump centred around 6 kHz)
+        hiss_bump = 1.0 + 0.5 * np.exp(-0.5 * ((freqs - 6000) / 4000) ** 2)
+
+        # 3. Roll-off above 12 kHz (old recordings rarely contain signal here)
+        rolloff = np.ones(len(freqs))
+        hi = freqs > 12000
+        rolloff[hi] = np.clip(1.0 - (freqs[hi] - 12000) / 8000, 0.2, 1.0)
+
+        template = pink * hiss_bump * rolloff
+        template /= np.mean(template)  # normalise so mean = 1
+
+        # Apply template to per-bin base floor.  Blend 60 % template, 40 %
+        # raw estimate so that track-specific features are not lost entirely.
+        spectral_mean = 0.6 * (np.mean(base_floor) * template) + 0.4 * base_floor
+        spectral_mean = uniform_filter1d(spectral_mean, size=5)
+        spectral_std = spectral_mean * 0.3
+
+        # Synthetic noise clip (only needed to satisfy the dataclass)
+        dur = 0.5
+        noise_clip = np.random.randn(int(dur * self._sr)).astype(np.float32) * float(np.mean(base_floor)) * 10
+
+        self._noise_profile = NoiseProfile(
+            noise_clip=noise_clip,
+            spectral_mean=spectral_mean,
+            spectral_std=spectral_std,
+            sample_rate=self._sr,
+            duration=dur,
+            start_time=0.0,
+            end_time=dur,
+        )
+        self._use_learned_profile = True
+        return self._noise_profile
 
     def load_audio(self, file_path: str) -> Tuple[np.ndarray, int]:
         """Load audio file using librosa."""
@@ -574,7 +684,14 @@ class AudioDenoiser:
 
         Returns a gain matrix (same shape as stft_mag) in [min_gain, 1.0].
         """
+        # Global threshold multiplier
         noise_estimate_scaled = noise_estimate * self._noise_threshold_mult
+
+        # Per-frequency control-point adjustments
+        if self._threshold_adjustments:
+            n_fft_here = (stft_mag.shape[0] - 1) * 2
+            freqs_here = librosa.fft_frequencies(sr=self._sr, n_fft=n_fft_here)
+            noise_estimate_scaled = noise_estimate_scaled * self._get_threshold_curve(freqs_here)
 
         # === SPECTRAL SUBTRACTION GAIN ===
         alpha = 1.0 + strength * 2.0
@@ -739,7 +856,11 @@ class AudioDenoiser:
             stft_long_mag, noise_est_long, noise_std_long, min_gain, strength
         )
         # Apply adaptive 2D smoothing to long-window gain
-        noise_2d_long = (noise_est_long * self._noise_threshold_mult)[:, np.newaxis]
+        long_scaled = noise_est_long * self._noise_threshold_mult
+        if self._threshold_adjustments:
+            freqs_long = librosa.fft_frequencies(sr=self._sr, n_fft=n_fft_long)
+            long_scaled = long_scaled * self._get_threshold_curve(freqs_long)
+        noise_2d_long = long_scaled[:, np.newaxis]
         gain_long = self._adaptive_2d_smooth(gain_long, stft_long_mag, noise_2d_long)
 
         denoised_long = librosa.istft(
@@ -816,8 +937,11 @@ class AudioDenoiser:
         den_phase = np.angle(stft_den)
 
         noise_estimate = self._noise_profile.spectral_mean
-        # Scale noise estimate by threshold multiplier
+        # Scale noise estimate by threshold multiplier + per-freq adjustments
         noise_scaled = noise_estimate * self._noise_threshold_mult
+        if self._threshold_adjustments:
+            gate_freqs = librosa.fft_frequencies(sr=self._sr, n_fft=self.N_FFT)
+            noise_scaled = noise_scaled * self._get_threshold_curve(gate_freqs)
         noise_2d = noise_scaled[:, np.newaxis]
 
         # How far above the noise floor is each denoised bin?
@@ -901,7 +1025,11 @@ class AudioDenoiser:
             noise_estimate = self._noise_profile.spectral_mean
         else:
             noise_estimate = self._estimate_noise_spectrum(orig_mag)
-        noise_2d = (noise_estimate * self._noise_threshold_mult)[:, np.newaxis]
+        hf_noise_scaled = noise_estimate * self._noise_threshold_mult
+        if self._threshold_adjustments:
+            hf_freqs = librosa.fft_frequencies(sr=self._sr, n_fft=self.N_FFT)
+            hf_noise_scaled = hf_noise_scaled * self._get_threshold_curve(hf_freqs)
+        noise_2d = hf_noise_scaled[:, np.newaxis]
 
         # Define HF region (above 4kHz)
         hf_start = 4000.0

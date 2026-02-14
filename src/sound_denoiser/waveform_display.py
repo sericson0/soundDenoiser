@@ -10,6 +10,7 @@ import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.widgets import SpanSelector
+from scipy.interpolate import PchipInterpolator
 
 
 class WaveformDisplay(ctk.CTkFrame):
@@ -67,6 +68,15 @@ class WaveformDisplay(ctk.CTkFrame):
         self.noise_floor_plot = None
         self.noise_threshold_mult: float = 1.0
         self.noise_threshold_plot = None
+
+        # Draggable threshold control points
+        self._ctrl_point_freqs = [100.0, 500.0, 2000.0, 6000.0, 12000.0]
+        self._ctrl_point_offsets = [0.0, 0.0, 0.0, 0.0, 0.0]  # dB offsets
+        self._ctrl_point_scatter = None       # matplotlib scatter artist
+        self._ctrl_point_labels = []          # text artists for dB labels
+        self._dragging_ctrl_idx: Optional[int] = None
+        self._ctrl_point_base_y: Optional[list] = None  # base Y (dB) before offset
+        self.on_threshold_adjust = None       # callback(dict: freq->dB)
         self.analyzer_img = None
         self.analyzer_line = None
         self.analyzer_fill = None
@@ -216,14 +226,29 @@ class WaveformDisplay(ctk.CTkFrame):
             self._refresh_threshold_artists()
 
     def _refresh_threshold_artists(self):
-        """Update learned noise floor trace on the spectrum view."""
+        """Update learned noise floor trace and draggable control points."""
         if not hasattr(self, "ax"):
             return
 
         floor_freqs = self.noise_floor_freqs
         floor_levels = self.noise_floor_levels
 
+        # Remove old control-point artists
+        if self._ctrl_point_scatter is not None:
+            try:
+                self._ctrl_point_scatter.remove()
+            except Exception:
+                pass
+            self._ctrl_point_scatter = None
+        for lbl in self._ctrl_point_labels:
+            try:
+                lbl.remove()
+            except Exception:
+                pass
+        self._ctrl_point_labels = []
+
         if floor_freqs is not None and floor_levels is not None:
+            # Gray dashed line: raw noise floor
             if self.noise_floor_plot is None:
                 (self.noise_floor_plot,) = self.ax.plot(
                     floor_freqs,
@@ -238,10 +263,25 @@ class WaveformDisplay(ctk.CTkFrame):
                 self.noise_floor_plot.set_data(floor_freqs, floor_levels)
                 self.noise_floor_plot.set_zorder(10)
 
-            # Purple line: noise floor shifted by the threshold multiplier
+            # Base purple offset from the global threshold multiplier
             offset_db = 20 * np.log10(max(self.noise_threshold_mult, 1e-3))
-            shifted_levels = floor_levels + offset_db
+            base_shifted = floor_levels + offset_db
 
+            # Apply per-frequency control-point adjustments via interpolation
+            any_adj = any(abs(o) > 0.01 for o in self._ctrl_point_offsets)
+            if any_adj:
+                interp = PchipInterpolator(
+                    self._ctrl_point_freqs,
+                    self._ctrl_point_offsets,
+                    extrapolate=True,
+                )
+                clamped = np.clip(floor_freqs, self._ctrl_point_freqs[0], self._ctrl_point_freqs[-1])
+                adj_db = np.clip(interp(clamped), -12, 12)
+                shifted_levels = base_shifted + adj_db
+            else:
+                shifted_levels = base_shifted
+
+            # Purple line: threshold curve (with control-point adjustments)
             if self.noise_threshold_plot is None:
                 (self.noise_threshold_plot,) = self.ax.plot(
                     floor_freqs,
@@ -255,6 +295,37 @@ class WaveformDisplay(ctk.CTkFrame):
             else:
                 self.noise_threshold_plot.set_data(floor_freqs, shifted_levels)
                 self.noise_threshold_plot.set_zorder(10)
+
+            # --- Draggable control points ---
+            # Compute each point's Y position on the shifted threshold curve
+            self._ctrl_point_base_y = []
+            ctrl_x = []
+            ctrl_y = []
+            for i, freq in enumerate(self._ctrl_point_freqs):
+                base_y = float(np.interp(freq, floor_freqs, base_shifted))
+                self._ctrl_point_base_y.append(base_y)
+                y = base_y + self._ctrl_point_offsets[i]
+                ctrl_x.append(freq)
+                ctrl_y.append(y)
+
+            self._ctrl_point_scatter = self.ax.scatter(
+                ctrl_x, ctrl_y,
+                s=80, color="#b187ff", edgecolors="white",
+                linewidths=1.5, zorder=15, picker=True,
+            )
+
+            # Small labels showing offset dB next to each point
+            label_names = ["Sub", "500", "2k", "6k", "12k"]
+            for i, (x, y) in enumerate(zip(ctrl_x, ctrl_y)):
+                off = self._ctrl_point_offsets[i]
+                txt = f"{off:+.1f}" if abs(off) >= 0.05 else label_names[i]
+                lbl = self.ax.text(
+                    x, y + 1.8, txt,
+                    color="white", fontsize=7, ha="center", va="bottom",
+                    zorder=16,
+                    bbox=dict(boxstyle="round,pad=0.15", fc="#333355", ec="none", alpha=0.8),
+                )
+                self._ctrl_point_labels.append(lbl)
         else:
             if self.noise_floor_plot is not None:
                 self.noise_floor_plot.set_data([], [])
@@ -400,6 +471,9 @@ class WaveformDisplay(ctk.CTkFrame):
         self.played_area = None
         self.noise_floor_plot = None
         self.noise_threshold_plot = None
+        self._ctrl_point_scatter = None
+        self._ctrl_point_labels = []
+        self._ctrl_point_base_y = None
         self.analyzer_img = None
 
         audio = self._audio_data
@@ -561,6 +635,9 @@ class WaveformDisplay(ctk.CTkFrame):
         self.comparison_fill = None
         self.noise_floor_plot = None
         self.noise_threshold_plot = None
+        self._ctrl_point_scatter = None
+        self._ctrl_point_labels = []
+        self._ctrl_point_base_y = None
 
         audio = self._audio_data
         sr = self._sample_rate
@@ -744,20 +821,74 @@ class WaveformDisplay(ctk.CTkFrame):
                 )
                 self.comparison_line.set_zorder(1.5)
 
-        # Ensure noise floor/threshold lines stay on top after fill recreation
+        # Ensure noise floor/threshold lines and control points stay on top
         if self.noise_floor_plot is not None:
             self.noise_floor_plot.set_zorder(10)
         if self.noise_threshold_plot is not None:
             self.noise_threshold_plot.set_zorder(10)
+        if self._ctrl_point_scatter is not None:
+            self._ctrl_point_scatter.set_zorder(15)
 
         self.canvas.draw_idle()
 
+    # ------------------------------------------------------------------
+    # Control-point hit testing
+    # ------------------------------------------------------------------
+
+    def _hit_test_ctrl_point(self, event) -> Optional[int]:
+        """Return the index of the control point near *event*, or None."""
+        if self._ctrl_point_scatter is None or self._ctrl_point_base_y is None:
+            return None
+
+        # Use display (pixel) coordinates for robust hit testing on log axis
+        disp_click = self.ax.transData.transform((event.xdata, event.ydata))
+        for i, freq in enumerate(self._ctrl_point_freqs):
+            y_val = (self._ctrl_point_base_y[i] + self._ctrl_point_offsets[i])
+            disp_pt = self.ax.transData.transform((freq, y_val))
+            dist = np.hypot(disp_click[0] - disp_pt[0], disp_click[1] - disp_pt[1])
+            if dist < 18:  # 18 pixel radius
+                return i
+        return None
+
+    # ------------------------------------------------------------------
+    # Public helpers for control points
+    # ------------------------------------------------------------------
+
+    def set_ctrl_point_offsets(self, offsets: list):
+        """Set control-point dB offsets externally (e.g. from denoiser state)."""
+        if len(offsets) == len(self._ctrl_point_offsets):
+            self._ctrl_point_offsets = list(offsets)
+            if self._view_mode == "spectrum":
+                self._refresh_threshold_artists()
+
+    def get_ctrl_point_adjustments(self) -> dict:
+        """Return current control-point adjustments as {freq_hz: dB_offset}."""
+        return {f: o for f, o in zip(self._ctrl_point_freqs, self._ctrl_point_offsets)}
+
+    def reset_ctrl_points(self):
+        """Reset all control-point offsets to zero."""
+        self._ctrl_point_offsets = [0.0] * len(self._ctrl_point_freqs)
+        if self._view_mode == "spectrum":
+            self._refresh_threshold_artists()
+        if self.on_threshold_adjust:
+            self.on_threshold_adjust(self.get_ctrl_point_adjustments())
+
+    # ------------------------------------------------------------------
+    # Mouse event handlers
+    # ------------------------------------------------------------------
+
     def _on_canvas_click(self, event):
-        """Handle mouse click on canvas for seeking or spectrum dragging."""
+        """Handle mouse click on canvas for seeking or control-point dragging."""
         if event.inaxes != self.ax or self._duration <= 0:
             return
 
+        # --- Spectrum mode: control-point interaction ---
         if self._view_mode == "spectrum":
+            if event.xdata is None or event.ydata is None:
+                return
+            idx = self._hit_test_ctrl_point(event)
+            if idx is not None:
+                self._dragging_ctrl_idx = idx
             return
 
         if self._selection_enabled:
@@ -775,11 +906,21 @@ class WaveformDisplay(ctk.CTkFrame):
                 self.on_seek(position)
 
     def _on_canvas_drag(self, event):
-        """Handle mouse drag on canvas for seeking or spectrum drag."""
+        """Handle mouse drag on canvas for seeking or control-point drag."""
         if event.inaxes != self.ax or self._duration <= 0:
             return
 
+        # --- Spectrum mode: dragging a control point ---
         if self._view_mode == "spectrum":
+            if self._dragging_ctrl_idx is not None and event.ydata is not None:
+                idx = self._dragging_ctrl_idx
+                base_y = self._ctrl_point_base_y[idx] if self._ctrl_point_base_y else 0
+                new_offset = float(event.ydata) - base_y
+                new_offset = max(-12.0, min(12.0, new_offset))
+                # Snap to 0.5 dB increments for usability
+                new_offset = round(new_offset * 2) / 2.0
+                self._ctrl_point_offsets[idx] = new_offset
+                self._refresh_threshold_artists()
             return
 
         if not self._drag_seeking:
@@ -796,7 +937,12 @@ class WaveformDisplay(ctk.CTkFrame):
                 self.on_seek(position)
 
     def _on_canvas_release(self, event):
-        """Handle mouse release after seeking."""
+        """Handle mouse release after seeking or control-point drag."""
+        # Finish control-point drag and notify
+        if self._dragging_ctrl_idx is not None:
+            self._dragging_ctrl_idx = None
+            if self.on_threshold_adjust:
+                self.on_threshold_adjust(self.get_ctrl_point_adjustments())
         self._drag_seeking = False
 
     def _on_scroll(self, event):

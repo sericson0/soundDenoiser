@@ -254,6 +254,7 @@ class SoundDenoiserApp(ctk.CTk):
             on_region_select=self._on_noise_region_selected,
             on_seek=lambda pos: self._on_seek("original", pos),
         )
+        self.waveform_original.on_threshold_adjust = self._on_threshold_adjust
         self.waveform_original.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
         self.waveform_original.plot_waveform(None, 44100, f"{self.track_title} (Original)", "#ff9f43")
 
@@ -261,6 +262,7 @@ class SoundDenoiserApp(ctk.CTk):
             waveform_frame,
             on_seek=lambda pos: self._on_seek("processed", pos),
         )
+        self.waveform_processed.on_threshold_adjust = self._on_threshold_adjust
         self.waveform_processed.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
         self.waveform_processed.plot_waveform(None, 44100, f"{self.track_title} (Denoised)", "#00d9ff")
         self.waveform_processed.grid_remove()  # Start hidden for a single-panel view
@@ -335,6 +337,7 @@ class SoundDenoiserApp(ctk.CTk):
             on_remove_selection=self._on_remove_noise_selection,
             on_play_selection=self._on_play_selection,
             on_edit_selection=self._on_edit_selection,
+            on_use_default=self._use_default_noise_profile,
         )
         self.noise_profile_panel.pack(fill="x", padx=4, pady=(4, 6))
 
@@ -624,6 +627,39 @@ class SoundDenoiserApp(ctk.CTk):
 
         threading.Thread(target=auto_detect_thread, daemon=True).start()
 
+    def _use_default_noise_profile(self):
+        """Generate a default noise profile from the audio's statistical shape."""
+        if self.denoiser.get_original() is None:
+            return
+
+        try:
+            profile = self.denoiser.generate_default_noise_profile()
+            self.noise_profile_panel.update_status(profile)
+            self._update_noise_floor_trace(profile)
+            self._set_status(
+                "Default noise profile applied — drag control points on the "
+                "Frequency view to fine-tune per-band threshold"
+            )
+
+            # Highlight Apply button
+            if not self.is_processing:
+                self.process_btn.configure(fg_color="#884499")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to generate default profile:\n{str(e)}")
+
+    def _on_threshold_adjust(self, adjustments: dict):
+        """Handle control-point threshold adjustments from the spectrum view."""
+        self.denoiser.set_threshold_adjustments(adjustments)
+
+        # Sync both waveform displays so the curve looks the same
+        offsets = list(adjustments.values())
+        self.waveform_original.set_ctrl_point_offsets(offsets)
+        self.waveform_processed.set_ctrl_point_offsets(offsets)
+
+        # Hint the user to reprocess
+        if self.denoiser.get_original() is not None and not self.is_processing:
+            self.process_btn.configure(fg_color="#884499")
+
     def _update_noise_floor_trace(self, profile: Optional[NoiseProfile]):
         """Push learned noise spectrum into frequency view overlays."""
         if profile is None:
@@ -640,10 +676,13 @@ class SoundDenoiserApp(ctk.CTk):
         self.waveform_processed.set_noise_floor_curve(freqs, floor_db)
 
     def _clear_noise_profile(self):
-        """Clear the learned noise profile and all selections."""
+        """Clear the learned noise profile, selections, and threshold adjustments."""
         self.denoiser.clear_noise_profile()
+        self.denoiser.set_threshold_adjustments(None)
         self.waveform_original.clear_selection()
         self.waveform_original.clear_noise_region()
+        self.waveform_original.reset_ctrl_points()
+        self.waveform_processed.reset_ctrl_points()
         self._update_noise_floor_trace(None)
         self._set_status("Noise profile and selections cleared")
 
