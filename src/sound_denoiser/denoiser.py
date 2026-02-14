@@ -626,6 +626,81 @@ class AudioDenoiser:
     def set_use_learned_profile(self, use: bool):
         self._use_learned_profile = use and self._noise_profile is not None
 
+    # ------------------------------------------------------------------
+    # Profile serialisation  (save / load)
+    # ------------------------------------------------------------------
+
+    def save_noise_profile(self, file_path: str):
+        """Save the current noise profile and threshold adjustments to a JSON file.
+
+        File format (.dnp = denoiser noise profile):
+        {
+            "version": 1,
+            "spectral_mean": [...],
+            "spectral_std": [...],
+            "sample_rate": int,
+            "duration": float,
+            "threshold_adjustments": {freq: dB, ...} or null
+        }
+        """
+        import json as _json
+
+        if self._noise_profile is None:
+            raise ValueError("No noise profile to save.")
+
+        data = {
+            "version": 1,
+            "spectral_mean": self._noise_profile.spectral_mean.tolist(),
+            "spectral_std": self._noise_profile.spectral_std.tolist(),
+            "sample_rate": int(self._noise_profile.sample_rate),
+            "duration": float(self._noise_profile.duration),
+            "threshold_adjustments": (
+                {str(k): float(v) for k, v in self._threshold_adjustments.items()}
+                if self._threshold_adjustments else None
+            ),
+        }
+
+        with open(file_path, "w", encoding="utf-8") as f:
+            _json.dump(data, f, indent=2)
+
+    def load_noise_profile(self, file_path: str) -> NoiseProfile:
+        """Load a noise profile (and optional threshold adjustments) from a .dnp file.
+
+        Returns the loaded NoiseProfile.
+        """
+        import json as _json
+
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+
+        spectral_mean = np.array(data["spectral_mean"], dtype=np.float64)
+        spectral_std = np.array(data["spectral_std"], dtype=np.float64)
+        sample_rate = int(data["sample_rate"])
+        duration = float(data.get("duration", 0.5))
+
+        # Minimal synthetic noise clip
+        noise_clip = np.random.randn(int(duration * sample_rate)).astype(np.float32) * float(np.mean(spectral_mean)) * 10
+
+        self._noise_profile = NoiseProfile(
+            noise_clip=noise_clip,
+            spectral_mean=spectral_mean,
+            spectral_std=spectral_std,
+            sample_rate=sample_rate,
+            duration=duration,
+            start_time=0.0,
+            end_time=duration,
+        )
+        self._use_learned_profile = True
+
+        # Restore threshold adjustments if present
+        adj = data.get("threshold_adjustments")
+        if adj:
+            self._threshold_adjustments = {float(k): float(v) for k, v in adj.items()}
+        else:
+            self._threshold_adjustments = None
+
+        return self._noise_profile
+
     # (Removed _apply_high_frequency_reduction and all related code)
 
     def _detect_transients(self, audio: np.ndarray, sr: int) -> np.ndarray:

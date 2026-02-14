@@ -71,9 +71,11 @@ class WaveformDisplay(ctk.CTkFrame):
 
         # Draggable threshold control points
         self._ctrl_point_freqs = [100.0, 500.0, 2000.0, 6000.0, 12000.0]
+        self._ctrl_point_names = ["Sub", "500Hz", "2kHz", "6kHz", "12kHz"]
         self._ctrl_point_offsets = [0.0, 0.0, 0.0, 0.0, 0.0]  # dB offsets
         self._ctrl_point_scatter = None       # matplotlib scatter artist
-        self._ctrl_point_labels = []          # text artists for dB labels
+        self._ctrl_point_hover_annot = None   # annotation for hover tooltip
+        self._ctrl_point_hover_idx: Optional[int] = None  # currently hovered point
         self._dragging_ctrl_idx: Optional[int] = None
         self._ctrl_point_base_y: Optional[list] = None  # base Y (dB) before offset
         self.on_threshold_adjust = None       # callback(dict: freq->dB)
@@ -240,12 +242,12 @@ class WaveformDisplay(ctk.CTkFrame):
             except Exception:
                 pass
             self._ctrl_point_scatter = None
-        for lbl in self._ctrl_point_labels:
+        if self._ctrl_point_hover_annot is not None:
             try:
-                lbl.remove()
+                self._ctrl_point_hover_annot.remove()
             except Exception:
                 pass
-        self._ctrl_point_labels = []
+            self._ctrl_point_hover_annot = None
 
         if floor_freqs is not None and floor_levels is not None:
             # Gray dashed line: raw noise floor
@@ -314,18 +316,20 @@ class WaveformDisplay(ctk.CTkFrame):
                 linewidths=1.5, zorder=15, picker=True,
             )
 
-            # Small labels showing offset dB next to each point
-            label_names = ["Sub", "500", "2k", "6k", "12k"]
-            for i, (x, y) in enumerate(zip(ctrl_x, ctrl_y)):
-                off = self._ctrl_point_offsets[i]
-                txt = f"{off:+.1f}" if abs(off) >= 0.05 else label_names[i]
-                lbl = self.ax.text(
-                    x, y + 1.8, txt,
-                    color="white", fontsize=7, ha="center", va="bottom",
-                    zorder=16,
-                    bbox=dict(boxstyle="round,pad=0.15", fc="#333355", ec="none", alpha=0.8),
-                )
-                self._ctrl_point_labels.append(lbl)
+            # Hidden annotation for hover tooltip (shown on mouseover)
+            self._ctrl_point_hover_annot = self.ax.annotate(
+                "", xy=(0, 0), xytext=(0, 12),
+                textcoords="offset points", ha="center", va="bottom",
+                fontsize=8, color="white",
+                bbox=dict(boxstyle="round,pad=0.3", fc="#333355", ec="#b187ff", alpha=0.92),
+                zorder=20,
+            )
+            self._ctrl_point_hover_annot.set_visible(False)
+
+            # If actively dragging, show annotation on the dragged point
+            if self._dragging_ctrl_idx is not None:
+                idx = self._dragging_ctrl_idx
+                self._show_ctrl_hover(idx, ctrl_x[idx], ctrl_y[idx])
         else:
             if self.noise_floor_plot is not None:
                 self.noise_floor_plot.set_data([], [])
@@ -472,7 +476,8 @@ class WaveformDisplay(ctk.CTkFrame):
         self.noise_floor_plot = None
         self.noise_threshold_plot = None
         self._ctrl_point_scatter = None
-        self._ctrl_point_labels = []
+        self._ctrl_point_hover_annot = None
+        self._ctrl_point_hover_idx = None
         self._ctrl_point_base_y = None
         self.analyzer_img = None
 
@@ -636,7 +641,8 @@ class WaveformDisplay(ctk.CTkFrame):
         self.noise_floor_plot = None
         self.noise_threshold_plot = None
         self._ctrl_point_scatter = None
-        self._ctrl_point_labels = []
+        self._ctrl_point_hover_annot = None
+        self._ctrl_point_hover_idx = None
         self._ctrl_point_base_y = None
 
         audio = self._audio_data
@@ -851,6 +857,30 @@ class WaveformDisplay(ctk.CTkFrame):
         return None
 
     # ------------------------------------------------------------------
+    # Control-point hover tooltip helpers
+    # ------------------------------------------------------------------
+
+    def _show_ctrl_hover(self, idx: int, x: float, y: float):
+        """Show the hover annotation for control point *idx* at (x, y)."""
+        if self._ctrl_point_hover_annot is None:
+            return
+        off = self._ctrl_point_offsets[idx]
+        name = self._ctrl_point_names[idx]
+        txt = f"{name}  {off:+.1f} dB"
+        self._ctrl_point_hover_annot.set_text(txt)
+        self._ctrl_point_hover_annot.xy = (x, y)
+        self._ctrl_point_hover_annot.set_visible(True)
+        self._ctrl_point_hover_idx = idx
+        self.canvas.draw_idle()
+
+    def _hide_ctrl_hover(self):
+        """Hide the hover annotation."""
+        if self._ctrl_point_hover_annot is not None and self._ctrl_point_hover_idx is not None:
+            self._ctrl_point_hover_annot.set_visible(False)
+            self._ctrl_point_hover_idx = None
+            self.canvas.draw_idle()
+
+    # ------------------------------------------------------------------
     # Public helpers for control points
     # ------------------------------------------------------------------
 
@@ -906,12 +936,16 @@ class WaveformDisplay(ctk.CTkFrame):
                 self.on_seek(position)
 
     def _on_canvas_drag(self, event):
-        """Handle mouse drag on canvas for seeking or control-point drag."""
+        """Handle mouse drag on canvas for seeking, control-point drag, or hover."""
         if event.inaxes != self.ax or self._duration <= 0:
+            # If we leave the axes, hide hover
+            if self._view_mode == "spectrum" and self._dragging_ctrl_idx is None:
+                self._hide_ctrl_hover()
             return
 
-        # --- Spectrum mode: dragging a control point ---
+        # --- Spectrum mode ---
         if self._view_mode == "spectrum":
+            # Actively dragging a control point
             if self._dragging_ctrl_idx is not None and event.ydata is not None:
                 idx = self._dragging_ctrl_idx
                 base_y = self._ctrl_point_base_y[idx] if self._ctrl_point_base_y else 0
@@ -921,6 +955,18 @@ class WaveformDisplay(ctk.CTkFrame):
                 new_offset = round(new_offset * 2) / 2.0
                 self._ctrl_point_offsets[idx] = new_offset
                 self._refresh_threshold_artists()
+                return
+
+            # Hover detection (no button held)
+            if event.xdata is not None and event.ydata is not None:
+                idx = self._hit_test_ctrl_point(event)
+                if idx is not None:
+                    freq = self._ctrl_point_freqs[idx]
+                    base_y = self._ctrl_point_base_y[idx] if self._ctrl_point_base_y else 0
+                    y = base_y + self._ctrl_point_offsets[idx]
+                    self._show_ctrl_hover(idx, freq, y)
+                elif self._ctrl_point_hover_idx is not None:
+                    self._hide_ctrl_hover()
             return
 
         if not self._drag_seeking:

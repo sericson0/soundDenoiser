@@ -338,6 +338,8 @@ class SoundDenoiserApp(ctk.CTk):
             on_play_selection=self._on_play_selection,
             on_edit_selection=self._on_edit_selection,
             on_use_default=self._use_default_noise_profile,
+            on_load_profile=self._load_noise_profile,
+            on_save_profile=self._save_noise_profile,
         )
         self.noise_profile_panel.pack(fill="x", padx=4, pady=(4, 6))
 
@@ -646,6 +648,113 @@ class SoundDenoiserApp(ctk.CTk):
                 self.process_btn.configure(fg_color="#884499")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to generate default profile:\n{str(e)}")
+
+    def _load_noise_profile(self):
+        """Load a noise profile from a file or use the built-in default."""
+        if self.denoiser.get_original() is None:
+            messagebox.showinfo("No Audio", "Load an audio file first.")
+            return
+
+        # Offer a choice: built-in Default or load from file
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Load Profile")
+        dialog.geometry("300x130")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        # Centre on parent
+        dialog.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() - 300) // 2
+        y = self.winfo_y() + (self.winfo_height() - 130) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+        ctk.CTkLabel(
+            dialog, text="Load a noise profile",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).pack(pady=(12, 8))
+
+        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_row.pack(fill="x", padx=16, pady=(0, 12))
+
+        def _use_default():
+            dialog.destroy()
+            self._use_default_noise_profile()
+
+        def _from_file():
+            dialog.destroy()
+            self._load_noise_profile_from_file()
+
+        ctk.CTkButton(
+            btn_row, text="Default Profile",
+            command=_use_default,
+            fg_color="#3a5a3a", hover_color="#4a7a4a",
+            height=32, font=ctk.CTkFont(size=11, weight="bold"),
+        ).pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        ctk.CTkButton(
+            btn_row, text="From File\u2026",
+            command=_from_file,
+            fg_color="#444455", hover_color="#555566",
+            height=32, font=ctk.CTkFont(size=11, weight="bold"),
+        ).pack(side="left", fill="x", expand=True)
+
+    def _load_noise_profile_from_file(self):
+        """Open a file picker and load a .dnp noise profile."""
+        initial_dir = self.config.get("last_profile_dir", str(Path.home()))
+        file_path = filedialog.askopenfilename(
+            title="Load Noise Profile",
+            filetypes=[("Denoiser Profile", "*.dnp"), ("All Files", "*.*")],
+            initialdir=initial_dir,
+        )
+        if not file_path:
+            return
+
+        try:
+            profile = self.denoiser.load_noise_profile(file_path)
+            self.noise_profile_panel.update_status(profile)
+            self._update_noise_floor_trace(profile)
+
+            # Restore control-point offsets if saved in the profile
+            adj = self.denoiser._threshold_adjustments
+            if adj:
+                ctrl_freqs = [100.0, 500.0, 2000.0, 6000.0, 12000.0]
+                offsets = [adj.get(f, 0.0) for f in ctrl_freqs]
+                self.waveform_original.set_ctrl_point_offsets(offsets)
+                self.waveform_processed.set_ctrl_point_offsets(offsets)
+
+            self.config["last_profile_dir"] = str(Path(file_path).parent)
+            self._save_config()
+            self._set_status(f"Loaded noise profile from {Path(file_path).name}")
+
+            if not self.is_processing:
+                self.process_btn.configure(fg_color="#884499")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load profile:\n{str(e)}")
+
+    def _save_noise_profile(self):
+        """Save the current noise profile + threshold adjustments to a .dnp file."""
+        if self.denoiser.get_noise_profile() is None:
+            messagebox.showinfo("No Profile", "Learn or load a noise profile first.")
+            return
+
+        initial_dir = self.config.get("last_profile_dir", str(Path.home()))
+        file_path = filedialog.asksaveasfilename(
+            title="Save Noise Profile",
+            filetypes=[("Denoiser Profile", "*.dnp")],
+            defaultextension=".dnp",
+            initialdir=initial_dir,
+        )
+        if not file_path:
+            return
+
+        try:
+            self.denoiser.save_noise_profile(file_path)
+            self.config["last_profile_dir"] = str(Path(file_path).parent)
+            self._save_config()
+            self._set_status(f"Noise profile saved to {Path(file_path).name}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save profile:\n{str(e)}")
 
     def _on_threshold_adjust(self, adjustments: dict):
         """Handle control-point threshold adjustments from the spectrum view."""
