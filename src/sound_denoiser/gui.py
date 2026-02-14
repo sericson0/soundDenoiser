@@ -27,12 +27,12 @@ try:
     from .denoiser import AudioDenoiser, NoiseProfile, DenoiseMethod
     from .audio_player import AudioPlayer, PlaybackState
     from .waveform_display import WaveformDisplay
-    from .ui_components import SeekBar, ParameterSlider, VerticalParameterSlider, NoiseProfilePanel
+    from .ui_components import SeekBar, ParameterSlider, VerticalParameterSlider, NoiseProfilePanel, Tooltip
 except ImportError:
     from denoiser import AudioDenoiser, NoiseProfile, DenoiseMethod
     from audio_player import AudioPlayer, PlaybackState
     from waveform_display import WaveformDisplay
-    from ui_components import SeekBar, ParameterSlider, VerticalParameterSlider, NoiseProfilePanel
+    from ui_components import SeekBar, ParameterSlider, VerticalParameterSlider, NoiseProfilePanel, Tooltip
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -387,7 +387,13 @@ class SoundDenoiserApp(ctk.CTk):
             corner_radius=8,
             state="disabled"
         )
-        self.process_btn.pack(fill="x", padx=10, pady=(0, 8))
+        self.process_btn.pack(fill="x", padx=10, pady=(0, 4))
+
+        # Processing stats display (hidden until first process)
+        self.stats_frame = ctk.CTkFrame(params_frame, fg_color="#1a2a3a", corner_radius=6)
+        # Not packed yet — shown after first processing
+        self._stats_widgets = []  # Track dynamically created stat rows
+        self._stats_tooltip = None
 
         # ═══════════════════════════════════════════════════════
         # Fine-Tuning — Collapsible section with remaining params
@@ -527,11 +533,41 @@ class SoundDenoiserApp(ctk.CTk):
         self.file_label.pack(side="right", padx=15, pady=5)
 
     def _on_noise_region_selected(self, start: float, end: float):
-        """Handle noise region selection from waveform - adds to multiple selections."""
-        # Add to the panel's selections list
-        self.noise_profile_panel.add_selection(start, end)
-        count = len(self.noise_profile_panel.get_selections())
-        self._set_status(f"Added noise region: {start:.2f}s - {end:.2f}s (Total: {count} selection(s))")
+        """Handle noise region selection from waveform.
+
+        If the new selection overlaps significantly with an existing one,
+        update that selection instead of adding a new one.
+        """
+        selections = self.noise_profile_panel.get_selections()
+
+        # Check for overlap with existing selections
+        best_overlap_idx = -1
+        best_overlap_amount = 0.0
+        for i, (s, e) in enumerate(selections):
+            overlap_start = max(start, s)
+            overlap_end = min(end, e)
+            overlap = max(0, overlap_end - overlap_start)
+            existing_duration = e - s
+            # Consider it an edit if >=30% of existing region overlaps
+            if existing_duration > 0 and overlap / existing_duration > 0.3:
+                if overlap > best_overlap_amount:
+                    best_overlap_amount = overlap
+                    best_overlap_idx = i
+
+        if best_overlap_idx >= 0:
+            # Update existing selection
+            self.noise_profile_panel._selections[best_overlap_idx] = (start, end)
+            self.noise_profile_panel._update_selections_display()
+            # Redraw waveform selections
+            self.waveform_original.clear_selection()
+            for s, e in self.noise_profile_panel.get_selections():
+                self.waveform_original.add_selection_rect(s, e)
+            self._set_status(f"Updated selection {best_overlap_idx + 1}: {start:.2f}s - {end:.2f}s")
+        else:
+            # Add new selection
+            self.noise_profile_panel.add_selection(start, end)
+            count = len(self.noise_profile_panel.get_selections())
+            self._set_status(f"Added noise region: {start:.2f}s - {end:.2f}s (Total: {count} selection(s))")
 
     def _learn_noise_profile_manual(self):
         """Learn noise profile from manually selected regions."""
@@ -1113,9 +1149,234 @@ class SoundDenoiserApp(ctk.CTk):
         self.process_btn.configure(state="normal", text="✨ Apply Denoising", fg_color="#6c3483")
         self._refresh_play_button_label()
 
+        # Compute and display processing stats
+        self._update_processing_stats(original_audio, display_audio, sr)
+
         # Update status
         profile_status = "with learned profile" if self.denoiser._use_learned_profile else "with adaptive estimation"
         self._set_status(f"Processing complete {profile_status} - Preview and adjust as needed")
+
+    def _update_processing_stats(self, original: Optional[np.ndarray], processed: Optional[np.ndarray], sr: int):
+        """Compute and display processing statistics segmented by volume level."""
+        if original is None or processed is None or sr <= 0:
+            return
+
+        try:
+            min_len = min(len(original), len(processed))
+            orig = original[:min_len]
+            proc = processed[:min_len]
+
+            n_fft = 4096
+            hop = 1024
+            S_orig = np.abs(librosa.stft(orig, n_fft=n_fft, hop_length=hop)) ** 2
+            S_proc = np.abs(librosa.stft(proc, n_fft=n_fft, hop_length=hop)) ** 2
+            freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+
+            # Band definitions: Low (<1kHz), Mid (1-4kHz), HF (4kHz+)
+            bands = [
+                ("Low",  "0-1k",   0,    1000),
+                ("Mid",  "1-4k",   1000, 4000),
+                ("HF",   "4k+",    4000, sr // 2),
+            ]
+
+            # Frame-level energy for volume segmentation
+            frame_energy = np.mean(S_orig, axis=0)
+            frame_energy_db = 10 * np.log10(frame_energy + 1e-12)
+
+            # Split frames into Quiet / Medium / Loud using percentiles
+            p30 = np.percentile(frame_energy_db, 30)
+            p70 = np.percentile(frame_energy_db, 70)
+            quiet_mask = frame_energy_db <= p30
+            mid_mask = (frame_energy_db > p30) & (frame_energy_db <= p70)
+            loud_mask = frame_energy_db > p70
+
+            volume_segments = [
+                ("Quiet",  quiet_mask),
+                ("Medium", mid_mask),
+                ("Loud",   loud_mask),
+            ]
+
+            # Compute average dB reduction per band per volume segment
+            # reduction = mean_band_dB(original) - mean_band_dB(processed)
+            # Positive = noise/energy removed. For quiet sections this should
+            # be large (noise removed). For loud, it should be small (signal kept).
+            stats = {}  # stats[(vol_label, band_label)] = reduction_db
+            for vol_label, vmask in volume_segments:
+                if np.sum(vmask) < 2:
+                    for b_label, _, _, _ in bands:
+                        stats[(vol_label, b_label)] = 0.0
+                    continue
+                for b_label, _, lo, hi in bands:
+                    fmask = (freqs >= lo) & (freqs < hi)
+                    if np.sum(fmask) == 0:
+                        stats[(vol_label, b_label)] = 0.0
+                        continue
+                    orig_band = S_orig[np.ix_(fmask, vmask)]
+                    proc_band = S_proc[np.ix_(fmask, vmask)]
+                    orig_mean_db = 10 * np.log10(np.mean(orig_band) + 1e-12)
+                    proc_mean_db = 10 * np.log10(np.mean(proc_band) + 1e-12)
+                    stats[(vol_label, b_label)] = orig_mean_db - proc_mean_db
+
+            # HF detail preservation
+            hf_mask = (freqs >= 4000) & (freqs <= 10000)
+            S_orig_hf = np.sqrt(S_orig[hf_mask, :])
+            S_proc_hf = np.sqrt(S_proc[hf_mask, :])
+            orig_onset = np.mean(np.maximum(np.diff(S_orig_hf, axis=1), 0))
+            proc_onset = np.mean(np.maximum(np.diff(S_proc_hf, axis=1), 0))
+            hf_detail_pct = (proc_onset / (orig_onset + 1e-12)) * 100
+
+            # Dynamics preservation
+            orig_rms_frames = librosa.feature.rms(y=orig, frame_length=2048, hop_length=512)[0]
+            proc_rms_frames = librosa.feature.rms(y=proc, frame_length=2048, hop_length=512)[0]
+            orig_dyn = np.std(20 * np.log10(orig_rms_frames + 1e-12))
+            proc_dyn = np.std(20 * np.log10(proc_rms_frames + 1e-12))
+            dyn_pct = (proc_dyn / (orig_dyn + 1e-12)) * 100
+
+            self._rebuild_stats_ui(bands, volume_segments, stats, hf_detail_pct, dyn_pct)
+            self.stats_frame.pack(fill="x", padx=10, pady=(0, 6))
+
+        except Exception as e:
+            print(f"Stats computation error: {e}")
+            import traceback; traceback.print_exc()
+            self.stats_frame.pack_forget()
+
+    def _rebuild_stats_ui(self, bands: list, volume_segments: list,
+                          stats: dict, hf_detail_pct: float, dyn_pct: float):
+        """Rebuild the stats panel with a columnar band layout."""
+        # Clear previous widgets
+        for w in self._stats_widgets:
+            w.destroy()
+        self._stats_widgets.clear()
+
+        def _color_for_reduction(val: float, is_loud: bool = False) -> str:
+            """Color code: for quiet/medium higher is better; for loud lower is better."""
+            if is_loud:
+                # Loud: low reduction = good (signal preserved)
+                if val <= 1.5:
+                    return "#4ade80"
+                elif val <= 4.0:
+                    return "#facc15"
+                else:
+                    return "#f87171"
+            else:
+                # Quiet/Medium: high reduction = good (noise removed)
+                if val >= 6:
+                    return "#4ade80"
+                elif val >= 3:
+                    return "#facc15"
+                else:
+                    return "#f87171"
+
+        tiny = ctk.CTkFont(size=8)
+        val_font = ctk.CTkFont(family="Consolas", size=11, weight="bold")
+        label_font = ctk.CTkFont(size=9, weight="bold")
+        sub_font = ctk.CTkFont(size=8)
+
+        n_bands = len(bands)
+
+        # ── Title row with help ──
+        title_row = ctk.CTkFrame(self.stats_frame, fg_color="transparent")
+        title_row.pack(fill="x", padx=6, pady=(4, 1))
+        self._stats_widgets.append(title_row)
+
+        ctk.CTkLabel(
+            title_row, text="dB Reduced by Volume Level",
+            font=ctk.CTkFont(size=9, weight="bold"), text_color="#6c9bce",
+        ).pack(side="left")
+
+        help_lbl = ctk.CTkLabel(
+            title_row, text="?",
+            font=ctk.CTkFont(size=9, weight="bold"),
+            text_color="#6c9bce", width=14, cursor="question_arrow",
+        )
+        help_lbl.pack(side="right", padx=(0, 2))
+
+        tooltip_text = (
+            "dB Reduced by Volume Level\n"
+            "Shows how much energy (dB) was removed in\n"
+            "each frequency band during quiet, medium,\n"
+            "and loud passages.\n\n"
+            "Quiet: Should be high — noise is being removed.\n"
+            "Medium: Moderate — mix of noise and signal.\n"
+            "Loud: Should be low — signal is preserved.\n\n"
+            "HF Detail: % of high-frequency transients\n"
+            "preserved. 100% = no detail lost.\n\n"
+            "Dynamics: How well the original dynamic range\n"
+            "is kept. 100% = unchanged."
+        )
+        if self._stats_tooltip is None:
+            self._stats_tooltip = Tooltip(help_lbl, tooltip_text, delay=200)
+        else:
+            self._stats_tooltip._hide()
+            self._stats_tooltip = Tooltip(help_lbl, tooltip_text, delay=200)
+
+        # ── Band column headers: Low | Mid | HF ──
+        header_frame = ctk.CTkFrame(self.stats_frame, fg_color="transparent")
+        header_frame.pack(fill="x", padx=4, pady=(2, 0))
+        self._stats_widgets.append(header_frame)
+        for i in range(n_bands):
+            header_frame.grid_columnconfigure(i, weight=1)
+
+        for col, (b_label, b_range, _, _) in enumerate(bands):
+            cell = ctk.CTkFrame(header_frame, fg_color="transparent")
+            cell.grid(row=0, column=col, sticky="nsew", padx=1)
+            ctk.CTkLabel(
+                cell, text=b_label, font=label_font, text_color="#cccccc",
+            ).pack()
+            ctk.CTkLabel(
+                cell, text=b_range, font=tiny, text_color="#666688",
+            ).pack()
+
+        # ── Volume segment rows ──
+        for vol_label, _ in volume_segments:
+            is_loud = (vol_label == "Loud")
+
+            row_frame = ctk.CTkFrame(self.stats_frame, fg_color="transparent")
+            row_frame.pack(fill="x", padx=4, pady=0)
+            self._stats_widgets.append(row_frame)
+            for i in range(n_bands):
+                row_frame.grid_columnconfigure(i, weight=1)
+
+            for col, (b_label, _, _, _) in enumerate(bands):
+                val = stats.get((vol_label, b_label), 0.0)
+                color = _color_for_reduction(val, is_loud)
+
+                cell = ctk.CTkFrame(row_frame, fg_color="#151530", corner_radius=4)
+                cell.grid(row=0, column=col, sticky="nsew", padx=1, pady=1)
+
+                ctk.CTkLabel(
+                    cell, text=f"{val:.1f}", font=val_font,
+                    text_color=color,
+                ).pack(pady=(2, 0))
+                ctk.CTkLabel(
+                    cell, text=vol_label, font=tiny,
+                    text_color="#555577",
+                ).pack(pady=(0, 2))
+
+        # ── Bottom summary: HF Detail + Dynamics ──
+        sep = ctk.CTkFrame(self.stats_frame, height=1, fg_color="#252545")
+        sep.pack(fill="x", padx=6, pady=(3, 2))
+        self._stats_widgets.append(sep)
+
+        summary = ctk.CTkFrame(self.stats_frame, fg_color="transparent")
+        summary.pack(fill="x", padx=6, pady=(0, 4))
+        self._stats_widgets.append(summary)
+        summary.grid_columnconfigure(0, weight=1)
+        summary.grid_columnconfigure(1, weight=1)
+
+        # HF Detail
+        hf_color = "#4ade80" if hf_detail_pct >= 75 else ("#facc15" if hf_detail_pct >= 55 else "#f87171")
+        hf_cell = ctk.CTkFrame(summary, fg_color="transparent")
+        hf_cell.grid(row=0, column=0, sticky="nsew")
+        ctk.CTkLabel(hf_cell, text="HF Detail", font=sub_font, text_color="#666688").pack()
+        ctk.CTkLabel(hf_cell, text=f"{hf_detail_pct:.0f}%", font=val_font, text_color=hf_color).pack()
+
+        # Dynamics
+        dyn_color = "#4ade80" if 90 <= dyn_pct <= 115 else ("#facc15" if 75 <= dyn_pct <= 130 else "#f87171")
+        dyn_cell = ctk.CTkFrame(summary, fg_color="transparent")
+        dyn_cell.grid(row=0, column=1, sticky="nsew")
+        ctk.CTkLabel(dyn_cell, text="Dynamics", font=sub_font, text_color="#666688").pack()
+        ctk.CTkLabel(dyn_cell, text=f"{dyn_pct:.0f}%", font=val_font, text_color=dyn_color).pack()
 
     def _on_noise_profile_learned(self, profile: NoiseProfile, region: Tuple[float, float]):
         """Handle noise profile learned from single-region auto-detect (legacy)."""
@@ -1139,10 +1400,13 @@ class SoundDenoiserApp(ctk.CTk):
         self.noise_profile_panel.clear_selections()
         self.waveform_original.clear_selection()
 
-        # Add each detected region
+        # Add each detected region — both to the panel (editable list) and waveform
         for region in regions:
             self.noise_profile_panel.add_selection(*region)
             self.waveform_original.add_selection_rect(*region)
+
+        # Show the selection rects so the user can see and edit them
+        self.waveform_original.show_selection_rects()
 
         # Use the first region as the reference for display
         if regions:
