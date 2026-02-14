@@ -78,9 +78,12 @@ class AudioDenoiser:
         transient_protection: float = 0.15,
         method: DenoiseMethod = DenoiseMethod.ADAPTIVE_BLEND,
         spectral_floor: float = 0.025,
-        noise_threshold: float = 1.5,
+        noise_threshold_db: float = 3.5,
         artifact_control: float = 0.7,
         adaptive_blend: bool = True,
+        hf_extra_reduction_db: float = 5.0,
+        hf_range_start: float = 4000.0,
+        hf_range_end: float = 12000.0,
     ):
         """
         Initialize the denoiser with parameters.
@@ -89,19 +92,20 @@ class AudioDenoiser:
             blend_original: Amount of original signal to blend back (0-1, default: 0.05)
             reduction_db: Maximum noise reduction in decibels (0-40, default: 18.0)
                 6 dB = noise halved, 12 dB = noise quartered, 20 dB = noise at 10%
-            transient_protection: How much to protect transients (0-1, default: 0.3)
+            transient_protection: How much to protect transients (0-1, default: 0.15)
             method: Denoising method to use (default: ADAPTIVE_BLEND)
-            spectral_floor: Minimum signal to retain, prevents artifacts (0-1, default: 0.05)
-            noise_threshold: Multiplier for noise estimate boundary (0.5-3.0, default: 1.5)
-                Higher values = more aggressive (treats more as noise)
-                Lower values = more conservative (preserves more signal)
+            spectral_floor: Minimum signal to retain, prevents artifacts (0-1, default: 0.025)
+            noise_threshold_db: Noise boundary above estimate in dB (0-10, default: 3.5)
+                Higher = more aggressive (treats more as noise)
+                0 dB = boundary at estimated noise level
+                3.5 dB ~ 1.5x multiplier, 6 dB ~ 2x multiplier
             artifact_control: Balance between subtraction and gating (0-1, default: 0.7)
                 0 = pure spectral subtraction (may cause musical noise/chirpy artifacts)
                 1 = pure spectral gating (may cause noise bursts/pumping)
-                0.5 = balanced blend of both approaches
-            adaptive_blend: When True, varies the blend based on signal characteristics (default: True)
-                Uses more gating at low frequencies and during transients,
-                more subtraction during sustained sections
+            adaptive_blend: When True, varies the blend based on signal characteristics
+            hf_extra_reduction_db: Additional reduction in the HF range (0-12, default: 5.0)
+            hf_range_start: Start frequency of HF extra reduction in Hz (default: 4000)
+            hf_range_end: End frequency of HF extra reduction in Hz (default: 12000)
         """
         self.blend_original = blend_original
         self.reduction_db = reduction_db
@@ -110,11 +114,17 @@ class AudioDenoiser:
 
         # Fine-tuning parameters
         self.spectral_floor = spectral_floor
-        self.noise_threshold = noise_threshold
+        self.noise_threshold_db = noise_threshold_db
         self.artifact_control = artifact_control
         self.adaptive_blend = adaptive_blend
 
+        # HF-specific parameters
+        self.hf_extra_reduction_db = hf_extra_reduction_db
+        self.hf_range_start = hf_range_start
+        self.hf_range_end = hf_range_end
+
         # Internal state
+        self._HARD_GAIN_FLOOR = 0.01  # -40 dB absolute minimum gain
         self._audio: Optional[np.ndarray] = None
         self._sr: Optional[int] = None
         self._processed: Optional[np.ndarray] = None
@@ -123,6 +133,11 @@ class AudioDenoiser:
         # Noise profile (learned from sample region)
         self._noise_profile: Optional[NoiseProfile] = None
         self._use_learned_profile: bool = False
+
+    @property
+    def _noise_threshold_mult(self) -> float:
+        """Convert noise threshold from dB to linear multiplier."""
+        return 10 ** (self.noise_threshold_db / 20)
 
     def load_audio(self, file_path: str) -> Tuple[np.ndarray, int]:
         """Load audio file using librosa."""
@@ -535,7 +550,7 @@ class AudioDenoiser:
 
         Returns a gain matrix (same shape as stft_mag) in [min_gain, 1.0].
         """
-        noise_estimate_scaled = noise_estimate * self.noise_threshold
+        noise_estimate_scaled = noise_estimate * self._noise_threshold_mult
 
         # === SPECTRAL SUBTRACTION GAIN ===
         alpha = 1.0 + strength * 2.0
@@ -591,7 +606,51 @@ class AudioDenoiser:
 
         # Convert to gain
         gain = blended_mag / (stft_mag + 1e-10)
-        gain = np.clip(gain, min_gain, 1.0)
+
+        # === FREQUENCY-DEPENDENT HF EXTRA REDUCTION ===
+        n_fft_actual = (stft_mag.shape[0] - 1) * 2
+        freqs = librosa.fft_frequencies(sr=self._sr, n_fft=n_fft_actual)
+
+        if self.hf_extra_reduction_db > 0:
+            hf_extra_linear = 10 ** (-self.hf_extra_reduction_db / 20)
+            taper_width = 500.0  # Hz smooth transition zone
+
+            # Smooth pulse: 1.0 inside [hf_range_start, hf_range_end], 0 outside
+            ramp_in = np.clip(
+                (freqs - self.hf_range_start + taper_width) / (2 * taper_width), 0, 1
+            )
+            ramp_out = np.clip(
+                (self.hf_range_end + taper_width - freqs) / (2 * taper_width), 0, 1
+            )
+            in_range = ramp_in * ramp_out
+            # Factor goes from 1.0 (no extra reduction) to hf_extra_linear
+            hf_factor = 1.0 - in_range * (1.0 - hf_extra_linear)
+            gain = gain * hf_factor[:, np.newaxis]
+
+        # === SNR-ADAPTIVE GAIN FLOOR ===
+        # In quiet passages (low SNR), allow deeper reduction.
+        # In loud passages (high SNR), noise is masked — relax the floor.
+        frame_signal_power = np.mean(stft_mag ** 2, axis=0)
+        frame_noise_power = np.mean(noise_2d ** 2, axis=0) + 1e-20
+        frame_snr_db = 10 * np.log10(frame_signal_power / frame_noise_power + 1e-10)
+
+        # Map frame SNR to a floor scaling factor:
+        #   SNR <= -3 dB : factor = 0.25 (allow ~12 dB deeper reduction)
+        #   SNR  = 10 dB : factor = 1.0  (normal reduction)
+        #   SNR >= 20 dB : factor = 1.5  (noise is masked, reduce less)
+        snr_factor = np.clip((frame_snr_db + 3) / 13, 0.25, 1.5)
+
+        # Also apply frequency-dependent floor (HF range gets lower floor)
+        if self.hf_extra_reduction_db > 0:
+            freq_floor = min_gain * hf_factor
+        else:
+            freq_floor = min_gain
+
+        # Per-frame adaptive minimum gain
+        adaptive_min = freq_floor[:, np.newaxis] * snr_factor[np.newaxis, :]  # freq x time
+        adaptive_min = np.maximum(adaptive_min, self._HARD_GAIN_FLOOR)
+
+        gain = np.clip(gain, adaptive_min, 1.0)
 
         return gain
 
@@ -672,7 +731,7 @@ class AudioDenoiser:
             stft_long_mag, noise_est_long, noise_std_long, min_gain, strength
         )
         # Apply adaptive 2D smoothing to long-window gain
-        noise_2d_long = (noise_est_long * self.noise_threshold)[:, np.newaxis]
+        noise_2d_long = (noise_est_long * self._noise_threshold_mult)[:, np.newaxis]
         gain_long = self._adaptive_2d_smooth(gain_long, stft_long_mag, noise_2d_long)
 
         denoised_long = librosa.istft(
@@ -755,10 +814,10 @@ class AudioDenoiser:
             noise_estimate = self._noise_profile.spectral_mean
         else:
             noise_estimate = self._estimate_noise_spectrum(orig_mag)
-        noise_2d = (noise_estimate * self.noise_threshold)[:, np.newaxis]
+        noise_2d = (noise_estimate * self._noise_threshold_mult)[:, np.newaxis]
 
-        # Define HF region (above 4kHz, scaled to sample rate)
-        hf_start = 4000.0
+        # Define HF region — use configured HF range start as synthesis start
+        hf_start = self.hf_range_start
         hf_mask = freqs >= hf_start
 
         if not np.any(hf_mask):
@@ -769,9 +828,12 @@ class AudioDenoiser:
         orig_snr = orig_mag / (noise_2d + 1e-10)
         den_snr = den_mag / (noise_2d + 1e-10)
 
-        # Signal loss estimate: where original had moderate SNR (1.5-5x noise)
-        # but denoised is near the floor, there was likely buried signal
-        signal_loss = np.clip((orig_snr - 1.5) / 3.5, 0, 1) * np.clip(1.0 - den_snr / 2, 0, 1)
+        # More sensitive signal loss detection:
+        # - Lowered orig_snr threshold from 1.5 to 1.2 (detect signal closer to noise)
+        # - Wider detection range (orig_snr 1.2 to 6x)
+        # - More sensitive den_snr check (was /2, now /1.5)
+        signal_loss = (np.clip((orig_snr - 1.2) / 4.8, 0, 1) *
+                       np.clip(1.0 - den_snr / 1.5, 0, 1))
 
         # Only apply in HF region
         hf_signal_loss = np.zeros_like(signal_loss)
@@ -779,23 +841,27 @@ class AudioDenoiser:
 
         # Taper in gradually from hf_start
         taper = np.zeros(len(freqs))
-        taper[hf_mask] = np.clip((freqs[hf_mask] - hf_start) / 2000, 0, 1)
+        taper[hf_mask] = np.clip((freqs[hf_mask] - hf_start) / 1500, 0, 1)
         hf_signal_loss *= taper[:, np.newaxis]
 
-        # Synthesize: add back a fraction of the removed energy shaped by the
-        # spectral envelope of nearby mid-frequency content
-        # Use the ratio of denoised to original as a guide
+        # Synthesize: add back a fraction of the removed energy
         removed = orig_mag - den_mag
         removed = np.maximum(removed, 0)
 
-        # Only add back a conservative fraction to avoid reintroducing noise
-        # Scale by reduction_db: lighter reduction = less synthesis needed
-        synthesis_strength = np.clip(self.reduction_db / 40, 0, 0.5) * 0.4
+        # Calibrated synthesis strength:
+        # - Base strength scales with reduction_db (more reduction = more synthesis)
+        # - Also factor in HF extra reduction (more HF reduction = more recovery needed)
+        # - Max ~0.45 (was 0.2) for aggressive but safe synthesis
+        base_strength = np.clip(self.reduction_db / 30, 0, 0.6)
+        hf_boost = np.clip(self.hf_extra_reduction_db / 12, 0, 0.4)
+        synthesis_strength = (base_strength + hf_boost) * 0.45
+        synthesis_strength = min(synthesis_strength, 0.45)
+
         synthesis = removed * hf_signal_loss * synthesis_strength
 
         # Smooth the synthesis to avoid introducing new artifacts
         synthesis = uniform_filter1d(synthesis, size=3, axis=0)
-        synthesis = uniform_filter1d(synthesis, size=5, axis=1)
+        synthesis = uniform_filter1d(synthesis, size=3, axis=1)
 
         # Add synthesized HF content
         result_mag = den_mag + synthesis
@@ -1125,12 +1191,13 @@ class AudioDenoiser:
         reduction_db: Optional[float] = None,
         transient_protection: Optional[float] = None,
         method: Optional[DenoiseMethod] = None,
-        hiss_start_freq: Optional[float] = None,
-        hiss_peak_freq: Optional[float] = None,
         spectral_floor: Optional[float] = None,
-        noise_threshold: Optional[float] = None,
+        noise_threshold_db: Optional[float] = None,
         artifact_control: Optional[float] = None,
         adaptive_blend: Optional[bool] = None,
+        hf_extra_reduction_db: Optional[float] = None,
+        hf_range_start: Optional[float] = None,
+        hf_range_end: Optional[float] = None,
     ):
         """Update denoiser parameters."""
         if blend_original is not None:
@@ -1141,18 +1208,20 @@ class AudioDenoiser:
             self.transient_protection = transient_protection
         if method is not None:
             self.method = method
-        if hiss_start_freq is not None:
-            self.hiss_start_freq = hiss_start_freq
-        if hiss_peak_freq is not None:
-            self.hiss_peak_freq = hiss_peak_freq
         if spectral_floor is not None:
             self.spectral_floor = spectral_floor
-        if noise_threshold is not None:
-            self.noise_threshold = noise_threshold
+        if noise_threshold_db is not None:
+            self.noise_threshold_db = noise_threshold_db
         if artifact_control is not None:
             self.artifact_control = artifact_control
         if adaptive_blend is not None:
             self.adaptive_blend = adaptive_blend
+        if hf_extra_reduction_db is not None:
+            self.hf_extra_reduction_db = hf_extra_reduction_db
+        if hf_range_start is not None:
+            self.hf_range_start = hf_range_start
+        if hf_range_end is not None:
+            self.hf_range_end = hf_range_end
 
     def set_method(self, method: DenoiseMethod):
         """Set the denoising method."""

@@ -354,10 +354,10 @@ class SoundDenoiserApp(ctk.CTk):
         self.noise_threshold_slider = VerticalParameterSlider(
             main_sliders_row,
             label="Noise Threshold",
-            from_=0.5,
-            to=3.0,
-            default=1.5,
-            unit="x",
+            from_=0.0,
+            to=10.0,
+            default=3.5,
+            unit=" dB",
             command=self._on_parameter_change,
             slider_height=120,
         )
@@ -487,6 +487,60 @@ class SoundDenoiserApp(ctk.CTk):
             text_color="#666666"
         )
         artifact_desc.pack(anchor="w", padx=8, pady=(0, 4))
+
+        # ── HF Extra Reduction section ──
+        hf_sep = ctk.CTkFrame(self.fine_tune_inner, height=1, fg_color="#333333")
+        hf_sep.pack(fill="x", padx=8, pady=(2, 4))
+
+        hf_label = ctk.CTkLabel(
+            self.fine_tune_inner,
+            text="HF Hiss Reduction",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color="#bb8fce"
+        )
+        hf_label.pack(anchor="w", padx=8, pady=(0, 2))
+
+        self.hf_extra_reduction_slider = ParameterSlider(
+            self.fine_tune_inner,
+            label="Extra HF Reduction",
+            from_=0.0,
+            to=12.0,
+            default=5.0,
+            unit=" dB",
+            command=self._on_parameter_change,
+            number_of_steps=48,
+            decimal_places=1,
+        )
+        self.hf_extra_reduction_slider.pack(fill="x", padx=8, pady=(0, 4))
+
+        self.hf_range_start_slider = ParameterSlider(
+            self.fine_tune_inner,
+            label="HF Range Start",
+            from_=1.0,
+            to=8.0,
+            default=4.0,
+            unit=" kHz",
+            command=self._on_parameter_change,
+            number_of_steps=28,
+            decimal_places=1,
+        )
+        self.hf_range_start_slider.pack(fill="x", padx=8, pady=(0, 4))
+
+        self.hf_range_end_slider = ParameterSlider(
+            self.fine_tune_inner,
+            label="HF Range End",
+            from_=4.0,
+            to=20.0,
+            default=12.0,
+            unit=" kHz",
+            command=self._on_parameter_change,
+            number_of_steps=64,
+            decimal_places=1,
+        )
+        self.hf_range_end_slider.pack(fill="x", padx=8, pady=(0, 4))
+
+        hf_sep2 = ctk.CTkFrame(self.fine_tune_inner, height=1, fg_color="#333333")
+        hf_sep2.pack(fill="x", padx=8, pady=(2, 4))
 
         # Adaptive Blend checkbox
         self.adaptive_blend_var = ctk.BooleanVar(value=True)
@@ -815,9 +869,12 @@ class SoundDenoiserApp(ctk.CTk):
             reduction_db=self.reduction_db_slider.get(),
             transient_protection=self.transient_slider.get() / 100.0,
             spectral_floor=self.spectral_floor_slider.get() / 100.0,
-            noise_threshold=self.noise_threshold_slider.get(),
+            noise_threshold_db=self.noise_threshold_slider.get(),
             artifact_control=self.artifact_control_slider.get() / 100.0,
             adaptive_blend=self.adaptive_blend_var.get(),
+            hf_extra_reduction_db=self.hf_extra_reduction_slider.get(),
+            hf_range_start=self.hf_range_start_slider.get() * 1000.0,
+            hf_range_end=self.hf_range_end_slider.get() * 1000.0,
         )
 
         # Process in background thread
@@ -841,26 +898,31 @@ class SoundDenoiserApp(ctk.CTk):
             self.fine_tune_toggle_btn.configure(text="▼ Fine-Tuning")
             self._fine_tune_expanded = True
 
-    def _on_parameter_change(self, value):
+    def _on_parameter_change(self, *args):
         """Handle parameter change - enable reprocessing hint."""
         if self.denoiser.get_original() is not None and not self.is_processing:
             self.process_btn.configure(fg_color="#884499")
         # Update the purple noise threshold line on the spectrum view
+        # Convert dB slider value to multiplier for the visual display
         if hasattr(self, "noise_threshold_slider"):
-            noise_thresh = self.noise_threshold_slider.get()
-            self.waveform_original.set_noise_threshold_multiplier(noise_thresh)
-            self.waveform_processed.set_noise_threshold_multiplier(noise_thresh)
+            noise_thresh_db = self.noise_threshold_slider.get()
+            noise_thresh_mult = 10 ** (noise_thresh_db / 20)
+            self.waveform_original.set_noise_threshold_multiplier(noise_thresh_mult)
+            self.waveform_processed.set_noise_threshold_multiplier(noise_thresh_mult)
 
     def _reset_parameters(self):
         """Reset parameters to defaults."""
         # Main parameters
         self.reduction_db_slider.set(18.0)
-        self.noise_threshold_slider.set(1.5)
+        self.noise_threshold_slider.set(3.5)
         # Fine-tuning defaults
         self.blend_slider.set(5.0)
         self.transient_slider.set(15.0)
         self.spectral_floor_slider.set(2.5)
         self.artifact_control_slider.set(70.0)
+        self.hf_extra_reduction_slider.set(5.0)
+        self.hf_range_start_slider.set(4.0)
+        self.hf_range_end_slider.set(12.0)
         self.adaptive_blend_var.set(True)
 
     def _get_player(self, which: str) -> AudioPlayer:
