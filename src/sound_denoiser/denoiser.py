@@ -270,159 +270,171 @@ class AudioDenoiser:
     ) -> Optional[Tuple[int, int, float]]:
         """
         Find a noise region at one edge of the audio by scanning inward.
-        
-        Two-phase approach that handles both stable and fading noise:
-        
-        Phase 1 (initial calibration):
-            Walk inward from the edge, skip silence. Collect the first 3
-            non-silent windows unconditionally — these are at the very edge
-            and are the most reliably noise-only audio.
-            
-        Phase 2 (expanding calibration):
-            Continue walking inward. Accept windows whose RMS is within 5x
-            of the initial floor (handles gradual fade-in/out of hiss).
-            Track the running max RMS as the true noise floor.  Stop
-            expansion when a window exceeds 5x initial floor.
-            
+
+        Uses both volume (RMS) and spectral characteristics to distinguish
+        noise from music.  Noise (hiss) has high spectral flatness and low
+        crest factor; music has tonal peaks and higher crest.
+
+        Three-phase approach:
+
+        Phase 1 (calibration):
+            Skip silence, collect first 3 non-silent windows.  These are
+            at the very edge and are the most reliably noise-only.  Also
+            record their spectral flatness to calibrate what "noise" looks like.
+
+        Phase 2 (expansion):
+            Continue inward.  Accept windows whose RMS is within 2.5x of the
+            calibrated floor AND whose spectral flatness is noise-like
+            (>= 50% of calibrated flatness).  Stop at first failure.
+
         Phase 3 (final walk):
-            Use the expanded noise floor. Accept windows < noise_floor * 3.
-            Stop at the first window that exceeds this threshold (music).
-        
-        Args:
-            audio: Audio array (1D, full track)
-            step_samples: Window size in samples (e.g. 0.1s worth)
-            from_start: If True, scan from sample 0 forward.
-                        If False, scan from the end backward.
-            silence_peak: Peak amplitude below which a window is silence
-            max_scan_seconds: Max seconds from the edge to scan.
-        
+            Use tighter RMS threshold (1.8x noise floor) AND spectral check.
+            Stop at first failure (music detected).
+
         Returns:
             (start_sample, end_sample, noise_floor_rms) or None.
         """
         sr = self._sr
         total = len(audio)
         max_scan_samples = int(max_scan_seconds * sr)
-        
-        # Determine the scan zone
+
         if from_start:
             zone_start = 0
             zone_end = min(total, max_scan_samples)
         else:
             zone_start = max(0, total - max_scan_samples)
             zone_end = total
-        
+
         zone = audio[zone_start:zone_end]
         n = len(zone)
         if n < step_samples:
             return None
-        
-        # ── Compute RMS and peak for every window in the zone ──
+
         window_starts = list(range(0, n - step_samples + 1, step_samples))
         if not window_starts:
             return None
-        
-        rms_arr = np.empty(len(window_starts))
-        peak_arr = np.empty(len(window_starts))
+
+        # ── Pre-compute features for every window ──
+        n_win = len(window_starts)
+        rms_arr = np.empty(n_win)
+        peak_arr = np.empty(n_win)
+        flatness_arr = np.empty(n_win)
+
+        nfft = min(2048, step_samples)
         for i, ws in enumerate(window_starts):
             chunk = zone[ws:ws + step_samples]
             rms_arr[i] = np.sqrt(np.mean(chunk ** 2))
             peak_arr[i] = np.max(np.abs(chunk))
-        
+
+            # Spectral flatness: geometric mean / arithmetic mean of power spectrum.
+            # Noise ≈ 0.3-0.8, tonal music ≈ 0.01-0.15
+            spec = np.abs(np.fft.rfft(chunk * np.hanning(len(chunk)), n=nfft))
+            power = spec ** 2 + 1e-20
+            log_mean = np.mean(np.log(power))
+            arith_mean = np.mean(power)
+            flatness_arr[i] = np.exp(log_mean) / (arith_mean + 1e-20)
+
         is_silence = (peak_arr < silence_peak) | (rms_arr < 0.0002)
-        
-        # ── Walk inward from the edge ──
+
+        # ── Walk direction ──
         if from_start:
-            indices = list(range(len(window_starts)))
+            indices = list(range(n_win))
         else:
-            indices = list(range(len(window_starts) - 1, -1, -1))
-        
+            indices = list(range(n_win - 1, -1, -1))
+
         # Phase 1: skip silence, collect first 3 non-silent as calibration
         calibration_count = 3
         calibration_rms = []
-        noise_accepted = []  # list of window indices accepted as noise
+        calibration_flatness = []
+        noise_accepted = []
         phase1_done = False
-        walk_start_idx = 0  # where to resume after phase 1
-        
+        walk_start_idx = 0
+
         for pos, i in enumerate(indices):
             if is_silence[i]:
                 if not calibration_rms:
-                    continue  # Still in leading silence
+                    continue  # Leading silence
                 else:
-                    # Silence gap after some noise — tolerate short gaps
                     noise_accepted.append(i)
                     continue
-            
+
             calibration_rms.append(rms_arr[i])
+            calibration_flatness.append(flatness_arr[i])
             noise_accepted.append(i)
-            
+
             if len(calibration_rms) >= calibration_count:
                 walk_start_idx = pos + 1
                 phase1_done = True
                 break
-        
+
         if not phase1_done or not calibration_rms:
             return None
-        
+
         initial_floor = max(calibration_rms)
         if initial_floor < 1e-6:
             return None
-        
-        # Phase 2: expand calibration — accept windows < initial_floor * 5
-        expansion_limit = initial_floor * 5.0
-        noise_floor = initial_floor  # running max of accepted noise RMS
-        
+
+        # Noise flatness baseline (minimum of calibration windows)
+        noise_flatness_baseline = min(calibration_flatness)
+        flatness_threshold = noise_flatness_baseline * 0.5  # Must be at least 50% as flat
+
+        # Phase 2: expand calibration with spectral check
+        expansion_limit = initial_floor * 2.5
+        noise_floor = initial_floor
+
         for pos in range(walk_start_idx, len(indices)):
             i = indices[pos]
-            
+
             if is_silence[i]:
-                # Tolerate isolated silence windows within noise
                 noise_accepted.append(i)
                 continue
-            
-            if rms_arr[i] <= expansion_limit:
-                noise_accepted.append(i)
-                if rms_arr[i] > noise_floor:
-                    noise_floor = rms_arr[i]
-            else:
-                # Exceeded expansion limit — switch to phase 3
+
+            # Reject if too loud OR too tonal (music-like spectrum)
+            if rms_arr[i] > expansion_limit:
                 walk_start_idx = pos
                 break
+            if flatness_arr[i] < flatness_threshold:
+                walk_start_idx = pos
+                break
+
+            noise_accepted.append(i)
+            if rms_arr[i] > noise_floor:
+                noise_floor = rms_arr[i]
         else:
-            # All windows accepted (rare — short file with only noise)
             walk_start_idx = len(indices)
-        
-        # Phase 3: final walk with tighter threshold
-        final_threshold = noise_floor * 3.0
-        
+
+        # Phase 3: final walk with tight thresholds
+        final_rms_limit = noise_floor * 1.8
+
         for pos in range(walk_start_idx, len(indices)):
             i = indices[pos]
-            
+
             if is_silence[i]:
                 noise_accepted.append(i)
                 continue
-            
-            if rms_arr[i] <= final_threshold:
+
+            # Must pass BOTH RMS and flatness checks
+            if rms_arr[i] <= final_rms_limit and flatness_arr[i] >= flatness_threshold:
                 noise_accepted.append(i)
             else:
                 break  # Hit music — stop
-        
-        # Trim trailing silence from accepted windows
+
+        # Trim trailing silence
         while noise_accepted:
             if is_silence[noise_accepted[-1]]:
                 noise_accepted.pop()
             else:
                 break
-        
+
         if not noise_accepted:
             return None
-        
-        # Convert to sample positions
+
         first_idx = min(noise_accepted)
         last_idx = max(noise_accepted)
         region_start = zone_start + window_starts[first_idx]
         region_end = zone_start + window_starts[last_idx] + step_samples
         region_end = min(region_end, total)
-        
+
         return (region_start, region_end, noise_floor)
     
     def auto_detect_noise_regions(self, min_duration: float = 0.5) -> List[Tuple[float, float]]:

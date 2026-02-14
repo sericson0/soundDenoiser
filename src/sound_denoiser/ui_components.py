@@ -8,6 +8,81 @@ if TYPE_CHECKING:  # Only imported for type hints to avoid circular dependencies
     from .denoiser import NoiseProfile
 
 
+class Tooltip:
+    """Lightweight hover tooltip for any tkinter/CTk widget."""
+
+    def __init__(self, widget, text: str, delay: int = 400):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self._tip_window = None
+        self._after_id = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, event=None):
+        self._hide()
+        self._after_id = self.widget.after(self.delay, self._show)
+
+    def _show(self):
+        if self._tip_window:
+            return
+
+        import tkinter as tk
+        tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.attributes("-topmost", True)
+
+        frame = tk.Frame(tw, bg="#2a2a40", bd=1, relief="solid", highlightbackground="#555555", highlightthickness=1)
+        frame.pack()
+        label = tk.Label(
+            frame,
+            text=self.text,
+            justify="left",
+            bg="#2a2a40",
+            fg="#cccccc",
+            font=("Segoe UI", 9),
+            padx=8,
+            pady=6,
+            wraplength=300,
+        )
+        label.pack()
+
+        # Position the tooltip, clamping to screen bounds
+        tw.update_idletasks()
+        tip_w = tw.winfo_reqwidth()
+        tip_h = tw.winfo_reqheight()
+        screen_w = self.widget.winfo_screenwidth()
+        screen_h = self.widget.winfo_screenheight()
+
+        # Try below-left of the widget first
+        x = self.widget.winfo_rootx() - tip_w + self.widget.winfo_width()
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+
+        # Clamp so the tooltip stays on screen
+        x = max(4, min(x, screen_w - tip_w - 4))
+        y = max(4, min(y, screen_h - tip_h - 4))
+
+        # If clipped at bottom, show above the widget instead
+        if y + tip_h > screen_h - 40:
+            y = self.widget.winfo_rooty() - tip_h - 4
+
+        tw.wm_geometry(f"+{x}+{y}")
+        self._tip_window = tw
+
+    def _hide(self, event=None):
+        if self._after_id:
+            self.widget.after_cancel(self._after_id)
+            self._after_id = None
+        if self._tip_window:
+            self._tip_window.destroy()
+            self._tip_window = None
+
+    def update_text(self, text: str):
+        self.text = text
+
+
 class SeekBar(ctk.CTkFrame):
     """Seekable progress bar for audio playback with time display."""
 

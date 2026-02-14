@@ -73,8 +73,8 @@ class WaveformDisplay(ctk.CTkFrame):
         self._analyzer_freqs: Optional[np.ndarray] = None
         self._analyzer_levels: Optional[np.ndarray] = None
         self._analyzer_peak_levels: Optional[np.ndarray] = None  # Peak hold levels
-        self._analyzer_floor_db = -60.0
-        self._analyzer_ceiling_db = 40.0
+        self._analyzer_floor_db = -50.0
+        self._analyzer_ceiling_db = 30.0
         self._analyzer_nfft = 2048
         self._analyzer_filter = None
         self._analyzer_filter_sr = None
@@ -153,7 +153,7 @@ class WaveformDisplay(ctk.CTkFrame):
         self.fig = Figure(figsize=(10, 2.2), dpi=100, facecolor="#1a1a2e")
         self.ax = self.fig.add_subplot(111)
         self.ax.set_facecolor("#1a1a2e")
-        self.fig.subplots_adjust(left=0.08, right=0.98, top=0.88, bottom=0.18)
+        self.fig.subplots_adjust(left=0.06, right=0.98, top=0.92, bottom=0.10)
 
         # Style the axes
         self.ax.tick_params(colors="#888888", labelsize=8)

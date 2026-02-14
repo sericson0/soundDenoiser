@@ -592,30 +592,37 @@ class SoundDenoiserApp(ctk.CTk):
             self._update_noise_floor_trace(profile)
 
             total_duration = sum(end - start for start, end in selections)
-            self._set_status(f"Noise profile learned from {len(selections)} region(s) ({total_duration:.2f}s total)")
+            self._set_status(
+                f"Noise profile learned from {len(selections)} region(s) "
+                f"({total_duration:.2f}s total) — click Apply Denoising to process"
+            )
 
-            # Auto-reprocess
-            if self.denoiser.get_original() is not None:
-                self._process_audio()
+            # Highlight the Apply button so the user knows to click it
+            if self.denoiser.get_original() is not None and not self.is_processing:
+                self.process_btn.configure(fg_color="#884499")
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to learn noise profile:\n{str(e)}")
 
     def _learn_noise_profile_auto(self):
-        """Auto-detect noise regions at beginning/end of file and learn noise profile."""
+        """Auto-detect noise regions at beginning/end of file.
+
+        Only finds regions — does NOT learn the profile or process.
+        The user can review/edit the regions and then click Learn.
+        """
         if self.denoiser.get_original() is None:
             return
 
         self._set_status("Auto-detecting noise regions at beginning/end of file...")
 
-        def auto_learn_thread():
+        def auto_detect_thread():
             try:
-                profile, regions = self.denoiser.auto_learn_noise_profile(min_duration=0.5)
-                self.processing_queue.put(("noise_profile_multi", profile, regions))
+                regions = self.denoiser.auto_detect_noise_regions(min_duration=0.3)
+                self.processing_queue.put(("noise_regions_detected", regions))
             except Exception as e:
                 self.processing_queue.put(("error", str(e)))
 
-        threading.Thread(target=auto_learn_thread, daemon=True).start()
+        threading.Thread(target=auto_detect_thread, daemon=True).start()
 
     def _update_noise_floor_trace(self, profile: Optional[NoiseProfile]):
         """Push learned noise spectrum into frequency view overlays."""
@@ -1042,6 +1049,10 @@ class SoundDenoiserApp(ctk.CTk):
                     _, profile, regions = msg
                     self._on_noise_profile_auto_learned(profile, regions)
 
+                elif msg[0] == "noise_regions_detected":
+                    _, regions = msg
+                    self._on_noise_regions_detected(regions)
+
                 elif msg[0] == "error":
                     _, error = msg
                     messagebox.showerror("Error", f"An error occurred:\n{error}")
@@ -1394,21 +1405,49 @@ class SoundDenoiserApp(ctk.CTk):
         if self.denoiser.get_original() is not None:
             self._process_audio()
 
-    def _on_noise_profile_auto_learned(self, profile: NoiseProfile, regions: List[Tuple[float, float]]):
-        """Handle noise profile learned from auto-detect (beginning/end scan)."""
+    def _on_noise_regions_detected(self, regions: List[Tuple[float, float]]):
+        """Handle auto-detected noise regions — show them for user review."""
+        if not regions:
+            self._set_status("Auto-detect: no suitable noise regions found. Please select manually.")
+            return
+
         # Clear any previous selections
         self.noise_profile_panel.clear_selections()
         self.waveform_original.clear_selection()
 
-        # Add each detected region — both to the panel (editable list) and waveform
+        # Switch to selection mode FIRST — this triggers a redraw (ax.clear),
+        # so rectangles must be added AFTER this call.
+        if not self.noise_selection_enabled:
+            self._toggle_noise_selection(True)
+
+        # Now add regions — these go on top of the freshly redrawn waveform
         for region in regions:
             self.noise_profile_panel.add_selection(*region)
             self.waveform_original.add_selection_rect(*region)
 
-        # Show the selection rects so the user can see and edit them
+        # Build a descriptive status message
+        parts = []
+        track_dur = self.denoiser._audio.shape[1] / self.denoiser._sr if self.denoiser._audio is not None else 0
+        for s, e in regions:
+            loc = "beginning" if s < track_dur * 0.3 else "end"
+            parts.append(f"{loc} ({s:.2f}s-{e:.2f}s)")
+        self._set_status(
+            f"Auto-detected {len(regions)} region(s): {', '.join(parts)} "
+            f"— review and click 'Learn from Selections'"
+        )
+
+    def _on_noise_profile_auto_learned(self, profile: NoiseProfile, regions: List[Tuple[float, float]]):
+        """Handle noise profile learned from auto-detect (legacy path)."""
+        # Clear any previous selections
+        self.noise_profile_panel.clear_selections()
+        self.waveform_original.clear_selection()
+
+        for region in regions:
+            self.noise_profile_panel.add_selection(*region)
+            self.waveform_original.add_selection_rect(*region)
+
         self.waveform_original.show_selection_rects()
 
-        # Use the first region as the reference for display
         if regions:
             self.selected_noise_region = regions[0]
             self.waveform_original.set_noise_region(*regions[0])
@@ -1417,21 +1456,12 @@ class SoundDenoiserApp(ctk.CTk):
         self.noise_profile_panel.enable_learn_button(True)
         self._update_noise_floor_trace(profile)
 
-        # Build a descriptive status message
         parts = []
-        for i, (s, e) in enumerate(regions):
-            duration = self.denoiser._audio.shape[1] / self.denoiser._sr if self.denoiser._audio is not None else 0
-            if s < duration * 0.3:
-                label = "beginning"
-            else:
-                label = "end"
-            parts.append(f"{label} ({s:.2f}s-{e:.2f}s)")
-        status = f"Auto-detected {len(regions)} noise region(s): " + ", ".join(parts)
-        self._set_status(status)
-
-        # Auto-reprocess
-        if self.denoiser.get_original() is not None:
-            self._process_audio()
+        track_dur = self.denoiser._audio.shape[1] / self.denoiser._sr if self.denoiser._audio is not None else 0
+        for s, e in regions:
+            loc = "beginning" if s < track_dur * 0.3 else "end"
+            parts.append(f"{loc} ({s:.2f}s-{e:.2f}s)")
+        self._set_status(f"Auto-detected {len(regions)} noise region(s): {', '.join(parts)}")
 
     def on_closing(self):
         """Clean up on window close."""
