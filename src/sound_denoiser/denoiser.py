@@ -515,16 +515,39 @@ class AudioDenoiser:
 
     def _estimate_noise_spectrum(self, stft_mag: np.ndarray) -> np.ndarray:
         """
-        Estimate noise spectrum using minimum statistics.
+        Estimate noise spectrum using time-varying minimum statistics.
 
-        Uses the assumption that the minimum energy in each frequency bin
-        over time represents the noise floor.
+        Uses a sliding window approach: for each frequency bin, track the
+        minimum energy over short overlapping windows, then take the median
+        of these local minima. This gives a tighter noise estimate that
+        adapts to time-varying noise levels while remaining robust.
         """
-        # Use minimum statistics with smoothing
-        # Take the 10th percentile across time as noise estimate
-        noise_estimate = np.percentile(stft_mag, 10, axis=1)
+        n_freq, n_frames = stft_mag.shape
 
-        # Smooth the estimate
+        if n_frames < 20:
+            # Too short for windowed approach, fall back to global percentile
+            noise_estimate = np.percentile(stft_mag, 10, axis=1)
+            return uniform_filter1d(noise_estimate, size=5)
+
+        # Sliding window minimum statistics
+        # Use windows of ~1 second (assuming hop_length gives ~86 fps at 44.1k)
+        win_frames = max(10, n_frames // 20)  # ~5% of total, at least 10 frames
+        n_windows = max(1, n_frames // (win_frames // 2))  # 50% overlap
+
+        local_mins = np.zeros((n_freq, n_windows))
+        for i in range(n_windows):
+            start = i * (win_frames // 2)
+            end = min(start + win_frames, n_frames)
+            if end - start < 5:
+                local_mins[:, i] = local_mins[:, max(0, i - 1)]
+                continue
+            # 5th percentile within each window (tighter than global 10th)
+            local_mins[:, i] = np.percentile(stft_mag[:, start:end], 5, axis=1)
+
+        # Median of local minima — robust against outlier windows
+        noise_estimate = np.median(local_mins, axis=1)
+
+        # Smooth across frequency
         noise_estimate = uniform_filter1d(noise_estimate, size=5)
 
         return noise_estimate
@@ -596,6 +619,16 @@ class AudioDenoiser:
         gain = blended_mag / (stft_mag + 1e-10)
         gain = np.clip(gain, min_gain, 1.0)
 
+        # === TEMPORAL GAIN SMOOTHING ===
+        # Smooth gains over time to prevent "pumping" / noise modulation.
+        # Use an exponential moving average along the time axis.
+        # This keeps the gain from swinging rapidly between frames.
+        alpha_smooth = 0.15  # higher = more smoothing, 0 = none
+        gain_time_smooth = uniform_filter1d(gain, size=7, axis=1)
+        gain = gain * (1.0 - alpha_smooth) + gain_time_smooth * alpha_smooth
+
+        gain = np.clip(gain, min_gain, 1.0)
+
         return gain
 
     def _adaptive_2d_smooth(self, gain: np.ndarray, stft_mag: np.ndarray,
@@ -607,24 +640,35 @@ class AudioDenoiser:
         smoothing adapted to the local SNR. Low-SNR regions (mostly noise) get
         more smoothing to suppress musical noise artifacts. High-SNR regions
         (mostly signal) get less smoothing to preserve detail.
+
+        Uses dual-kernel approach: a narrow kernel for high-SNR and a wider
+        kernel for low-SNR regions, blended per-bin.
         """
         # Compute local SNR for each time-frequency bin
         snr = stft_mag / (noise_2d + 1e-10)
 
-        # Adaptive smoothing width: more smoothing in low-SNR regions
-        # SNR < 2 -> heavy smoothing, SNR > 8 -> minimal smoothing
+        # Adaptive smoothing factor: more smoothing in low-SNR regions
+        # SNR < 2 -> heavy smoothing (factor=1.0)
+        # SNR > 8 -> minimal smoothing (factor=0.1)
         smooth_factor = np.clip(1.0 - (snr - 2) / 6, 0.1, 1.0)
 
-        # Frequency smoothing (along axis 0) - adaptive kernel
-        gain_freq_smooth = uniform_filter1d(gain, size=5, axis=0)
-        # Time smoothing (along axis 1) - adaptive kernel
-        gain_time_smooth = uniform_filter1d(gain, size=5, axis=1)
-        # Combined 2D smooth
-        gain_2d_smooth = (gain_freq_smooth + gain_time_smooth) / 2.0
+        # Narrow kernel (preserves detail in high-SNR)
+        gain_freq_narrow = uniform_filter1d(gain, size=3, axis=0)
+        gain_time_narrow = uniform_filter1d(gain, size=3, axis=1)
+        gain_narrow = (gain_freq_narrow + gain_time_narrow) / 2.0
+
+        # Wide kernel (suppresses musical noise in low-SNR)
+        gain_freq_wide = uniform_filter1d(gain, size=7, axis=0)
+        gain_time_wide = uniform_filter1d(gain, size=7, axis=1)
+        gain_wide = (gain_freq_wide + gain_time_wide) / 2.0
+
+        # Blend between narrow and wide based on SNR
+        # Low SNR -> use wide-kernel smoothing
+        # High SNR -> use narrow-kernel smoothing
+        wide_weight = np.clip(1.0 - (snr - 1.5) / 5, 0, 1)
+        gain_2d_smooth = gain_narrow * (1.0 - wide_weight) + gain_wide * wide_weight
 
         # Blend between original gain and smoothed gain based on local SNR
-        # Low SNR -> use smoothed gain (suppresses musical noise)
-        # High SNR -> use original gain (preserves signal detail)
         gain_out = gain * (1.0 - smooth_factor) + gain_2d_smooth * smooth_factor
 
         return np.clip(gain_out, np.min(gain), 1.0)
@@ -734,6 +778,76 @@ class AudioDenoiser:
 
         return denoised
 
+    def _residual_noise_gate(self, denoised: np.ndarray, original: np.ndarray) -> np.ndarray:
+        """
+        Residual noise gate — a gentle secondary pass that pushes the remaining
+        noise floor down in time-frequency bins that are still close to (or below)
+        the noise estimate after the primary denoising.
+
+        This narrows the gap between our noise floor and RX's without introducing
+        gain pumping, because it only affects bins that are clearly noise-dominated
+        in the *denoised* signal.
+        """
+        if not self._use_learned_profile or self._noise_profile is None:
+            return denoised
+
+        stft_den = librosa.stft(denoised, n_fft=self.N_FFT, hop_length=self.HOP_LENGTH)
+        den_mag = np.abs(stft_den)
+        den_phase = np.angle(stft_den)
+
+        noise_estimate = self._noise_profile.spectral_mean
+        # Scale noise estimate by threshold multiplier
+        noise_scaled = noise_estimate * self._noise_threshold_mult
+        noise_2d = noise_scaled[:, np.newaxis]
+
+        # How far above the noise floor is each denoised bin?
+        ratio = den_mag / (noise_2d + 1e-10)
+
+        # Gate factor: only catch bins at/below noise floor
+        # ratio <= 0.5: full attenuation
+        # ratio >= 2.0: no attenuation
+        gate = np.clip((ratio - 0.5) / 1.5, 0, 1)
+
+        # Frequency-dependent gate strength:
+        # Full gate below 4kHz
+        # Moderate gate 4-10kHz (HF hiss is perceptible here)
+        # Reduced gate above 10kHz (HF synthesis recovers this)
+        freqs = librosa.fft_frequencies(sr=self._sr, n_fft=self.N_FFT)
+        freq_taper = np.ones(len(freqs))
+        # Taper down above 10kHz to protect air/shimmer
+        hf_mask = freqs > 10000
+        freq_taper[hf_mask] = np.clip(1.0 - (freqs[hf_mask] - 10000) / 5000, 0.4, 1.0)
+        freq_taper = freq_taper[:, np.newaxis]
+
+        # The attenuation target: push noise-only bins down by ~7 dB extra
+        residual_floor = 0.45  # ~ -7 dB additional reduction
+        gate_gain = residual_floor + gate * (1.0 - residual_floor)
+
+        # Apply frequency taper: less gate effect in HF
+        gate_gain = 1.0 - (1.0 - gate_gain) * freq_taper
+
+        # Frame energy modulation: ease off gate during loud frames (transients)
+        # to preserve HF onset detail, apply fully during quiet frames
+        frame_energy = np.mean(den_mag ** 2, axis=0)
+        quiet_threshold = np.percentile(frame_energy, 30)
+        loud_threshold = np.percentile(frame_energy, 70)
+        # loud frames -> energy_mod approaches 0 (less gating)
+        # quiet frames -> energy_mod approaches 1 (full gating)
+        energy_mod = np.clip(1.0 - (frame_energy - quiet_threshold) /
+                             (loud_threshold - quiet_threshold + 1e-10), 0.2, 1.0)
+        energy_mod = uniform_filter1d(energy_mod, size=5)  # smooth transitions
+        # Blend: in loud frames, pull gate_gain toward 1.0 (no effect)
+        gate_gain = 1.0 - (1.0 - gate_gain) * energy_mod[np.newaxis, :]
+
+        # Smooth the gate to avoid artifacts and modulation
+        gate_gain = uniform_filter1d(gate_gain, size=5, axis=0)
+        gate_gain = uniform_filter1d(gate_gain, size=7, axis=1)
+
+        result_mag = den_mag * gate_gain
+        stft_result = result_mag * np.exp(1j * den_phase)
+
+        return librosa.istft(stft_result, hop_length=self.HOP_LENGTH, length=len(denoised))
+
     def _hf_synthesis(self, denoised: np.ndarray, original: np.ndarray) -> np.ndarray:
         """
         High-frequency synthesis (RX Algorithm D equivalent).
@@ -772,20 +886,20 @@ class AudioDenoiser:
         orig_snr = orig_mag / (noise_2d + 1e-10)
         den_snr = den_mag / (noise_2d + 1e-10)
 
-        # More sensitive signal loss detection:
-        # - Lowered orig_snr threshold from 1.5 to 1.2 (detect signal closer to noise)
-        # - Wider detection range (orig_snr 1.2 to 6x)
-        # - More sensitive den_snr check (was /2, now /1.5)
-        signal_loss = (np.clip((orig_snr - 1.2) / 4.8, 0, 1) *
-                       np.clip(1.0 - den_snr / 1.5, 0, 1))
+        # Sensitive signal loss detection:
+        # - Low orig_snr threshold (1.1x) to detect signal close to noise
+        # - Wide detection range (1.1 to 6x)
+        # - Sensitive den_snr check: if denoised is < 1.8x noise, signal was lost
+        signal_loss = (np.clip((orig_snr - 1.1) / 4.9, 0, 1) *
+                       np.clip(1.0 - den_snr / 1.8, 0, 1))
 
         # Only apply in HF region
         hf_signal_loss = np.zeros_like(signal_loss)
         hf_signal_loss[hf_mask, :] = signal_loss[hf_mask, :]
 
-        # Taper in gradually from hf_start
+        # Taper in gradually from hf_start (wider transition zone)
         taper = np.zeros(len(freqs))
-        taper[hf_mask] = np.clip((freqs[hf_mask] - hf_start) / 1500, 0, 1)
+        taper[hf_mask] = np.clip((freqs[hf_mask] - hf_start) / 2000, 0, 1)
         hf_signal_loss *= taper[:, np.newaxis]
 
         # Synthesize: add back a fraction of the removed energy
@@ -794,9 +908,9 @@ class AudioDenoiser:
 
         # Calibrated synthesis strength:
         # - Base strength scales with reduction_db (more reduction = more synthesis)
-        # - Max ~0.45 for aggressive but safe synthesis
-        synthesis_strength = np.clip(self.reduction_db / 30, 0, 0.6) * 0.45
-        synthesis_strength = min(synthesis_strength, 0.45)
+        # - Max ~0.65 for aggressive recovery of buried HF detail
+        synthesis_strength = np.clip(self.reduction_db / 25, 0, 0.8) * 0.65
+        synthesis_strength = min(synthesis_strength, 0.65)
 
         synthesis = removed * hf_signal_loss * synthesis_strength
 
@@ -823,6 +937,9 @@ class AudioDenoiser:
         """
         # Core denoising with multiresolution + adaptive 2D smoothing
         denoised = self._multiresolution_denoise(audio_channel)
+
+        # Residual noise gate — push remaining noise floor down in quiet bins
+        denoised = self._residual_noise_gate(denoised, audio_channel)
 
         # Reconstruct high-frequency detail
         denoised = self._hf_synthesis(denoised, audio_channel)
