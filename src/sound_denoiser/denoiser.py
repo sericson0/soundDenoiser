@@ -538,7 +538,7 @@ class AudioDenoiser:
 
         if n_frames < 20:
             # Too short for windowed approach, fall back to global percentile
-            noise_estimate = np.percentile(stft_mag, 10, axis=1)
+            noise_estimate = np.percentile(stft_mag, 8, axis=1)
             return uniform_filter1d(noise_estimate, size=5)
 
         # Sliding window minimum statistics
@@ -553,8 +553,9 @@ class AudioDenoiser:
             if end - start < 5:
                 local_mins[:, i] = local_mins[:, max(0, i - 1)]
                 continue
-            # 5th percentile within each window (tighter than global 10th)
-            local_mins[:, i] = np.percentile(stft_mag[:, start:end], 5, axis=1)
+            # 3rd percentile within each window — tighter estimate that
+            # better captures the true noise floor without music contamination
+            local_mins[:, i] = np.percentile(stft_mag[:, start:end], 3, axis=1)
 
         # Median of local minima — robust against outlier windows
         noise_estimate = np.median(local_mins, axis=1)
@@ -631,13 +632,20 @@ class AudioDenoiser:
         gain = blended_mag / (stft_mag + 1e-10)
         gain = np.clip(gain, min_gain, 1.0)
 
-        # === TEMPORAL GAIN SMOOTHING ===
-        # Smooth gains over time to prevent "pumping" / noise modulation.
-        # Use an exponential moving average along the time axis.
-        # This keeps the gain from swinging rapidly between frames.
-        alpha_smooth = 0.15  # higher = more smoothing, 0 = none
-        gain_time_smooth = uniform_filter1d(gain, size=7, axis=1)
-        gain = gain * (1.0 - alpha_smooth) + gain_time_smooth * alpha_smooth
+        # === ASYMMETRIC TEMPORAL GAIN SMOOTHING ===
+        # Use different time constants for attack (gain decreasing = onset)
+        # vs release (gain increasing = noise returning after transient).
+        # Fast attack preserves transient edges; slow release keeps noise
+        # suppressed longer after a transient, closing the noise floor gap.
+        alpha_attack = 0.08   # fast: let gain drop quickly for onsets
+        alpha_release = 0.25  # slow: hold low gain longer after transients
+        smoothed_gain = np.copy(gain)
+        for t in range(1, gain.shape[1]):
+            # Per-bin: if gain is decreasing -> attack, if increasing -> release
+            decreasing = gain[:, t] < smoothed_gain[:, t - 1]
+            alpha = np.where(decreasing, alpha_attack, alpha_release)
+            smoothed_gain[:, t] = (1.0 - alpha) * gain[:, t] + alpha * smoothed_gain[:, t - 1]
+        gain = smoothed_gain
 
         gain = np.clip(gain, min_gain, 1.0)
 
@@ -820,19 +828,28 @@ class AudioDenoiser:
         # ratio >= 2.0: no attenuation
         gate = np.clip((ratio - 0.5) / 1.5, 0, 1)
 
-        # Frequency-dependent gate strength:
-        # Full gate below 4kHz
-        # Moderate gate 4-10kHz (HF hiss is perceptible here)
-        # Reduced gate above 10kHz (HF synthesis recovers this)
+        # Frequency-dependent gate strength and depth:
+        # Full gate everywhere, with DEEPER attenuation in 4-12kHz
+        # (where the Presence/Air noise floor gap vs RX is largest)
         freqs = librosa.fft_frequencies(sr=self._sr, n_fft=self.N_FFT)
+
+        # Base residual floor: ~7 dB extra reduction
+        residual_floor_base = 0.45
+
+        # In 4-12kHz, use a deeper floor: ~10 dB extra reduction
+        residual_floor = np.full(len(freqs), residual_floor_base)
+        hf_boost_mask = (freqs >= 4000) & (freqs <= 12000)
+        residual_floor[hf_boost_mask] = 0.32  # ~ -10 dB
+        # Smooth transitions at the edges
+        residual_floor = uniform_filter1d(residual_floor, size=5)
+        residual_floor = residual_floor[:, np.newaxis]
+
+        # Taper gate effect above 12kHz to protect air/shimmer
         freq_taper = np.ones(len(freqs))
-        # Taper down above 10kHz to protect air/shimmer
-        hf_mask = freqs > 10000
-        freq_taper[hf_mask] = np.clip(1.0 - (freqs[hf_mask] - 10000) / 5000, 0.4, 1.0)
+        ultra_hf = freqs > 12000
+        freq_taper[ultra_hf] = np.clip(1.0 - (freqs[ultra_hf] - 12000) / 5000, 0.4, 1.0)
         freq_taper = freq_taper[:, np.newaxis]
 
-        # The attenuation target: push noise-only bins down by ~7 dB extra
-        residual_floor = 0.45  # ~ -7 dB additional reduction
         gate_gain = residual_floor + gate * (1.0 - residual_floor)
 
         # Apply frequency taper: less gate effect in HF
