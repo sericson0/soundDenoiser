@@ -220,13 +220,6 @@ class WaveformDisplay(ctk.CTkFrame):
         if not hasattr(self, "ax"):
             return
 
-        if self.analyzer_fill is not None:
-            try:
-                self.analyzer_fill.remove()
-            except Exception:
-                pass
-            self.analyzer_fill = None
-
         floor_freqs = self.noise_floor_freqs
         floor_levels = self.noise_floor_levels
 
@@ -236,12 +229,14 @@ class WaveformDisplay(ctk.CTkFrame):
                     floor_freqs,
                     floor_levels,
                     color="#999999",
-                    linewidth=1.4,
+                    linewidth=1.6,
                     linestyle="--",
                     alpha=0.9,
+                    zorder=10,
                 )
             else:
                 self.noise_floor_plot.set_data(floor_freqs, floor_levels)
+                self.noise_floor_plot.set_zorder(10)
 
             # Purple line: noise floor shifted by the threshold multiplier
             offset_db = 20 * np.log10(max(self.noise_threshold_mult, 1e-3))
@@ -252,20 +247,19 @@ class WaveformDisplay(ctk.CTkFrame):
                     floor_freqs,
                     shifted_levels,
                     color="#b187ff",
-                    linewidth=1.4,
+                    linewidth=1.6,
                     linestyle="--",
                     alpha=0.9,
+                    zorder=10,
                 )
             else:
                 self.noise_threshold_plot.set_data(floor_freqs, shifted_levels)
+                self.noise_threshold_plot.set_zorder(10)
         else:
             if self.noise_floor_plot is not None:
                 self.noise_floor_plot.set_data([], [])
             if self.noise_threshold_plot is not None:
                 self.noise_threshold_plot.set_data([], [])
-
-        if self.analyzer_line is not None:
-            self.analyzer_line.set_zorder(2)
 
         self.canvas.draw_idle()
 
@@ -749,6 +743,12 @@ class WaveformDisplay(ctk.CTkFrame):
                     zorder=0.5,
                 )
                 self.comparison_line.set_zorder(1.5)
+
+        # Ensure noise floor/threshold lines stay on top after fill recreation
+        if self.noise_floor_plot is not None:
+            self.noise_floor_plot.set_zorder(10)
+        if self.noise_threshold_plot is not None:
+            self.noise_threshold_plot.set_zorder(10)
 
         self.canvas.draw_idle()
 
