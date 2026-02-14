@@ -488,60 +488,6 @@ class SoundDenoiserApp(ctk.CTk):
         )
         artifact_desc.pack(anchor="w", padx=8, pady=(0, 4))
 
-        # ── HF Extra Reduction section ──
-        hf_sep = ctk.CTkFrame(self.fine_tune_inner, height=1, fg_color="#333333")
-        hf_sep.pack(fill="x", padx=8, pady=(2, 4))
-
-        hf_label = ctk.CTkLabel(
-            self.fine_tune_inner,
-            text="HF Hiss Reduction",
-            font=ctk.CTkFont(size=10, weight="bold"),
-            text_color="#bb8fce"
-        )
-        hf_label.pack(anchor="w", padx=8, pady=(0, 2))
-
-        self.hf_extra_reduction_slider = ParameterSlider(
-            self.fine_tune_inner,
-            label="Extra HF Reduction",
-            from_=0.0,
-            to=12.0,
-            default=5.0,
-            unit=" dB",
-            command=self._on_parameter_change,
-            number_of_steps=48,
-            decimal_places=1,
-        )
-        self.hf_extra_reduction_slider.pack(fill="x", padx=8, pady=(0, 4))
-
-        self.hf_range_start_slider = ParameterSlider(
-            self.fine_tune_inner,
-            label="HF Range Start",
-            from_=1.0,
-            to=8.0,
-            default=4.0,
-            unit=" kHz",
-            command=self._on_parameter_change,
-            number_of_steps=28,
-            decimal_places=1,
-        )
-        self.hf_range_start_slider.pack(fill="x", padx=8, pady=(0, 4))
-
-        self.hf_range_end_slider = ParameterSlider(
-            self.fine_tune_inner,
-            label="HF Range End",
-            from_=4.0,
-            to=20.0,
-            default=12.0,
-            unit=" kHz",
-            command=self._on_parameter_change,
-            number_of_steps=64,
-            decimal_places=1,
-        )
-        self.hf_range_end_slider.pack(fill="x", padx=8, pady=(0, 4))
-
-        hf_sep2 = ctk.CTkFrame(self.fine_tune_inner, height=1, fg_color="#333333")
-        hf_sep2.pack(fill="x", padx=8, pady=(2, 4))
-
         # Adaptive Blend checkbox
         self.adaptive_blend_var = ctk.BooleanVar(value=True)
         self.adaptive_blend_checkbox = ctk.CTkCheckBox(
@@ -872,9 +818,6 @@ class SoundDenoiserApp(ctk.CTk):
             noise_threshold_db=self.noise_threshold_slider.get(),
             artifact_control=self.artifact_control_slider.get() / 100.0,
             adaptive_blend=self.adaptive_blend_var.get(),
-            hf_extra_reduction_db=self.hf_extra_reduction_slider.get(),
-            hf_range_start=self.hf_range_start_slider.get() * 1000.0,
-            hf_range_end=self.hf_range_end_slider.get() * 1000.0,
         )
 
         # Process in background thread
@@ -920,9 +863,6 @@ class SoundDenoiserApp(ctk.CTk):
         self.transient_slider.set(15.0)
         self.spectral_floor_slider.set(2.5)
         self.artifact_control_slider.set(70.0)
-        self.hf_extra_reduction_slider.set(5.0)
-        self.hf_range_start_slider.set(4.0)
-        self.hf_range_end_slider.set(12.0)
         self.adaptive_blend_var.set(True)
 
     def _get_player(self, which: str) -> AudioPlayer:

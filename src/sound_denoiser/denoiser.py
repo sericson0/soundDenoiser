@@ -81,9 +81,6 @@ class AudioDenoiser:
         noise_threshold_db: float = 3.5,
         artifact_control: float = 0.7,
         adaptive_blend: bool = True,
-        hf_extra_reduction_db: float = 5.0,
-        hf_range_start: float = 4000.0,
-        hf_range_end: float = 12000.0,
     ):
         """
         Initialize the denoiser with parameters.
@@ -103,9 +100,6 @@ class AudioDenoiser:
                 0 = pure spectral subtraction (may cause musical noise/chirpy artifacts)
                 1 = pure spectral gating (may cause noise bursts/pumping)
             adaptive_blend: When True, varies the blend based on signal characteristics
-            hf_extra_reduction_db: Additional reduction in the HF range (0-12, default: 5.0)
-            hf_range_start: Start frequency of HF extra reduction in Hz (default: 4000)
-            hf_range_end: End frequency of HF extra reduction in Hz (default: 12000)
         """
         self.blend_original = blend_original
         self.reduction_db = reduction_db
@@ -118,13 +112,7 @@ class AudioDenoiser:
         self.artifact_control = artifact_control
         self.adaptive_blend = adaptive_blend
 
-        # HF-specific parameters
-        self.hf_extra_reduction_db = hf_extra_reduction_db
-        self.hf_range_start = hf_range_start
-        self.hf_range_end = hf_range_end
-
         # Internal state
-        self._HARD_GAIN_FLOOR = 0.01  # -40 dB absolute minimum gain
         self._audio: Optional[np.ndarray] = None
         self._sr: Optional[int] = None
         self._processed: Optional[np.ndarray] = None
@@ -606,51 +594,7 @@ class AudioDenoiser:
 
         # Convert to gain
         gain = blended_mag / (stft_mag + 1e-10)
-
-        # === FREQUENCY-DEPENDENT HF EXTRA REDUCTION ===
-        n_fft_actual = (stft_mag.shape[0] - 1) * 2
-        freqs = librosa.fft_frequencies(sr=self._sr, n_fft=n_fft_actual)
-
-        if self.hf_extra_reduction_db > 0:
-            hf_extra_linear = 10 ** (-self.hf_extra_reduction_db / 20)
-            taper_width = 500.0  # Hz smooth transition zone
-
-            # Smooth pulse: 1.0 inside [hf_range_start, hf_range_end], 0 outside
-            ramp_in = np.clip(
-                (freqs - self.hf_range_start + taper_width) / (2 * taper_width), 0, 1
-            )
-            ramp_out = np.clip(
-                (self.hf_range_end + taper_width - freqs) / (2 * taper_width), 0, 1
-            )
-            in_range = ramp_in * ramp_out
-            # Factor goes from 1.0 (no extra reduction) to hf_extra_linear
-            hf_factor = 1.0 - in_range * (1.0 - hf_extra_linear)
-            gain = gain * hf_factor[:, np.newaxis]
-
-        # === SNR-ADAPTIVE GAIN FLOOR ===
-        # In quiet passages (low SNR), allow deeper reduction.
-        # In loud passages (high SNR), noise is masked — relax the floor.
-        frame_signal_power = np.mean(stft_mag ** 2, axis=0)
-        frame_noise_power = np.mean(noise_2d ** 2, axis=0) + 1e-20
-        frame_snr_db = 10 * np.log10(frame_signal_power / frame_noise_power + 1e-10)
-
-        # Map frame SNR to a floor scaling factor:
-        #   SNR <= -3 dB : factor = 0.25 (allow ~12 dB deeper reduction)
-        #   SNR  = 10 dB : factor = 1.0  (normal reduction)
-        #   SNR >= 20 dB : factor = 1.5  (noise is masked, reduce less)
-        snr_factor = np.clip((frame_snr_db + 3) / 13, 0.25, 1.5)
-
-        # Also apply frequency-dependent floor (HF range gets lower floor)
-        if self.hf_extra_reduction_db > 0:
-            freq_floor = min_gain * hf_factor
-        else:
-            freq_floor = min_gain
-
-        # Per-frame adaptive minimum gain
-        adaptive_min = freq_floor[:, np.newaxis] * snr_factor[np.newaxis, :]  # freq x time
-        adaptive_min = np.maximum(adaptive_min, self._HARD_GAIN_FLOOR)
-
-        gain = np.clip(gain, adaptive_min, 1.0)
+        gain = np.clip(gain, min_gain, 1.0)
 
         return gain
 
@@ -816,8 +760,8 @@ class AudioDenoiser:
             noise_estimate = self._estimate_noise_spectrum(orig_mag)
         noise_2d = (noise_estimate * self._noise_threshold_mult)[:, np.newaxis]
 
-        # Define HF region — use configured HF range start as synthesis start
-        hf_start = self.hf_range_start
+        # Define HF region (above 4kHz)
+        hf_start = 4000.0
         hf_mask = freqs >= hf_start
 
         if not np.any(hf_mask):
@@ -850,11 +794,8 @@ class AudioDenoiser:
 
         # Calibrated synthesis strength:
         # - Base strength scales with reduction_db (more reduction = more synthesis)
-        # - Also factor in HF extra reduction (more HF reduction = more recovery needed)
-        # - Max ~0.45 (was 0.2) for aggressive but safe synthesis
-        base_strength = np.clip(self.reduction_db / 30, 0, 0.6)
-        hf_boost = np.clip(self.hf_extra_reduction_db / 12, 0, 0.4)
-        synthesis_strength = (base_strength + hf_boost) * 0.45
+        # - Max ~0.45 for aggressive but safe synthesis
+        synthesis_strength = np.clip(self.reduction_db / 30, 0, 0.6) * 0.45
         synthesis_strength = min(synthesis_strength, 0.45)
 
         synthesis = removed * hf_signal_loss * synthesis_strength
@@ -1195,9 +1136,6 @@ class AudioDenoiser:
         noise_threshold_db: Optional[float] = None,
         artifact_control: Optional[float] = None,
         adaptive_blend: Optional[bool] = None,
-        hf_extra_reduction_db: Optional[float] = None,
-        hf_range_start: Optional[float] = None,
-        hf_range_end: Optional[float] = None,
     ):
         """Update denoiser parameters."""
         if blend_original is not None:
@@ -1216,12 +1154,6 @@ class AudioDenoiser:
             self.artifact_control = artifact_control
         if adaptive_blend is not None:
             self.adaptive_blend = adaptive_blend
-        if hf_extra_reduction_db is not None:
-            self.hf_extra_reduction_db = hf_extra_reduction_db
-        if hf_range_start is not None:
-            self.hf_range_start = hf_range_start
-        if hf_range_end is not None:
-            self.hf_range_end = hf_range_end
 
     def set_method(self, method: DenoiseMethod):
         """Set the denoising method."""
